@@ -1,0 +1,545 @@
+;; ============================================================================
+;;  BetPoly escrow — pari-mutuel prediction markets on TON
+;; ============================================================================
+;;
+;;  Non-custodial by construction:
+;;    * users send TON straight to this contract; the operator never holds funds
+;;    * the operator's backend has NO key; it only reads the chain
+;;    * resolution is signed by the ADMIN wallet, not by the bot
+;;    * every winner calls `claim` and the contract pays the wallet directly
+;;
+;;  Payout math (pari-mutuel):
+;;      distributable = total_pool - fee
+;;      payout_i      = stake_i * distributable / winning_pool
+;;  If nobody bet on the winning option the admin must `cancel`, which enables
+;;  full refunds. Funds can never be stranded: `claim` always has a path.
+;;
+;;  Anti-spam / safety:
+;;    * one bet per (wallet, market) — enforced by the bets dictionary key
+;;    * `min_stake`, `paused`, per-market `closes_at`, fee cap of 10%
+;;    * `total_locked` accounting: `withdraw_fees` can never touch user funds
+;;
+;;  Wire format: keep in sync with bot/chain/bodies.py
+;; ============================================================================
+
+#include "imports/stdlib.fc";
+
+;; ------------------------------------------------------------------ opcodes
+;; The bundled stdlib exposes `dict_set` (slice keys) but not `dict_get?`.
+;; Declaring it here keeps address keys (267 bits) usable for the bets map.
+(slice, int) dict_get?(cell dict, int key_len, slice index) asm(index dict key_len) "DICTGET" "NULLSWAPIFNOT";
+
+const int op_create_market   = 0x1A0A0001;
+const int op_place_bet       = 0x1A0A0002;
+const int op_resolve_market  = 0x1A0A0003;
+const int op_cancel_market   = 0x1A0A0004;
+const int op_claim_payout    = 0x1A0A0005;
+const int op_set_paused      = 0x1A0A0101;
+const int op_set_fee         = 0x1A0A0102;
+const int op_change_admin    = 0x1A0A0103;
+const int op_withdraw_fees   = 0x1A0A0104;
+
+;; ------------------------------------------------------------------- events
+const int ev_market_created  = 0xE0A00001;
+const int ev_market_resolved = 0xE0A00002;
+const int ev_market_cancelled = 0xE0A00003;
+
+;; ------------------------------------------------------------------- status
+const int status_open        = 0;
+const int status_resolved    = 1;
+const int status_cancelled   = 2;
+const int no_winner          = 255;
+
+;; --------------------------------------------------------------- exit codes
+const int err_not_admin        = 401;
+const int err_invalid_body     = 402;
+const int err_paused           = 403;
+const int err_bad_params       = 404;
+const int err_bad_time         = 405;
+const int err_bad_value        = 406;
+const int err_market_missing   = 407;
+const int err_market_closed    = 408;
+const int err_bad_option       = 409;
+const int err_duplicate_bet    = 410;
+const int err_already_resolved = 411;
+const int err_no_winner        = 412;
+const int err_not_resolved     = 413;
+const int err_nothing_to_claim = 414;
+const int err_already_claimed  = 415;
+const int err_fee_cap          = 416;
+const int err_locked_funds     = 417;
+
+;; ------------------------------------------------------------------ limits
+const int min_create_value = 50000000;    ;; 0.05 TON
+const int min_event_value  = 10000000;    ;; 0.01 TON
+const int min_bet_value    = 10000000;    ;; 0.01 TON on top of the stake
+const int max_fee_bps      = 1000;        ;; 10 %
+const int max_options      = 8;
+const int min_duration     = 300;         ;; 5 min
+const int max_duration     = 31536000;    ;; 365 days
+const int reserve          = 10000000;    ;; keep 0.01 TON for storage
+
+;; ============================================================================
+;;  Storage
+;;  storage#_ admin:MsgAddress indexer:MsgAddress fee_bps:uint16 min_stake:Coins
+;;            paused:uint1 seqno:uint32 total_locked:Coins fees:Coins
+;;            markets:^(HashmapE 32 ^Market)
+;; ============================================================================
+(slice, slice, int, int, int, int, int, int, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+    return (ds~load_msg_addr(), ds~load_msg_addr(), ds~load_uint(16), ds~load_coins(),
+            ds~load_uint(1), ds~load_uint(32), ds~load_coins(), ds~load_coins(),
+            ds~load_dict());
+}
+
+() save_data(slice admin, slice indexer, int fee_bps, int min_stake, int paused,
+             int seqno, int total_locked, int fees, cell markets) impure inline {
+    set_data(begin_cell()
+        .store_slice(admin)
+        .store_slice(indexer)
+        .store_uint(fee_bps, 16)
+        .store_coins(min_stake)
+        .store_uint(paused, 1)
+        .store_uint(seqno, 32)
+        .store_coins(total_locked)
+        .store_coins(fees)
+        .store_dict(markets)
+        .end_cell());
+}
+
+;; ============================================================================
+;;  Market cell
+;;  market#_ status:uint8 winning:uint8 option_count:uint8 closes_at:uint32
+;;           fee_bps:uint16 total_pool:Coins winning_pool:Coins title_hash:uint256
+;;           pools:HashmapE 8 Coins  bets:HashmapE 267 ^Bet
+;;  bet#_ option:uint8 stake:Coins claimed:uint1
+;; ============================================================================
+
+;; Returns a builder pre-filled with the fixed market header.
+builder market_header(int status, int winning, int option_count, int closes_at,
+                      int fee_bps, int total_pool, int winning_pool, int title_hash) inline {
+    return begin_cell()
+        .store_uint(status, 8)
+        .store_uint(winning, 8)
+        .store_uint(option_count, 8)
+        .store_uint(closes_at, 32)
+        .store_uint(fee_bps, 16)
+        .store_coins(total_pool)
+        .store_coins(winning_pool)
+        .store_uint(title_hash, 256);
+}
+
+(int, int, int, int, int, int, int, int, cell, cell) unpack_market(slice ms) inline {
+    int status       = ms~load_uint(8);
+    int winning      = ms~load_uint(8);
+    int option_count = ms~load_uint(8);
+    int closes_at    = ms~load_uint(32);
+    int fee_bps      = ms~load_uint(16);
+    int total_pool   = ms~load_coins();
+    int winning_pool = ms~load_coins();
+    int title_hash   = ms~load_uint(256);
+    cell pools       = ms~load_dict();
+    cell bets        = ms~load_dict();
+    return (status, winning, option_count, closes_at, fee_bps, total_pool,
+            winning_pool, title_hash, pools, bets);
+}
+
+cell pack_market(int status, int winning, int option_count, int closes_at,
+                 int fee_bps, int total_pool, int winning_pool, int title_hash,
+                 cell pools, cell bets) inline {
+    return market_header(status, winning, option_count, closes_at, fee_bps,
+                         total_pool, winning_pool, title_hash)
+        .store_dict(pools)
+        .store_dict(bets)
+        .end_cell();
+}
+
+;; Dictionary key for one wallet inside one market: the 267 bit address slice.
+slice address_key(slice address) inline {
+    return begin_cell().store_slice(address).end_cell().begin_parse();
+}
+
+int pool_of(cell pools, int option) inline {
+    (slice pool_slice, int found) = udict_get?(pools, 8, option);
+    if (found) {
+        (slice rest, int amount) = load_coins(pool_slice);
+        return amount;
+    }
+    return 0;
+}
+
+cell set_pool(cell pools, int option, int amount) inline {
+    return udict_set(pools, 8, option,
+                     begin_cell().store_coins(amount).end_cell().begin_parse());
+}
+
+;; ============================================================================
+;;  Outgoing messages
+;; ============================================================================
+
+() send_event(slice indexer, int value, cell body) impure inline {
+    ;; The payload does not fit inline next to the address header, so it travels
+    ;; as a single ref. Indexers unwrap the empty first cell (see
+    ;; bot/chain/bodies.py::_to_cell).
+    var msg = begin_cell()
+        .store_uint(0x10, 6)                 ;; no bounce, no ihr
+        .store_slice(indexer)
+        .store_coins(value)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(body)
+        .end_cell();
+    send_raw_message(msg, 1);
+}
+
+() send_ton(slice destination, int amount, int mode) impure inline {
+    var msg = begin_cell()
+        .store_uint(0x10, 6)
+        .store_slice(destination)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    send_raw_message(msg, mode);
+}
+
+() require_admin(slice sender, slice admin) impure inline {
+    throw_unless(err_not_admin, equal_slice_bits(sender, admin));
+}
+
+;; ============================================================================
+;;  Main entry point
+;; ============================================================================
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_bits() < 32) {
+        return ();  ;; plain transfer: keep the coins (fee pool), no state change
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();  ;; ignore bounced messages
+    }
+    slice sender = cs~load_msg_addr();
+
+    (slice admin, slice indexer, int fee_bps, int min_stake, int paused, int seqno,
+     int total_locked, int fees, cell markets) = load_data();
+
+    int op = in_msg_body~load_uint(32);
+    int now_ts = now();
+
+    ;; ---------------------------------------------------------- create market
+    if (op == op_create_market) {
+        throw_if(err_paused, paused);
+        throw_unless(err_bad_value, msg_value >= min_create_value);
+        int title_hash   = in_msg_body~load_uint(256);
+        int closes_at    = in_msg_body~load_uint(32);
+        int option_count = in_msg_body~load_uint(8);
+        throw_unless(err_bad_params, option_count >= 2);
+        throw_unless(err_bad_params, option_count <= max_options);
+        throw_unless(err_bad_time, closes_at >= now_ts + min_duration);
+        throw_unless(err_bad_time, closes_at <= now_ts + max_duration);
+
+        int market_id = seqno;
+        cell market = pack_market(status_open, no_winner, option_count, closes_at,
+                                  fee_bps, 0, 0, title_hash, null(), null());
+        markets = udict_set(markets, 32, market_id, market.begin_parse());
+        seqno = seqno + 1;
+        fees = fees + msg_value - min_event_value;
+
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+
+        send_event(indexer, min_event_value, begin_cell()
+            .store_uint(ev_market_created, 32)
+            .store_uint(market_id, 32)
+            .store_slice(sender)
+            .store_uint(title_hash, 256)
+            .store_uint(closes_at, 32)
+            .store_uint(option_count, 8)
+            .store_uint(fee_bps, 16)       ;; snapshot used for payout estimates
+            .end_cell());
+        return ();
+    }
+
+    ;; --------------------------------------------------------------- place bet
+    if (op == op_place_bet) {
+        throw_if(err_paused, paused);
+        int market_id = in_msg_body~load_uint(32);
+        int option    = in_msg_body~load_uint(8);
+        int stake     = in_msg_body~load_coins();
+        throw_unless(err_bad_value, stake >= min_stake);
+        throw_unless(err_bad_value, msg_value >= stake + min_bet_value);
+
+        (slice market_slice, int found) = udict_get?(markets, 32, market_id);
+        throw_unless(err_market_missing, found);
+
+        (int status, int winning, int option_count, int closes_at, int m_fee_bps,
+         int total_pool, int winning_pool, int title_hash, cell pools, cell bets) =
+            unpack_market(market_slice);
+
+        throw_unless(err_market_closed, status == status_open);
+        throw_unless(err_market_closed, now_ts < closes_at);
+        throw_unless(err_bad_option, option < option_count);
+
+        slice bet_key = address_key(sender);
+        (slice existing, int has_bet) = dict_get?(bets, 267, bet_key);
+        throw_if(err_duplicate_bet, has_bet);
+
+        cell bet = begin_cell()
+            .store_uint(option, 8)
+            .store_coins(stake)
+            .store_uint(0, 1)
+            .end_cell();
+        bets = dict_set(bets, 267, bet_key, bet.begin_parse());
+        pools = set_pool(pools, option, pool_of(pools, option) + stake);
+        total_pool = total_pool + stake;
+        total_locked = total_locked + stake;
+        fees = fees + msg_value - stake;
+
+        cell updated = pack_market(status, winning, option_count, closes_at, m_fee_bps,
+                                   total_pool, winning_pool, title_hash, pools, bets);
+        markets = udict_set(markets, 32, market_id, updated.begin_parse());
+
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+        return ();
+    }
+
+    ;; ------------------------------------------------------------ resolve
+    if (op == op_resolve_market) {
+        require_admin(sender, admin);
+        int market_id = in_msg_body~load_uint(32);
+        int winner    = in_msg_body~load_uint(8);
+
+        (slice market_slice, int found) = udict_get?(markets, 32, market_id);
+        throw_unless(err_market_missing, found);
+
+        (int status, int winning, int option_count, int closes_at, int m_fee_bps,
+         int total_pool, int winning_pool, int title_hash, cell pools, cell bets) =
+            unpack_market(market_slice);
+
+        throw_unless(err_already_resolved, status == status_open);
+        throw_unless(err_market_closed, now_ts >= closes_at);
+        throw_unless(err_bad_option, winner < option_count);
+
+        int winner_pool = pool_of(pools, winner);
+        throw_unless(err_no_winner, winner_pool > 0);
+
+        int fee_cut = muldiv(total_pool, m_fee_bps, 10000);
+        total_locked = total_locked - fee_cut;
+        fees = fees + fee_cut + msg_value - min_event_value;
+
+        cell updated = pack_market(status_resolved, winner, option_count, closes_at,
+                                   m_fee_bps, total_pool, winner_pool, title_hash,
+                                   pools, bets);
+        markets = udict_set(markets, 32, market_id, updated.begin_parse());
+
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+
+        send_event(indexer, min_event_value, begin_cell()
+            .store_uint(ev_market_resolved, 32)
+            .store_uint(market_id, 32)
+            .store_uint(winner, 8)
+            .store_coins(total_pool)
+            .store_coins(winner_pool)
+            .end_cell());
+        return ();
+    }
+
+    ;; ------------------------------------------------------------- cancel
+    if (op == op_cancel_market) {
+        require_admin(sender, admin);
+        int market_id = in_msg_body~load_uint(32);
+        (slice market_slice, int found) = udict_get?(markets, 32, market_id);
+        throw_unless(err_market_missing, found);
+
+        (int status, int winning, int option_count, int closes_at, int m_fee_bps,
+         int total_pool, int winning_pool, int title_hash, cell pools, cell bets) =
+            unpack_market(market_slice);
+        throw_unless(err_already_resolved, status == status_open);
+
+        fees = fees + msg_value - min_event_value;
+        cell updated = pack_market(status_cancelled, no_winner, option_count, closes_at,
+                                   m_fee_bps, total_pool, winning_pool, title_hash,
+                                   pools, bets);
+        markets = udict_set(markets, 32, market_id, updated.begin_parse());
+
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+
+        send_event(indexer, min_event_value, begin_cell()
+            .store_uint(ev_market_cancelled, 32)
+            .store_uint(market_id, 32)
+            .end_cell());
+        return ();
+    }
+
+    ;; -------------------------------------------------------------- claim
+    if (op == op_claim_payout) {
+        int market_id = in_msg_body~load_uint(32);
+        (slice market_slice, int found) = udict_get?(markets, 32, market_id);
+        throw_unless(err_market_missing, found);
+
+        (int status, int winning, int option_count, int closes_at, int m_fee_bps,
+         int total_pool, int winning_pool, int title_hash, cell pools, cell bets) =
+            unpack_market(market_slice);
+
+        throw_unless(err_not_resolved, status != status_open);
+
+        slice bet_key = address_key(sender);
+        (slice bet_slice, int has_bet) = dict_get?(bets, 267, bet_key);
+        throw_unless(err_nothing_to_claim, has_bet);
+
+        slice bs = bet_slice;
+        int bet_option = bs~load_uint(8);
+        int stake      = bs~load_coins();
+        int claimed    = bs~load_uint(1);
+        throw_if(err_already_claimed, claimed);
+
+        int payout = 0;
+        if (status == status_cancelled) {
+            payout = stake;
+        } else {
+            throw_unless(err_nothing_to_claim, bet_option == winning);
+            int distributable = total_pool - muldiv(total_pool, m_fee_bps, 10000);
+            payout = muldiv(stake, distributable, winning_pool);
+        }
+
+        slice updated_bet = begin_cell()
+            .store_uint(bet_option, 8)
+            .store_coins(stake)
+            .store_uint(1, 1)
+            .end_cell()
+            .begin_parse();
+        bets = dict_set(bets, 267, bet_key, updated_bet);
+        total_locked = total_locked - payout;
+        fees = fees + msg_value;
+
+        cell updated = pack_market(status, winning, option_count, closes_at, m_fee_bps,
+                                   total_pool, winning_pool, title_hash, pools, bets);
+        markets = udict_set(markets, 32, market_id, updated.begin_parse());
+
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+
+        if (payout > 0) {
+            send_ton(sender, payout, 1);
+        }
+        return ();
+    }
+
+    ;; -------------------------------------------------------- admin: pause
+    if (op == op_set_paused) {
+        require_admin(sender, admin);
+        paused = in_msg_body~load_uint(8);
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+        return ();
+    }
+
+    ;; ------------------------------------------------------------ admin: fee
+    if (op == op_set_fee) {
+        require_admin(sender, admin);
+        int new_fee = in_msg_body~load_uint(16);
+        throw_unless(err_fee_cap, new_fee <= max_fee_bps);
+        save_data(admin, indexer, new_fee, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+        return ();
+    }
+
+    ;; ---------------------------------------------------------- admin: admin
+    if (op == op_change_admin) {
+        require_admin(sender, admin);
+        slice new_admin = in_msg_body~load_msg_addr();
+        save_data(new_admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+        return ();
+    }
+
+    ;; --------------------------------------------------- admin: withdraw fees
+    if (op == op_withdraw_fees) {
+        require_admin(sender, admin);
+        int amount = in_msg_body~load_coins();
+        throw_unless(err_bad_value, amount > 0);
+        throw_unless(err_bad_value, amount <= fees);
+        throw_unless(err_locked_funds, my_balance >= total_locked + reserve + amount);
+
+        fees = fees - amount;
+        save_data(admin, indexer, fee_bps, min_stake, paused, seqno, total_locked,
+                  fees, markets);
+        send_ton(admin, amount, 1);
+        return ();
+    }
+
+    ;; unknown op: keep the coins, do nothing
+    return ();
+}
+
+;; ============================================================================
+;;  Getters (used by the backend / explorers)
+;; ============================================================================
+
+int get_market_count() method_id {
+    (_, _, _, _, _, int seqno, _, _, _) = load_data();
+    return seqno;
+}
+
+int get_fee_bps() method_id {
+    (_, _, int fee_bps, _, _, _, _, _, _) = load_data();
+    return fee_bps;
+}
+
+int get_min_stake() method_id {
+    (_, _, _, int min_stake, _, _, _, _, _) = load_data();
+    return min_stake;
+}
+
+int get_paused() method_id {
+    (_, _, _, _, int paused, _, _, _, _) = load_data();
+    return paused;
+}
+
+int get_total_locked() method_id {
+    (_, _, _, _, _, _, int total_locked, _, _) = load_data();
+    return total_locked;
+}
+
+int get_fees() method_id {
+    (_, _, _, _, _, _, _, int fees, _) = load_data();
+    return fees;
+}
+
+;; (status, winning, option_count, closes_at, fee_bps, total_pool, winning_pool)
+(int, int, int, int, int, int, int) get_market_data(int market_id) method_id {
+    (_, _, _, _, _, _, _, _, cell markets) = load_data();
+    (slice market_slice, int found) = udict_get?(markets, 32, market_id);
+    throw_unless(err_market_missing, found);
+    (int status, int winning, int option_count, int closes_at, int m_fee_bps,
+     int total_pool, int winning_pool, int title_hash, cell pools, cell bets) =
+        unpack_market(market_slice);
+    return (status, winning, option_count, closes_at, m_fee_bps, total_pool, winning_pool);
+}
+
+;; (found, option, stake, claimed)
+(int, int, int, int) get_bet(int market_id, slice bettor) method_id {
+    (_, _, _, _, _, _, _, _, cell markets) = load_data();
+    (slice market_slice, int found) = udict_get?(markets, 32, market_id);
+    ifnot (found) {
+        return (0, 0, 0, 0);
+    }
+    (int status, int winning, int option_count, int closes_at, int m_fee_bps,
+     int total_pool, int winning_pool, int title_hash, cell pools, cell bets) =
+        unpack_market(market_slice);
+    (slice bet_slice, int has_bet) = dict_get?(bets, 267, address_key(bettor));
+    ifnot (has_bet) {
+        return (0, 0, 0, 0);
+    }
+    slice bs = bet_slice;
+    return (1, bs~load_uint(8), bs~load_coins(), bs~load_uint(1));
+}
+
+;; (admin, indexer, fee_bps, min_stake, paused, seqno, total_locked, fees, markets)
+(slice, slice, int, int, int, int, int, int, cell) get_storage() method_id {
+    return load_data();
+}

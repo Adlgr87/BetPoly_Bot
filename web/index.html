@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#101319" />
+  <title>BetPoly · Mercados TON</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://unpkg.com/@tonconnect/ui@5.0.1/dist/tonconnect-ui.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="boot" class="boot">
+    <div class="boot-logo">◎</div>
+    <p>Cargando BetPoly…</p>
+  </div>
+
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">◎</span>
+        <div>
+          <h1>BetPoly</h1>
+          <p id="mode-label" class="muted small">Mercados no-custodiales</p>
+        </div>
+      </div>
+      <button id="wallet-chip" class="chip" type="button">Conectar wallet</button>
+    </header>
+
+    <div id="dev-banner" class="banner hidden">
+      Modo local: sin <code>initData</code> de Telegram. Abre el bot en Telegram para
+      operar con tu cuenta real.
+    </div>
+
+    <div id="wallet-banner" class="banner banner-warn hidden">
+      <span id="wallet-banner-text"></span>
+      <button id="reconnect" class="link-btn" type="button">Reconectar</button>
+    </div>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="markets" role="tab">Mercados</button>
+      <button class="tab" data-view="mine" role="tab">Mis apuestas</button>
+      <button class="tab" data-view="create" role="tab">Crear</button>
+      <button class="tab hidden" data-view="admin" id="admin-tab" role="tab">Admin</button>
+    </nav>
+
+    <main class="views">
+      <!-- Mercados -->
+      <section id="view-markets" class="view">
+        <div class="row-between">
+          <h2>Mercados abiertos</h2>
+          <button id="refresh-markets" class="icon-btn" type="button" title="Actualizar">⟳</button>
+        </div>
+        <div id="markets-list" class="list"></div>
+      </section>
+
+      <!-- Mis apuestas -->
+      <section id="view-mine" class="view hidden">
+        <div class="profile-card" id="profile-card"></div>
+        <h2>Mis apuestas on-chain</h2>
+        <div id="my-bets" class="list"></div>
+      </section>
+
+      <!-- Crear -->
+      <section id="view-create" class="view hidden">
+        <h2>Crear mercado</h2>
+        <p class="muted small">
+          El mercado se crea on-chain con una transacción firmada por tu wallet.
+          Tú pagas el gas de creación (≈&nbsp;<span id="create-gas">0.05</span>&nbsp;TON).
+        </p>
+        <form id="create-form" class="card form">
+          <label>
+            Pregunta / título
+            <input id="create-title" type="text" maxlength="140" required
+                   placeholder="¿Ganará México el próximo partido?" />
+          </label>
+          <label>
+            Opciones (una por línea o separadas por comas)
+            <textarea id="create-options" rows="3" required
+                      placeholder="Sí&#10;No&#10;Empate"></textarea>
+          </label>
+          <label>
+            Fecha y hora de cierre
+            <input id="create-close" type="datetime-local" required />
+          </label>
+          <button class="primary" type="submit" id="create-submit">Crear mercado on-chain</button>
+          <p class="hint muted small">
+            Los textos se guardan off-chain como metadatos; el dinero y las reglas
+            viven en el contrato escrow.
+          </p>
+        </form>
+      </section>
+
+      <!-- Admin -->
+      <section id="view-admin" class="view hidden">
+        <h2>Admin · resolución on-chain</h2>
+        <p class="muted small">
+          El bot no tiene llaves. Genera la transacción sin firmar y tu propia wallet
+          (la del administrador) la firma.
+        </p>
+        <div id="admin-markets" class="list"></div>
+        <div class="card">
+          <h3>Estado del indexador</h3>
+          <pre id="indexer-status" class="mono small">—</pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span id="escrow-label" class="mono small">—</span>
+      <span class="small muted">
+        El bot nunca ve tu frase semilla. Firma siempre desde tu wallet.
+      </span>
+    </footer>
+  </div>
+
+  <!-- Bet sheet -->
+  <div id="sheet" class="sheet hidden" role="dialog" aria-modal="true">
+    <div class="sheet-backdrop" data-close="1"></div>
+    <div class="sheet-panel">
+      <div class="sheet-head">
+        <div>
+          <h3 id="sheet-title">Apostar</h3>
+          <p id="sheet-subtitle" class="muted small"></p>
+        </div>
+        <button class="icon-btn" data-close="1" type="button" aria-label="Cerrar">✕</button>
+      </div>
+      <div id="sheet-body" class="sheet-body"></div>
+      <div class="sheet-foot">
+        <div id="sheet-summary" class="summary muted small"></div>
+        <button id="sheet-confirm" class="primary" type="button" disabled>Firmar apuesta</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <div id="busy" class="busy hidden"><div class="spinner"></div></div>
+</body>
+</html>

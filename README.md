@@ -1,97 +1,291 @@
 # BetPoly_Bot 🎯
 
-Bot de Telegram para predicciones y apuestas entre usuarios. Los usuarios crean predicciones, apuestan puntos en resultados y compiten en un ranking global.
+Predicciones y mercados de apuestas sobre TON, servidos desde un bot de Telegram y una **Mini App** web. El backend **nunca custodia fondos y nunca firma transacciones**: solo *lee* la blockchain y *prepara* transacciones sin firmar que el usuario (o el admin) firma en su propia wallet.
 
 ---
 
-## 📊 Product Backlog — Análisis de Mercado → Features de Telegram
+## 🧠 Modelo de custodia (lo importante)
 
-> Análisis de necesidades del usuario en el mercado de predicciones sociales y apuestas informales entre amigos/comunidades de Telegram.
-
-| ID | Necesidad del Usuario (Análisis) | Feature Propuesta | Implementación en Telegram (UX) | Prioridad |
-| :--- | :--- | :--- | :--- | :--- |
-| F001 | Los usuarios no saben qué puede hacer el bot ni cómo empezar; la fricción inicial es alta y abandona antes de experimentar valor. | **Onboarding Guiado**: Presentar el bot, registrar al usuario y mostrar las acciones principales en un solo flujo. | Comando `/start` que envía un mensaje de bienvenida con un `InlineKeyboardMarkup` de 2 botones: "➕ Crear Predicción" y "📋 Ver Predicciones Activas". El registro ocurre de forma silenciosa en base de datos. | **Alta** |
-| F002 | Los usuarios quieren proponer eventos inciertos para que su comunidad opine/apueste, pero sin herramientas nativas de Telegram para ello. | **Crear Predicción**: Permitir al usuario definir una pregunta con múltiples opciones y una fecha de cierre. | Comando `/crear` que inicia un flujo conversacional por pasos (`ConversationHandler`): (1) pide el título, (2) pide las opciones separadas por comas, (3) pide la fecha de cierre. Confirmación final con `InlineKeyboardMarkup` ("✅ Confirmar" / "❌ Cancelar"). | **Alta** |
-| F003 | Los usuarios necesitan ver qué predicciones están abiertas de forma clara y rápida sin salir de Telegram. | **Ver Predicciones Activas**: Listar todas las predicciones abiertas con estado en tiempo real. | Comando `/predicciones` que envía una lista paginada de predicciones abiertas. Cada ítem tiene botones inline: "🎲 Apostar" (por predicción) y botones de navegación "⬅️ Anterior / ➡️ Siguiente". | **Alta** |
-| F004 | Los usuarios quieren apostar puntos a una opción concreta de forma intuitiva, sin comandos complejos. | **Apostar en una Predicción**: Seleccionar opción y cantidad de puntos a apostar. | Al pulsar "🎲 Apostar" se muestra un `InlineKeyboardMarkup` con las opciones disponibles. Tras elegir la opción, el bot pide la cantidad de puntos por mensaje de texto. Confirmación con resumen y botón "✅ Confirmar apuesta". | **Alta** |
-| F005 | Los usuarios quieren ver su historial de apuestas, saldo de puntos y tasa de acierto para medir su rendimiento. | **Mis Apuestas / Perfil**: Vista personal con estadísticas de rendimiento. | Comando `/misbets` que envía una tarjeta de perfil con: saldo de puntos 💰, apuestas ganadas/perdidas/pendientes y porcentaje de acierto. Botón inline "📜 Ver historial completo" para listar apuestas anteriores. | **Alta** |
-| F006 | La competición entre usuarios genera retención; sin un ranking visible, los usuarios pierden motivación a largo plazo. | **Leaderboard / Ranking Global**: Tabla de los mejores apostadores por puntos acumulados. | Comando `/ranking` que muestra el top-10 con medallas 🥇🥈🥉 y la posición del usuario solicitante destacada. Botón inline "🔄 Actualizar" para refrescar datos. | **Media** |
-| F007 | Los usuarios pierden predicciones porque no recuerdan que están abiertas; la falta de recordatorios reduce la participación. | **Alertas y Notificaciones Push**: Avisar a los participantes cuando una predicción está a punto de cerrar o ha sido resuelta. | Mensajes proactivos enviados por el bot (job scheduler) 24 h y 1 h antes del cierre. Al resolver una predicción, el bot notifica individualmente a cada apostador con su resultado y puntos ganados/perdidos. | **Media** |
-| F008 | Los administradores necesitan poder resolver predicciones (declarar el resultado correcto) sin intervención técnica. | **Panel de Administrador**: Resolver predicciones y gestionar el estado del bot. | Comando `/admin` restringido por `user_id` en la config. Lista de predicciones pendientes de resolución con `InlineKeyboardMarkup`: seleccionar predicción → seleccionar opción ganadora → confirmar. El bot calcula y distribuye puntos automáticamente. | **Alta** |
-| F009 | Los usuarios nuevos y recurrentes necesitan un punto de consulta rápida sobre los comandos disponibles. | **Ayuda Contextual**: Mostrar comandos disponibles y descripción breve. | Comando `/help` con lista de comandos y emojis, más un botón inline "📖 Cómo funciona" que envía un mensaje educativo con el flujo principal del bot. | **Media** |
-| F010 | En grupos de Telegram, los usuarios quieren crear predicciones directamente sin salir del chat grupal. | **Modo Grupo**: Habilitar el bot en grupos y canales para crear/votar predicciones colectivas. | Soporte del bot para ser añadido a grupos. Los comandos `/crear` y `/predicciones` funcionan en contexto grupal. Las predicciones creadas en un grupo quedan asociadas a ese `chat_id`, visibles solo para los miembros del grupo. | **Baja** |
-
----
-
-## 🏗️ Recomendación de Arquitectura
-
-### Decisión: `InlineKeyboardMarkup` como paradigma principal
-
-Para **BetPoly_Bot**, la arquitectura recomendada es un **flujo guiado completamente por `InlineKeyboardMarkup`** en lugar de un `MenuButton` (menú persistente de comandos).
-
-**Razones:**
-
-1. **Flujos multi-paso** — Crear una predicción, seleccionar opciones y confirmar una apuesta requiere conversaciones de varios pasos (`ConversationHandler`). Los botones inline mantienen el contexto dentro de cada mensaje y permiten editar el mensaje original (`.edit_message_text`) para una experiencia fluida sin saturar el chat.
-
-2. **Feedback inmediato** — Los `InlineKeyboardButton` con `callback_data` permiten actualizar el estado del mensaje (ej. deshabilitar el botón de apuesta una vez votado) sin necesidad de comandos adicionales.
-
-3. **Experiencia sin fricción** — El usuario nunca necesita escribir comandos manualmente después del `/start`; toda la navegación ocurre a través de botones, reduciendo la curva de aprendizaje.
-
-4. **El `MenuButton` como complemento** — Se configura un `MenuButton` con los comandos `/start`, `/predicciones`, `/ranking`, `/misbets` y `/help` como acceso rápido desde el menú de comandos de Telegram, pero no como flujo principal.
-
-### Stack Tecnológico
-
-| Componente | Tecnología |
-| :--- | :--- |
-| Lenguaje | Python 3.11+ |
-| Framework Bot | `python-telegram-bot` v21 (async) |
-| Base de Datos | SQLite (via `aiosqlite`) |
-| Scheduler | `APScheduler` (alertas push) |
-| Configuración | Variables de entorno (`.env`) |
-
----
-
-## 🚀 Instalación y Ejecución
-
-```bash
-# 1. Clonar el repositorio
-git clone https://github.com/Adlgr87/BetPoly_Bot.git
-cd BetPoly_Bot
-
-# 2. Crear entorno virtual
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate   # Windows
-
-# 3. Instalar dependencias
-pip install -r requirements.txt
-
-# 4. Configurar variables de entorno
-cp .env.example .env
-# Editar .env y añadir BOT_TOKEN y ADMIN_IDS
-
-# 5. Ejecutar el bot
-python main.py
+```
+usuario ──firma──▶ contrato escrow (contracts/escrow.fc) ──claim──▶ usuario
+                         ▲
+        backend (sin claves): solo lee eventos y prepara payloads
 ```
 
-## 📁 Estructura del Proyecto
+| Regla | Cómo se garantiza |
+| :--- | :--- |
+| El bot no puede mover tu dinero | No tiene claves; sólo construye mensajes firmables |
+| Cada apuesta va directo al contrato | `place_bet` se envía desde tu wallet al escrow |
+| El premio lo paga el contrato | `claim_payout` lo firma el ganador; el contrato transfiere |
+| La resolución no la decide el bot | `resolve_market` exige la firma del **admin on-chain** |
+| Los saldos son los de la cadena | La base de datos es un *espejo* de sólo lectura del índice |
+| Los fondos no pueden quedar atrapados | `cancel_market` habilita reembolso íntegro, para siempre |
+
+Dos economías conviven (`BET_MODE`):
+
+* **`points`** — puntos virtuales en SQLite (`/crear`, `/predicciones`, `/misbets`, `/ranking`). Sin blockchain, ideal para demo y comunidad.
+* **`escrow`** — TON real en el contrato escrow, vía Mini App + TON Connect.
+* **`hybrid`** (por defecto) — ambas; los puntos siguen siendo virtuales y los mercados on-chain se abren desde la web.
+
+> ⚠️ El modo `escrow`/`hybrid` mueve TON real. Verifica la dirección del contrato, el admin y el `fee_bps` **antes** de difundir el bot.
+
+---
+
+## 🏗️ Arquitectura
+
+| Capa | Tecnología |
+| :--- | :--- |
+| Bot | Python 3.11+, `python-telegram-bot` 21.6 (async, `JobQueue`) |
+| Mini App / API | `aiohttp` (sirve `web/`, sin build step) |
+| Persistencia | SQLite vía `aiosqlite` (una conexión, `BEGIN IMMEDIATE`) |
+| Contrato | FunC (`contracts/escrow.fc`), pari-mutuel, probado en `@ton/sandbox` |
+| Lectura on-chain | `toncenter` (`bot/chain/toncenter.py`) + índice incremental |
+| Pruebas | `pytest` (offline) + sandbox TVM (`node tests/escrow.test.js`) |
+
+Componentes que corren en un solo loop de asyncio (`main.py`): bot de Telegram (polling), API/Mini App (HTTP), e indexer (sólo lectura, tolerante a fallos de red).
+
+### Estructura
 
 ```
 BetPoly_Bot/
 ├── bot/
-│   ├── __init__.py
-│   ├── database.py          # Capa de persistencia SQLite
-│   ├── keyboards.py         # Helpers para InlineKeyboardMarkup
-│   └── handlers/
-│       ├── __init__.py
-│       ├── start.py         # /start — onboarding
-│       ├── predictions.py   # /crear, /predicciones, /apuesta
-│       ├── stats.py         # /misbets, /ranking
-│       ├── admin.py         # /admin — panel de administrador
-│       └── help.py          # /help
-├── main.py                  # Punto de entrada del bot
-├── config.py                # Configuración y variables de entorno
-├── requirements.txt
-├── .env.example
-└── README.md
+│   ├── api.py               # API HTTP + hosting de la Mini App
+│   ├── chain/
+│   │   ├── addresses.py     # direcciones EQ…/0:… , validación
+│   │   ├── bodies.py        # opcodes, payloads y eventos (espejo de escrow.fc)
+│   │   ├── toncenter.py     # cliente TON Center (transacciones, state init)
+│   │   ├── ton_proof.py     # verificación Ed25519 de ton_proof
+│   │   └── indexer.py       # proyección on-chain → SQLite (idempotente)
+│   ├── markets.py           # reglas de negocio + transacciones SIN FIRMAR
+│   ├── database.py          # puntos, predicciones, espejo on-chain
+│   ├── security.py          # initData, sesiones HMAC, nonces, rate limiting
+│   ├── formatting.py        # helpers HTML/formatos TON y fechas
+│   ├── keyboards.py         # teclados inline
+│   └── handlers/            # start, predictions, markets, stats, wallet, admin, help
+├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png)
+├── contracts/               # escrow.fc, stdlib, build.js, deploy.js, tests
+├── tests/                   # suite pytest offline
+├── config.py                # configuración tipada desde el entorno
+└── main.py                  # entrada: bot + API + indexer
 ```
+
+---
+
+## 🚀 Puesta en marcha (puntos, sin blockchain)
+
+```bash
+git clone https://github.com/Adlgr87/BetPoly_Bot.git
+cd BetPoly_Bot
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env      # define BOT_TOKEN y ADMIN_IDS
+python main.py --check    # valida configuración sin arrancar nada
+python main.py            # bot + Mini App + indexer
+```
+
+Para desarrollo sin Telegram: `WEB_ENABLED=true ALLOW_DEV_SESSION=true python main.py` y abre `http://localhost:8080`.
+
+> `ALLOW_DEV_SESSION=true` desactiva la verificación de `initData`: `config.validate()` lo rechaza en producción.
+
+---
+
+## ⛓️ Puesta en marcha on-chain
+
+### 1. Compilar y probar el contrato
+
+```bash
+cd contracts
+npm install
+npm run build     # contracts/build/escrow.code.boc + escrow.fif
+npm test          # 22 checks sobre @ton/sandbox (sin red)
+```
+
+Hash de referencia del código compilado actual:
+
+```
+a29c5c51fe93597967c6d37c976a27e989d13662117165dec1d899fe3292db9b   (80 bits en la raíz)
+```
+
+### 2. Desplegar
+
+`deploy.js` usa la mnemónica del operador **una sola vez** (desde tu máquina) para publicar el contrato. El backend no la necesita nunca.
+
+```bash
+cd contracts
+DRY_RUN=1 \
+  ADMIN_ADDRESS="EQ…admin wallet…" \
+  INDEXER_ADDRESS="EQ…dirección del bot…" \
+  node scripts/deploy.js          # imprime la dirección, no envía nada
+
+MNEMONIC="24 palabras del operador" \
+  ADMIN_ADDRESS="EQ…admin wallet…" \
+  INDEXER_ADDRESS="EQ…dirección del bot…" \
+  NETWORK=testnet TON_API_KEY="…" \
+  node scripts/deploy.js
+```
+
+Escribe `contracts/build/deploy.json` con dirección, `codeHash`, admin y parámetros. Despliega primero en `testnet`.
+
+El *admin on-chain* debe ser una wallet que controles a mano: es la única que puede resolver, cancelar, cambiar la comisión o retirar fees. **No** debe ser una clave del servidor.
+
+### 3. Configurar el backend
+
+```dotenv
+BET_MODE=hybrid
+ESCROW_ADDRESS=EQ…        # dirección impresa por deploy.js
+ESCROW_ADMIN_ADDRESS=EQ…  # informativo
+PUBLIC_BASE_URL=https://tu-dominio   # https obligatorio (Telegram + TON Connect)
+TON_PROOF_DOMAIN=tu-dominio
+SECRET_KEY=<32+ bytes aleatorios>
+TON_NETWORK=mainnet
+TON_API_KEY=…
+```
+
+`PUBLIC_BASE_URL` debe servirse por HTTPS y alojar `/tonconnect-manifest.json` y `/static/icon.png`: TON Connect los descarga y verifica el origen.
+
+---
+
+## 🔌 API HTTP
+
+Todas las rutas devuelven `{"ok": true, "data": …}` o `{"ok": false, "error": {"code", "message"}}`.
+
+| Método | Ruta | Descripción |
+| :--- | :--- | :--- |
+| GET | `/` | Mini App |
+| GET | `/tonconnect-manifest.json` | Manifiesto TON Connect |
+| GET | `/terms`, `/privacy` | Páginas legales |
+| GET | `/api/health` | Estado del proceso (sin datos sensibles) |
+| GET | `/api/config` | Configuración pública (sin secretos) |
+| POST | `/api/session` | `init_data` de Telegram → sesión firmada |
+| POST | `/api/wallet/nonce` | Nonce de un solo uso para `ton_proof` |
+| POST | `/api/wallet/verify` | Verifica `ton_proof` y vincula la wallet |
+| DELETE | `/api/wallet` | Desvincula la wallet |
+| GET | `/api/me` | Perfil, puntos, wallet |
+| GET | `/api/markets` | Mercados del espejo on-chain |
+| GET | `/api/markets/{id}` | Detalle + tu apuesta + multiplicadores |
+| POST | `/api/markets/prepare` | Transacción **sin firmar** para crear mercado |
+| POST | `/api/markets/{id}/bets/prepare` | Transacción sin firmar para apostar |
+| POST | `/api/markets/{id}/claim/prepare` | Transacción sin firmar para cobrar |
+| POST | `/api/admin/markets/{id}/resolve/prepare` | Resolución (solo admin) |
+| POST | `/api/admin/markets/{id}/cancel/prepare` | Cancelación (solo admin) |
+| GET | `/api/indexer` | Cursor, últimas transacciones y estado del índice |
+
+Las sesiones viajan en la cabecera `X-Session`. El backend **nunca** devuelve una transacción firmada.
+
+---
+
+## 🔐 Seguridad
+
+* **Autenticación**: `hash = HMAC_SHA256(bot_token, "WebAppData")` sobre el `init_data`; se valida `auth_date` y se exige `ALLOW_DEV_SESSION=false` en producción.
+* **Sesiones**: token `user_id.expira.hmac(secret_key)`; sin `secret_key` persistente las sesiones mueren al reiniciar (solo válido en desarrollo).
+* **ton_proof**: digest `sha256("ton-proof-item-v2/" ‖ wc ‖ address_hash ‖ domain_len ‖ domain ‖ timestamp ‖ payload)`, firmado en Ed25519 con la clave del `StateInit` (que debe hashear a la dirección declarada). Dominio exacto, ventana de 600 s, nonce de un solo uso por `(user_id, purpose)`.
+* **Rate limiting** por IP/usuario en sesión, preparación de transacciones y verificación de wallets.
+* **CSP** con `frame-ancestors` configurable (`FRAME_ANCESTORS`) para permitir Telegram y bloquear el resto.
+* **Índice idempotente**: cada transacción se procesa una vez (`chain_txs`), el cursor solo avanza tras confirmar, y un fallo de red nunca bloquea al bot.
+
+La base de datos **no** es una fuente de verdad monetaria: ante cualquier discrepancia, manda la cadena.
+
+---
+
+## 📜 Contrato escrow
+
+Pari-mutuel: cada mercado reparte todo el pozo menos la comisión entre quienes acertaron.
+
+```
+distributable = total_pool − floor(total_pool · fee_bps / 10000)
+payout        = floor(stake · distributable / winning_pool)
+```
+
+Si nadie apostó a la opción ganadora, `resolve_market` falla con `412` y el admin debe `cancel_market`: entonces todos cobran su stake completo.
+
+| Opcode | Operación | Quién |
+| :--- | :--- | :--- |
+| `0x1A0A0001` | `create_market(title_hash, closes_at, option_count)` | cualquiera |
+| `0x1A0A0002` | `place_bet(market_id, option, stake)` | cualquiera (1 apuesta por wallet/mercado) |
+| `0x1A0A0003` | `resolve_market(market_id, winning_option)` | admin |
+| `0x1A0A0004` | `cancel_market(market_id)` | admin |
+| `0x1A0A0005` | `claim_payout(market_id)` | apostador |
+| `0x1A0A0101` | `set_paused(0/1)` | admin |
+| `0x1A0A0102` | `set_fee(fee_bps ≤ 1000)` | admin |
+| `0x1A0A0103` | `set_admin(address)` | admin |
+| `0x1A0A0104` | `withdraw_fees(amount)` | admin |
+
+| Exit code | Significado |
+| :--- | :--- |
+| `401` | No eres el admin |
+| `402` | Cuerpo inválido |
+| `403` | Contrato en pausa |
+| `404` | Parámetros inválidos |
+| `405` | Fecha de cierre fuera de rango |
+| `406` | Valor enviado insuficiente |
+| `407` | Mercado inexistente |
+| `408` | Mercado cerrado |
+| `409` | Opción inválida |
+| `410` | Ya apostaste en este mercado |
+| `411` | Ya resuelto / cancelado |
+| `412` | Nadie acertó: hay que cancelar |
+| `413` | Mercado aún abierto |
+| `414` | No tienes nada que cobrar |
+| `415` | Ya cobraste |
+| `416` | Comisión por encima del 10 % |
+| `417` | `withdraw_fees` tocaría fondos bloqueados |
+
+Límites: `min_stake` configurable (0.1 TON por defecto), `max_options = 8`, cierre entre 5 min y 365 días, reserva de 0.01 TON para almacenamiento.
+
+Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con un único ref; `bot/chain/bodies.py` la desenvuelve.
+
+---
+
+## 🧪 Pruebas
+
+```bash
+.venv/bin/python -m pytest          # suite offline: contrato espejo, puntos, API, seguridad
+cd contracts && node tests/escrow.test.js   # contrato real en el sandbox TVM
+```
+
+La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`, `FakeClient` para el indexer y claves Ed25519 sintéticas para `ton_proof`.
+
+---
+
+## 🤖 Comandos del bot
+
+| Comando | Descripción |
+| :--- | :--- |
+| `/start` | Menú principal y onboarding |
+| `/wallet` | Vincular wallet TON (ton_proof) |
+| `/mercados` | Mercados on-chain en sólo lectura |
+| `/predicciones` | Predicciones de puntos abiertas |
+| `/crear` | Crear una predicción de puntos (3 pasos) |
+| `/misbets` | Perfil, apuestas y rendimiento |
+| `/ranking` | Top 10 por puntos |
+| `/admin` | Panel de administrador (resolver, cancelar, on-chain) |
+| `/help` | Ayuda |
+| `/cancelar` | Cancelar la operación en curso |
+
+---
+
+## 📊 Product Backlog (estado)
+
+| ID | Feature | Estado |
+| :--- | :--- | :--- |
+| F001 | Onboarding guiado (`/start` + teclado inline) | ✅ |
+| F002 | Crear predicción por pasos (`ConversationHandler`) | ✅ |
+| F003 | Listar predicciones abiertas con paginación | ✅ |
+| F004 | Apostar puntos con confirmación | ✅ |
+| F005 | Perfil e historial (`/misbets`) | ✅ |
+| F006 | Ranking global (`/ranking`) | ✅ |
+| F007 | Recordatorios de cierre y notificación de resolución | ✅ |
+| F008 | Panel de administrador (puntos y on-chain) | ✅ |
+| F009 | Ayuda contextual (`/help`, botón “Cómo funciona”) | ✅ |
+| F010 | Modo grupo (predicciones por `chat_id`) | ✅ |
+| F011 | Mini App con TON Connect y `ton_proof` | ✅ |
+| F012 | Contrato escrow pari-mutuel + índice on-chain | ✅ |
+| F013 | Resolución oráculo automática (resultados deportivos) | ⬜ pendiente |
+| F014 | Retiros fiat / on-ramp | ⬜ pendiente |
+
+---
+
+## ⚠️ Aviso legal
+
+BetPoly es software: no es un operador de juego, no custodia fondos y no garantiza resultados de mercado. Los mercados con TON real pueden estar regulados en tu jurisdicción; el operador que despliegue el contrato es responsable de cumplir la normativa aplicable (licencias, KYC/AML, edad mínima y geobloqueo). Usa `testnet` hasta que tengas asesoría legal.

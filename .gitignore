@@ -7,7 +7,7 @@ __pycache__/
 *.egg
 *.egg-info/
 dist/
-build/
+/build/
 .eggs/
 
 # Virtual environments
@@ -15,6 +15,12 @@ venv/
 .venv/
 env/
 .env
+
+# Node / contratos
+node_modules/
+contracts/node_modules/
+# Local deploy output (addresses, keys never); the compiled BOC is tracked.
+contracts/build/deploy.json
 
 # Database
 *.db

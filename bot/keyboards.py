@@ -1,64 +1,117 @@
-"""Inline keyboard helpers for BetPoly_Bot."""
+"""Inline keyboard helpers for BetPoly_Bot.
+
+Telegram limits ``callback_data`` to 64 bytes, so callback payloads stay short
+and always carry the numeric ids only.
+"""
 from __future__ import annotations
 
-from typing import List
+from typing import Any, Dict, List, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+
+import config
+
+
+def _webapp(url: str, label: str = "🚀 Abrir Mini App") -> InlineKeyboardButton:
+    return InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
+
+
+def _esc_label(text: str, size: int = 34) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= size else text[: size - 1] + "…"
 
 
 # ---------------------------------------------------------------------------
 # Start / main menu
 # ---------------------------------------------------------------------------
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def main_menu_keyboard(*, is_admin: bool = False, wallet=None) -> InlineKeyboardMarkup:
+    settings = config.get_settings()
+    rows: List[List[InlineKeyboardButton]] = []
+
+    if settings.escrow_enabled:
+        rows.append([_webapp(settings.webapp_url, "⚡ Apostar TON (Mini App)")])
+
+    points_row: List[InlineKeyboardButton] = []
+    if settings.points_enabled:
+        points_row.append(
+            InlineKeyboardButton("📋 Predicciones", callback_data="list_predictions:0")
+        )
+        points_row.append(InlineKeyboardButton("➕ Crear", callback_data="cmd_crear"))
+    if points_row:
+        rows.append(points_row)
+
+    rows.append(
         [
-            [
-                InlineKeyboardButton("📋 Ver Predicciones", callback_data="list_predictions:0"),
-                InlineKeyboardButton("➕ Crear Predicción", callback_data="cmd_crear"),
-            ],
-            [
-                InlineKeyboardButton("🏆 Ranking", callback_data="ranking"),
-                InlineKeyboardButton("📊 Mis Apuestas", callback_data="my_bets"),
-            ],
-            [
-                InlineKeyboardButton("❓ Ayuda", callback_data="help"),
-            ],
+            InlineKeyboardButton("🏆 Ranking", callback_data="ranking"),
+            InlineKeyboardButton("📊 Perfil", callback_data="my_bets"),
         ]
     )
-
-
-# ---------------------------------------------------------------------------
-# Prediction list (paginated)
-# ---------------------------------------------------------------------------
-
-def predictions_list_keyboard(page: int, total_pages: int, pred_ids: List[int]) -> InlineKeyboardMarkup:
-    rows = []
-    for pred_id in pred_ids:
+    if settings.escrow_enabled:
+        wallet_label = "👛 Wallet vinculada" if wallet else "👛 Vincular wallet"
         rows.append(
-            [InlineKeyboardButton(f"🎲 Apostar", callback_data=f"bet_select:{pred_id}")]
+            [
+                InlineKeyboardButton(wallet_label, callback_data="wallet_info"),
+                InlineKeyboardButton("🌐 Mercados", callback_data="list_markets:0"),
+            ]
         )
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"list_predictions:{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("➡️ Siguiente", callback_data=f"list_predictions:{page + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")])
+    rows.append(
+        [
+            InlineKeyboardButton("❓ Ayuda", callback_data="help"),
+            InlineKeyboardButton("🔒 Cómo es no-custodial", callback_data="how_it_works"),
+        ]
+    )
+    if is_admin:
+        rows.append([InlineKeyboardButton("🔧 Admin", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
-# Bet flow
+# Off-chain predictions (virtual points)
 # ---------------------------------------------------------------------------
+
+def predictions_list_keyboard(
+    page: int, total_pages: int, predictions: List[Dict[str, Any]]
+) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for pred in predictions:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🎲 {_esc_label(pred['title'])}", callback_data=f"bet_select:{pred['id']}"
+                )
+            ]
+        )
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton("⬅️", callback_data=f"list_predictions:{page - 1}")
+        )
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(
+            InlineKeyboardButton("➡️", callback_data=f"list_predictions:{page + 1}")
+        )
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🏠 Menú", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
+
 
 def options_keyboard(prediction_id: int, options: List[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(opt["label"], callback_data=f"bet_option:{prediction_id}:{opt['id']}")]
+        [
+            InlineKeyboardButton(
+                _esc_label(opt["label"], 40),
+                callback_data=f"bet_option:{prediction_id}:{opt['id']}",
+            )
+        ]
         for opt in options
     ]
-    rows.append([InlineKeyboardButton("🔙 Volver", callback_data="list_predictions:0")])
+    rows.append(
+        [InlineKeyboardButton("🔙 Volver", callback_data="list_predictions:0")]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -67,13 +120,78 @@ def confirm_bet_keyboard(prediction_id: int, option_id: int, amount: int) -> Inl
         [
             [
                 InlineKeyboardButton(
-                    "✅ Confirmar apuesta",
+                    "✅ Confirmar",
                     callback_data=f"bet_confirm:{prediction_id}:{option_id}:{amount}",
                 ),
-                InlineKeyboardButton("❌ Cancelar", callback_data=f"bet_select:{prediction_id}"),
+                InlineKeyboardButton(
+                    "❌ Cancelar", callback_data=f"bet_select:{prediction_id}"
+                ),
             ]
         ]
     )
+
+
+def cancel_conversation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancelar", callback_data="create_cancel")]]
+    )
+
+
+def confirm_create_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Confirmar", callback_data="create_confirm"),
+                InlineKeyboardButton("❌ Cancelar", callback_data="create_cancel"),
+            ]
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# On-chain markets
+# ---------------------------------------------------------------------------
+
+def markets_list_keyboard(
+    page: int, total_pages: int, markets_list: List[Dict[str, Any]]
+) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for market in markets_list:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🔒 {_esc_label(market['title'])}",
+                    callback_data=f"market_view:{market['market_id']}",
+                )
+            ]
+        )
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"list_markets:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"list_markets:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    settings = config.get_settings()
+    if settings.escrow_enabled:
+        rows.append([_webapp(settings.webapp_url, "🚀 Abrir Mini App para apostar")])
+    rows.append([InlineKeyboardButton("🏠 Menú", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def market_detail_keyboard(market: Dict[str, Any]) -> InlineKeyboardMarkup:
+    settings = config.get_settings()
+    rows: List[List[InlineKeyboardButton]] = []
+    if settings.escrow_enabled:
+        rows.append([_webapp(settings.webapp_url, "🎲 Apostar en la Mini App")])
+    if market.get("status") == "open":
+        rows.append(
+            [InlineKeyboardButton("🔄 Actualizar", callback_data=f"market_view:{market['market_id']}")]
+        )
+    rows.append([InlineKeyboardButton("🔙 Mercados", callback_data="list_markets:0")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -82,16 +200,26 @@ def confirm_bet_keyboard(prediction_id: int, option_id: int, amount: int) -> Inl
 
 def admin_predictions_keyboard(predictions: List[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"📌 {p['title'][:40]}", callback_data=f"admin_resolve:{p['id']}")]
+        [
+            InlineKeyboardButton(
+                f"📌 {_esc_label(p['title'], 36)}", callback_data=f"admin_resolve:{p['id']}"
+            )
+        ]
         for p in predictions
     ]
+    rows.append([InlineKeyboardButton("🔒 Mercados on-chain", callback_data="admin_chain:0")])
     rows.append([InlineKeyboardButton("🔙 Salir", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
 
 
 def admin_options_keyboard(pred_id: int, options: List[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"✅ {opt['label']}", callback_data=f"admin_winner:{pred_id}:{opt['id']}")]
+        [
+            InlineKeyboardButton(
+                f"✅ {_esc_label(opt['label'], 36)}",
+                callback_data=f"admin_winner:{pred_id}:{opt['id']}",
+            )
+        ]
         for opt in options
     ]
     rows.append([InlineKeyboardButton("🔙 Volver", callback_data="admin_panel")])
@@ -112,14 +240,70 @@ def confirm_resolve_keyboard(pred_id: int, option_id: int) -> InlineKeyboardMark
     )
 
 
+def admin_chain_markets_keyboard(
+    page: int, total_pages: int, markets_list: List[Dict[str, Any]]
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🔒 {_esc_label(m['title'], 34)}",
+                callback_data=f"admin_chain_market:{m['market_id']}",
+            )
+        ]
+        for m in markets_list
+    ]
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_chain:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_chain:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Volver", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_chain_options_keyboard(market_id: int, options: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🏁 {_esc_label(opt['label'], 34)}",
+                callback_data=f"admin_chain_win:{market_id}:{opt['idx']}",
+            )
+        ]
+        for opt in options
+    ]
+    rows.append(
+        [InlineKeyboardButton("🔙 Volver", callback_data="admin_chain_market:%d" % market_id)]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_chain_market_keyboard(market_id: int, status: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if status == "open":
+        rows.append(
+            [InlineKeyboardButton("🏁 Resolver", callback_data=f"admin_chain_options:{market_id}")]
+        )
+        rows.append(
+            [InlineKeyboardButton("🛑 Cancelar mercado", callback_data=f"admin_chain_cancel:{market_id}")]
+        )
+    rows.append([InlineKeyboardButton("🔄 Actualizar", callback_data=f"admin_chain_market:{market_id}")])
+    rows.append([InlineKeyboardButton("🔙 Volver", callback_data="admin_chain:0")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
 
-def back_to_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")]]
-    )
+def back_to_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")]]
+    if config.get_settings().escrow_enabled:
+        rows.insert(0, [_webapp(config.get_settings().webapp_url, "🚀 Mini App")])
+    return InlineKeyboardMarkup(rows)
 
 
 def refresh_ranking_keyboard() -> InlineKeyboardMarkup:
@@ -129,3 +313,25 @@ def refresh_ranking_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")],
         ]
     )
+
+
+def help_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("📖 ¿Cómo funciona?", callback_data="how_it_works")]]
+    settings = config.get_settings()
+    if settings.escrow_enabled:
+        rows.insert(0, [_webapp(settings.webapp_url, "🚀 Abrir Mini App")])
+    rows.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def wallet_keyboard(wallet: Optional[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    settings = config.get_settings()
+    rows: List[List[InlineKeyboardButton]] = []
+    if settings.escrow_enabled:
+        rows.append([_webapp(settings.webapp_url, "👛 Vincular wallet en la Mini App")])
+    if wallet:
+        rows.append(
+            [InlineKeyboardButton("🔓 Desvincular", callback_data="wallet_unlink")]
+        )
+    rows.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
