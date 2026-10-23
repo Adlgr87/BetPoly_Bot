@@ -23,7 +23,17 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import aiosqlite
 
@@ -696,104 +706,26 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
     * If nobody picked the winning option (or there are no bets) every stake is
       refunded instead of silently burning points.
     * Idempotent: resolving twice raises instead of paying twice.
+
+    El cuerpo queda como una secuencia de pasos con nombre (R-07): validar,
+    leer, planificar pagos, escribir y encolar avisos. La aritmética vive en
+    `bot/economics.py` y en `_plan_payouts`, nunca aquí.
     """
-    settings = config.get_settings()
     async with transaction() as db:
-        async with db.execute("SELECT * FROM predictions WHERE id = ?", (pred_id,)) as cur:
-            pred = await cur.fetchone()
-        if pred is None:
-            raise DatabaseError("Predicción no encontrada.")
-        if pred["status"] == "resolved":
-            raise DatabaseError("Esta predicción ya fue resuelta.")
-        if pred["status"] not in ("open", "closed"):
-            raise DatabaseError("Esta predicción no se puede resolver.")
-
-        async with db.execute(
-            "SELECT id, label FROM options WHERE id = ? AND prediction_id = ?",
-            (winning_option_id, pred_id),
-        ) as cur:
-            option = await cur.fetchone()
-        if option is None:
-            raise DatabaseError("La opción ganadora no pertenece a esta predicción.")
-        winning_label = option["label"]
-
-        async with db.execute(
-            "SELECT id, user_id, option_id, amount FROM bets WHERE prediction_id = ? ORDER BY id",
-            (pred_id,),
-        ) as cur:
-            bets = [dict(r) for r in await cur.fetchall()]
-
-        total_pool = sum(int(b["amount"]) for b in bets)
-        winners = [b for b in bets if int(b["option_id"]) == int(winning_option_id)]
-        winning_pool = sum(int(b["amount"]) for b in winners)
-
-        settlements: List[BetSettlement] = []
-        rake = 0
-
-        if not bets:
-            payouts: Dict[int, int] = {}
-        elif winning_pool == 0:
-            # Nobody was right: full refund, no rake.
-            payouts = {b["id"]: int(b["amount"]) for b in bets}
-        else:
-            distributable = economics.distributable(total_pool, settings.house_rake_bps)
-            rake = total_pool - distributable
-            payouts = _split_payouts(winners, distributable, winning_pool)
-
-        now = iso_now()
-        for bet in bets:
-            payout = int(payouts.get(bet["id"], 0))
-            if not bets or winning_pool == 0:
-                result = "refund"
-            elif int(bet["option_id"]) == int(winning_option_id):
-                result = "win"
-            else:
-                result = "lose"
-            await db.execute(
-                "UPDATE bets SET result = ?, payout = ? WHERE id = ?",
-                (result, payout, bet["id"]),
-            )
-            if payout:
-                await db.execute(
-                    "UPDATE users SET points = points + ?, updated_at = ? WHERE user_id = ?",
-                    (payout, now, bet["user_id"]),
-                )
-            settlements.append(
-                BetSettlement(
-                    bet_id=int(bet["id"]),
-                    user_id=int(bet["user_id"]),
-                    option_id=int(bet["option_id"]),
-                    stake=int(bet["amount"]),
-                    payout=payout,
-                    result=result,
-                )
-            )
-
-        await db.execute(
-            "UPDATE predictions SET status = 'resolved', winner_opt = ?, resolved_at = ? WHERE id = ?",
-            (winning_label, now, pred_id),
+        pred = await _resolvable_prediction(db, pred_id)
+        winning_label = await _winning_label(db, pred_id, winning_option_id)
+        bets = await _prediction_bets(db, pred_id)
+        total_pool, winning_pool = _pool_totals(bets, winning_option_id)
+        plan = _plan_payouts(
+            bets, winning_option_id, total_pool, winning_pool, config.get_settings().house_rake_bps
         )
 
-        # F-04: quien ganó o recuperó puntos merece saberlo. Se escribe en la
-        # misma transacción, así que no puede haber liquidación sin aviso ni
-        # aviso de una liquidación que no ocurrió. `queue` deduplica.
-        for settlement in settlements:
-            if settlement.result not in ("win", "refund"):
-                continue
-            await _queue_notification(
-                db,
-                settlement.user_id,
-                NOTIFICATION_PREDICTION_RESULT,
-                pred_id,
-                {
-                    "prediction_id": pred_id,
-                    "title": pred["title"],
-                    "winning_label": winning_label,
-                    "result": settlement.result,
-                    "stake": settlement.stake,
-                    "payout": settlement.payout,
-                },
-            )
+        settlements = await _write_settlements(db, bets, winning_option_id, plan)
+        await db.execute(
+            "UPDATE predictions SET status = 'resolved', winner_opt = ?, resolved_at = ? WHERE id = ?",
+            (winning_label, iso_now(), pred_id),
+        )
+        await _queue_result_notifications(db, pred, pred_id, winning_label, settlements)
 
     return SettlementResult(
         prediction_id=pred_id,
@@ -801,9 +733,151 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
         winning_label=winning_label,
         total_pool=total_pool,
         winning_pool=winning_pool,
-        rake=rake,
+        rake=plan.rake,
         bets=settlements,
     )
+
+
+class _SettlementPlan(NamedTuple):
+    """Qué cobra cada apuesta y cuánto se queda el rake."""
+
+    payouts: Dict[int, int]
+    rake: int
+    refunded: bool
+
+
+async def _resolvable_prediction(db: aiosqlite.Connection, pred_id: int) -> aiosqlite.Row:
+    async with db.execute("SELECT * FROM predictions WHERE id = ?", (pred_id,)) as cur:
+        pred = await cur.fetchone()
+    if pred is None:
+        raise DatabaseError("Predicción no encontrada.")
+    if pred["status"] == "resolved":
+        raise DatabaseError("Esta predicción ya fue resuelta.")
+    if pred["status"] not in ("open", "closed"):
+        raise DatabaseError("Esta predicción no se puede resolver.")
+    return pred
+
+
+async def _winning_label(
+    db: aiosqlite.Connection, pred_id: int, winning_option_id: int
+) -> str:
+    async with db.execute(
+        "SELECT id, label FROM options WHERE id = ? AND prediction_id = ?",
+        (winning_option_id, pred_id),
+    ) as cur:
+        option = await cur.fetchone()
+    if option is None:
+        raise DatabaseError("La opción ganadora no pertenece a esta predicción.")
+    return option["label"]
+
+
+async def _prediction_bets(db: aiosqlite.Connection, pred_id: int) -> List[Dict[str, Any]]:
+    async with db.execute(
+        "SELECT id, user_id, option_id, amount FROM bets WHERE prediction_id = ? ORDER BY id",
+        (pred_id,),
+    ) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+def _pool_totals(bets: List[Dict[str, Any]], winning_option_id: int) -> Tuple[int, int]:
+    total = sum(int(b["amount"]) for b in bets)
+    winning = sum(
+        int(b["amount"]) for b in bets if int(b["option_id"]) == int(winning_option_id)
+    )
+    return total, winning
+
+
+def _plan_payouts(
+    bets: List[Dict[str, Any]],
+    winning_option_id: int,
+    total_pool: int,
+    winning_pool: int,
+    rake_bps: int,
+) -> _SettlementPlan:
+    """Cuánto cobra cada apuesta: reparto pari-mutuel, reembolso total o nada."""
+    if not bets or winning_pool == 0:
+        # Sin apuestas, o sin nadie que acierte: se devuelve todo y no hay rake.
+        return _SettlementPlan({b["id"]: int(b["amount"]) for b in bets}, 0, True)
+    distributable = economics.distributable(total_pool, rake_bps)
+    winners = [b for b in bets if int(b["option_id"]) == int(winning_option_id)]
+    return _SettlementPlan(
+        _split_payouts(winners, distributable, winning_pool),
+        total_pool - distributable,
+        False,
+    )
+
+
+def _bet_result(option_id: int, winning_option_id: int, refunded: bool) -> str:
+    if refunded:
+        return "refund"
+    return "win" if int(option_id) == int(winning_option_id) else "lose"
+
+
+async def _write_settlements(
+    db: aiosqlite.Connection,
+    bets: List[Dict[str, Any]],
+    winning_option_id: int,
+    plan: _SettlementPlan,
+) -> List[BetSettlement]:
+    """Marca cada apuesta, paga a quien corresponda y devuelve el resumen."""
+    settlements: List[BetSettlement] = []
+    now = iso_now()
+    for bet in bets:
+        payout = int(plan.payouts.get(bet["id"], 0))
+        result = _bet_result(int(bet["option_id"]), winning_option_id, plan.refunded)
+        await db.execute(
+            "UPDATE bets SET result = ?, payout = ? WHERE id = ?",
+            (result, payout, bet["id"]),
+        )
+        if payout:
+            await db.execute(
+                "UPDATE users SET points = points + ?, updated_at = ? WHERE user_id = ?",
+                (payout, now, bet["user_id"]),
+            )
+        settlements.append(
+            BetSettlement(
+                bet_id=int(bet["id"]),
+                user_id=int(bet["user_id"]),
+                option_id=int(bet["option_id"]),
+                stake=int(bet["amount"]),
+                payout=payout,
+                result=result,
+            )
+        )
+    return settlements
+
+
+async def _queue_result_notifications(
+    db: aiosqlite.Connection,
+    pred: aiosqlite.Row,
+    pred_id: int,
+    winning_label: str,
+    settlements: List[BetSettlement],
+) -> None:
+    """F-04: quien ganó o recuperó puntos merece saberlo.
+
+    Se escribe en la misma transacción, así que no puede haber liquidación sin
+    aviso ni aviso de una liquidación que no ocurrió. `_queue_notification`
+    deduplica. Perder no se notifica: `/misbets` es la fuente de verdad y un
+    aviso por cada derrota sería ruido.
+    """
+    for settlement in settlements:
+        if settlement.result not in ("win", "refund"):
+            continue
+        await _queue_notification(
+            db,
+            settlement.user_id,
+            NOTIFICATION_PREDICTION_RESULT,
+            pred_id,
+            {
+                "prediction_id": pred_id,
+                "title": pred["title"],
+                "winning_label": winning_label,
+                "result": settlement.result,
+                "stake": settlement.stake,
+                "payout": settlement.payout,
+            },
+        )
 
 
 async def resolve_prediction(pred_id: int, winning_option_id: int) -> str:

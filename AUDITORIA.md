@@ -325,8 +325,16 @@ No se encontraron secretos, mnemónicos ni direcciones hardcodeadas. Lo que sí 
 
 **Resuelto (Fase 6):** regenerado a 512×512 con paleta de 64 colores: **79 408 B** (−91 %). `scripts/build_icon.py` lo reproduce de forma idempotente y falla si supera los 80 KB; un test vigila el presupuesto.
 
-### R-07 — 🟡 Complejidad alta en el núcleo de dinero
+### R-07 — ✅ Complejidad alta en el núcleo de dinero
 `radon`: `verify_ton_proof` E36, `_process_tx` D26, `_send_profile` D25, `validate_init_data` D22, `verify_wallet` C19, `settle_prediction` C18, `_fetch` C18, `market_view` C16, `prepare_transaction_payload` C16, `bet_amount_message` C16, `prepare_create_market` C14, `Settings.validate` C14. `verify_ton_proof` y `settle_prediction` son las que más se beneficiarían de dividirse en pasos.
+
+**Resuelto (Fase 6):** `verify_ton_proof` pasa de complejidad 36 a **2** y
+`settle_prediction` de 20 a **1**, divididas en pasos con nombre (validar
+dominio, marca de tiempo, payload, firma y dirección; planificar pagos, escribir
+liquidaciones y encolar avisos) sin cambiar el comportamiento: las suites
+existentes siguen verdes sin tocarlas. `tests/test_complexity.py` mide McCabe
+sobre el AST: ninguna función nueva pasa de 12, las 16 que ya estaban arriba
+tienen un techo congelado y las dos funciones de dinero, tope duro de 8.
 
 ### R-08 — ✅ Encuesta cada 25 s con la pestaña visible
 `web/static/app.js` mantiene `setInterval(... 25000)` sobre `/api/markets` mientras la vista de mercados está activa, además de `pollMarket` (12 × 6 s) y `pollForMarket` (15 × 5 s) tras cada acción. En un servidor de 512 MB con muchos usuarios concurrentes, es el mayor consumidor de CPU. El indexador por defecto también encuesta cada 20 s (`INDEXER_POLL_INTERVAL`).

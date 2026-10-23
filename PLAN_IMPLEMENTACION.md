@@ -440,6 +440,7 @@ cliente HTTP real. Todo queda fijado en `tests/test_performance.py` y
 | R-06 | `icon.png` a 512×512 WebP/PNG optimizado (<80 KB) | test que falla si un asset estático supera el presupuesto | ✅ 921 682 B → **79 408 B** (−91 %), `scripts/build_icon.py` reproducible |
 | R-09 | `Cache-Control: public, max-age=31536000, immutable` para assets versionados; gzip en memoria para `/static/*.js|css` | test de cabeceras | ✅ `?v=<huella>` → inmutable; gzip memoizado; `ETag` + `304` en el resto |
 | R-08 | Polling adaptativo: `setInterval` 25 s → backoff 15/30/60 s; `ETag` en `/api/markets` con `304` | test de que un segundo GET devuelve 304 | ✅ sin `setInterval`; escalones 15/30/60 s con reinicio por actividad; `/api/markets` responde `304` |
+| R-07 | Dividir `verify_ton_proof` (E36) y `settle_prediction` (C18) en pasos con nombre | test de complejidad sobre el AST con trinquete | ✅ 36 → **2** y 20 → **1**; queda una lista base de 16 funciones que solo puede encogerse |
 
 **Presupuesto de arranque de la Mini App:** HTML+CSS+JS+icono < 350 KB comprimidos.
 Medido: **93.3 KB** (index.html 2.4 + styles.css 3.0 + app.js 10.5 + icono 77.5),
@@ -455,6 +456,10 @@ frente a los 921 KB del icono anterior.
   lento nunca encola el siguiente y volver a la pestaña reinicia en 15 s.
 - El presupuesto de activos es un test (`STARTUP_BUDGET_BYTES`, `ICON_BUDGET_BYTES`),
   no una convención: un PNG de 900 KB falla el CI.
+- La complejidad también es un test (`tests/test_complexity.py`, McCabe sobre el
+  AST, sin dependencias nuevas): ninguna función nueva pasa de 12, las 16 que ya
+  estaban por encima tienen un techo congelado y las dos del núcleo de dinero
+  tienen tope duro de 8. Una función puede salir del baseline; nunca entrar.
 
 ---
 

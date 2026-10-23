@@ -387,6 +387,10 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - **R-04 · `SCAN` en `onchain_bets`.** Índice `idx_onchain_bets_bettor(bettor, id DESC)`.
 - **R-05 · Dos `TEMP B-TREE`.** Índices `idx_markets_status_close(status, closes_at,
   market_id DESC)` e `idx_onchain_bets_mkt_opt(market_id, option)`.
+- **R-07 · Complejidad del núcleo de dinero.** `verify_ton_proof` (36 → 2) y
+  `settle_prediction` (20 → 1) se parten en pasos con nombre, sin cambiar el
+  comportamiento: las suites de `ton_proof` y de liquidación siguen verdes sin
+  editarlas. Un test de McCabe sobre el AST congela un techo por función.
 - **R-06 · Icono de 921 KB.** `web/static/icon.png` pasa a 512×512 con paleta de
   64 colores: **79 408 B** (−91 %). `scripts/build_icon.py` lo regenera y falla
   si supera los 80 KB.
@@ -405,6 +409,9 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
   fuera del directorio estático, `ETag` de `/api/markets` y presupuesto de
   arranque (**93.3 KB** comprimidos frente a 350 KB) como test.
 - `scripts/build_icon.py`: generación reproducible del icono con tope de tamaño.
+- `tests/test_complexity.py`: trinquete de complejidad ciclomática calculada
+  sobre el AST (sin dependencias nuevas), con baseline que solo encoge y tope
+  duro para las funciones que mueven dinero.
 - CI: el umbral de cobertura global sube de 80 % a **83 %** (medido: 84.8 %).
 
 ### Arreglado (CI)
@@ -430,5 +437,6 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 
 ### Pendiente
 - Fase 7: mantenibilidad, dependencias y tooling del contrato.
-- R-07 (complejidad de `verify_ton_proof` y `settle_prediction`) sigue abierto:
-  no se tocó en esta fase para no mezclar refactor con rendimiento.
+- R-07 queda cerrado para las dos funciones del núcleo de dinero; las 16
+  funciones del baseline (indexer, `config.validate`, `verify_wallet`) se
+  dividen en la Fase 7 con el trinquete ya puesto.
