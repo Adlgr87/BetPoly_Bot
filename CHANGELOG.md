@@ -412,7 +412,7 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - `tests/test_complexity.py`: trinquete de complejidad ciclomática calculada
   sobre el AST (sin dependencias nuevas), con baseline que solo encoge y tope
   duro para las funciones que mueven dinero.
-- CI: el umbral de cobertura global sube de 80 % a **83 %** (medido: 84.8 %).
+- CI: el umbral de cobertura global sube de 80 % a **83 %** (medido: 85.0 %).
 
 ### Arreglado (CI)
 - **`npm audit` rompía el build por un advisory sin parche.** Un aviso nuevo
