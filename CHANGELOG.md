@@ -387,6 +387,12 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - **R-04 · `SCAN` en `onchain_bets`.** Índice `idx_onchain_bets_bettor(bettor, id DESC)`.
 - **R-05 · Dos `TEMP B-TREE`.** Índices `idx_markets_status_close(status, closes_at,
   market_id DESC)` e `idx_onchain_bets_mkt_opt(market_id, option)`.
+- **F-04 (duplicado) · El admin avisaba dos veces.** `admin_confirm_callback`
+  enviaba los mensajes de victoria en el acto *y* `settle_prediction` los
+  encolaba en el outbox: cada ganador recibía dos avisos (uno inmediato y otro
+  del job 30 s después) y los perdedores uno que la política decidió no enviar.
+  El panel ahora solo muestra el resumen; los avisos salen únicamente del
+  outbox, con dedupe, backoff y sin bloquear la liquidación si Telegram falla.
 - **R-07 · Complejidad del núcleo de dinero.** `verify_ton_proof` (36 → 2) y
   `settle_prediction` (20 → 1) se parten en pasos con nombre, sin cambiar el
   comportamiento: las suites de `ton_proof` y de liquidación siguen verdes sin

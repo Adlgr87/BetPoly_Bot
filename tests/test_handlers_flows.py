@@ -553,9 +553,11 @@ class TestAdminResolvePoints:
         )
         await admin_handler.admin_confirm_callback(update, context)
         assert any("Predicción resuelta" in e["text"] for e in recorder.events)
-        # Avisa a quien ganó (F-04 mediante el outbox) y al perdedor por chat.
-        assert any(e["kind"] == "send" for e in recorder.events)
+        # Los avisos salen **solo** por el outbox (F-04): un `send` directo aquí
+        # duplicaría el mensaje que el job envía 30 s después.
+        assert not any(e["kind"] == "send" for e in recorder.events)
         assert len(await db.notifications_for(1)) == 1
+        assert await db.notifications_for(2) == []
 
     async def test_winner_without_pool_says_refund(self, db):
         pred_id = await _prediction(db)
@@ -584,6 +586,7 @@ class TestAdminResolvePoints:
         assert "❌" in recorder.last["text"]
 
     async def test_bet_notification_failure_does_not_break_resolution(self, db):
+        """Un Telegram caído no puede frenar una liquidación ya escrita."""
         pred_id = await self._ready(db)
         options = await db.get_options(pred_id)
         update, context, recorder = make_update(
@@ -592,6 +595,8 @@ class TestAdminResolvePoints:
         context.bot.error = RuntimeError("usuario bloqueó el bot")
         await admin_handler.admin_confirm_callback(update, context)
         assert any("Predicción resuelta" in e["text"] for e in recorder.events)
+        # El aviso queda encolado y el job lo reintenta; nada se perdió.
+        assert len(await db.notifications_for(1)) == 1
 
 
 class TestAdminChain:

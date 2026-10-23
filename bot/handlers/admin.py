@@ -10,7 +10,6 @@ Two different jobs live here:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -247,39 +246,10 @@ async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
     if result.rake:
         summary += f"\n🏦 Comisión de la casa: {bold(fmt_points(result.rake))} pts"
 
+    # Los avisos a los ganadores ya están encolados en la misma transacción
+    # (F-04, outbox con dedupe y backoff). Enviarlos aquí otra vez duplicaría
+    # el mensaje: el resumen se queda para el admin y el job hace el resto.
     await edit_or_reply(update, summary, reply_markup=back_keyboard(update))
-    await _notify_bettors(context, result)
-
-
-async def _notify_bettors(context: ContextTypes.DEFAULT_TYPE, result: database.SettlementResult) -> None:
-    for index, bet in enumerate(result.bets, start=1):
-        if bet.result == "win":
-            text = (
-                "🎉 <b>¡Ganaste!</b>\n\n"
-                f"🎯 {esc(result.title)}\n"
-                f"🏁 Opción: <b>{esc(result.winning_label)}</b>\n"
-                f"🪙 Apostaste {bold(fmt_points(bet.stake))} → recibes "
-                f"<b>{bold(fmt_points(bet.payout))}</b> puntos."
-            )
-        elif bet.result == "refund":
-            text = (
-                "↩️ <b>Reembolso</b>\n\n"
-                f"🎯 {esc(result.title)}\n"
-                f"🪙 Te devolvemos <b>{fmt_points(bet.payout)}</b> puntos."
-            )
-        else:
-            text = (
-                "😢 <b>Esta vez no fue</b>\n\n"
-                f"🎯 {esc(result.title)}\n"
-                f"🏁 Ganó: <b>{esc(result.winning_label)}</b>\n"
-                f"🪙 Perdiste {bold(fmt_points(bet.stake))} puntos."
-            )
-        try:
-            await context.bot.send_message(chat_id=bet.user_id, text=text, parse_mode="HTML")
-        except Exception as exc:  # noqa: BLE001 - user blocked the bot
-            logger.debug("Could not notify user %s: %s", bet.user_id, exc)
-        if index % 20 == 0:
-            await asyncio.sleep(1)  # stay under Telegram's flood limit
 
 
 # ---------------------------------------------------------------------------
