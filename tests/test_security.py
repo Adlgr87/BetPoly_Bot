@@ -126,6 +126,35 @@ class TestNonces:
         nonce = await db.create_nonce(5, "ton_proof")
         assert await db.consume_nonce(nonce, 5, "ton_proof", ttl_seconds=0) is False
 
+    async def _insert_nonce(self, db, nonce: str, *, age_seconds: int) -> None:
+        created = int(time.time()) - age_seconds
+        async with db.connection() as conn:
+            await conn.execute(
+                "INSERT INTO auth_nonces (nonce, user_id, purpose, created_at) "
+                "VALUES (?, 5, 'ton_proof', ?)",
+                (nonce, created),
+            )
+            await conn.commit()
+
+    async def test_purge_nonces_keeps_the_fresh_ones(self, db):
+        await self._insert_nonce(db, "viejo", age_seconds=3 * 86_400)
+        await self._insert_nonce(db, "reciente", age_seconds=60)
+        await db.purge_nonces(86_400)
+        async with db.connection() as conn:
+            async with conn.execute("SELECT nonce FROM auth_nonces ORDER BY nonce") as cur:
+                remaining = [row["nonce"] for row in await cur.fetchall()]
+        assert remaining == ["reciente"]
+
+    async def test_create_nonce_purges_through_the_shared_policy(self, db):
+        """D-01: la caducidad vive en `purge_nonces`, no duplicada en el INSERT."""
+        await self._insert_nonce(db, "viejo", age_seconds=3 * 86_400)
+        await db.create_nonce(5, "ton_proof", ttl_seconds=600)
+        async with db.connection() as conn:
+            async with conn.execute(
+                "SELECT nonce FROM auth_nonces WHERE nonce = 'viejo'"
+            ) as cur:
+                assert await cur.fetchone() is None
+
 
 class TestRateLimiter:
     def test_allows_under_limit(self):
