@@ -22,6 +22,11 @@
     sheetMode: 'bet',
     verifying: false,
     pollTimer: null,
+    pollStep: 0,
+    marketsFingerprint: '',
+    quote: null,
+    quoteSeq: 0,
+    quoteTimer: null,
   };
 
   let tonConnectUI = null;
@@ -175,15 +180,43 @@
     bindEvents();
     await Promise.all([loadMarkets(), loadMine()]);
 
-    state.pollTimer = setInterval(() => {
-      if (document.visibilityState === 'visible' && state.view === 'markets') loadMarkets(true);
-    }, 25000);
+    schedulePoll();
+  }
+
+  /* R-08: sondeo adaptativo. Empieza en 15 s y, si nada cambia, se relaja a
+     30 s y luego a 60 s. Cualquier actividad del usuario (o un cambio real en
+     los mercados) vuelve a 15 s: se refresca rápido cuando importa y se deja
+     de gastar batería y datos cuando no pasa nada. */
+  const POLL_DELAYS = [15000, 30000, 60000];
+
+  function schedulePoll() {
+    const delay = POLL_DELAYS[Math.min(state.pollStep, POLL_DELAYS.length - 1)];
+    clearTimeout(state.pollTimer);
+    state.pollTimer = setTimeout(pollOnce, delay);
+  }
+
+  async function pollOnce() {
+    if (document.visibilityState === 'visible' && state.view === 'markets') {
+      const before = state.marketsFingerprint;
+      try {
+        await loadMarkets(true);
+      } catch (error) { /* se reintenta en el siguiente ciclo */ }
+      const changed = state.marketsFingerprint !== before;
+      state.pollStep = changed ? 0 : Math.min(state.pollStep + 1, POLL_DELAYS.length - 1);
+    }
+    schedulePoll();
+  }
+
+  function pollNow() {
+    // Interacción del usuario: el siguiente refresco vuelve a ser el más rápido.
+    state.pollStep = 0;
+    schedulePoll();
   }
 
   function showFatal(message) {
     const boot = $('#boot');
     boot.innerHTML = `<div class="boot-logo">⚠️</div><p>${esc(message)}</p>
-      <button class="primary" style="max-width:240px;margin:0 auto" onclick="location.reload()">Reintentar</button>`;
+      <button class="primary boot-retry" type="button" data-reload="1">Reintentar</button>`;
   }
 
   function applyConfig() {
@@ -192,7 +225,7 @@
       ? 'Mercados no-custodiales en TON'
       : 'Modo puntos (sin dinero real)';
     const gas = $('#create-gas');
-    if (gas) gas.textContent = cfg.create_gas_ton || '0.05';
+    if (gas) gas.textContent = cfg.create_gas_ton || '—';
     $('#escrow-label').textContent = cfg.escrow_address
       ? `Escrow: ${short(cfg.escrow_address, 6)}`
       : 'Escrow: no configurado';
@@ -377,7 +410,10 @@
         <span class="pill open">${esc(points)} puntos</span>
         <span class="pill">${state.myBets.length} apuestas on-chain</span>
         <span class="pill">${wins} ganadas</span>
-      </div>`;
+      </div>
+      ${state.wallet
+        ? `<button class="ghost" type="button" data-unlink-wallet="1">Desvincular wallet</button>`
+        : ''}`;
   }
 
   function marketCard(market) {
@@ -483,7 +519,10 @@
           <span>🪙 ${fmtTon(market.pool_ton)} TON</span>
           <span>⏰ ${fmtDate(market.closes_at)}</span>
         </div>
-        <button class="primary" data-admin-resolve="${market.market_id}">Resolver on-chain</button>
+        <div class="option-row">
+          <button class="primary" data-admin-resolve="${market.market_id}">Resolver on-chain</button>
+          <button class="ghost" data-admin-cancel="${market.market_id}">Cancelar y reembolsar</button>
+        </div>
       </article>`).join('');
   }
 
@@ -500,6 +539,8 @@
     try {
       const data = await api('/api/markets?status=open&limit=50', { auth: !!state.session });
       state.markets = data.markets || [];
+      // Huella para el sondeo adaptativo (R-08): si no cambió, se relaja.
+      state.marketsFingerprint = JSON.stringify(state.markets);
       renderMarkets();
       if (state.view === 'admin') renderAdmin();
     } catch (error) {
@@ -591,11 +632,16 @@
       </div>
       <div class="option-row">${options}</div>`;
 
+    if (market.resolving) {
+      body += `<p class="muted small">🔒 Resolución en curso: no se aceptan apuestas nuevas.</p>`;
+    }
+
     if (isOpen && !myBet) {
       body += `
         <label>Importe a apostar (TON)
           <div class="amount-row">
             <input id="bet-amount" type="number" inputmode="decimal" min="0" step="0.1"
+                   max="${esc(state.config.max_stake_ton || '')}"
                    placeholder="${esc(state.config.min_stake_ton)}" />
           </div>
         </label>
@@ -654,23 +700,53 @@
     }
     const option = state.selection.option;
     const amount = Number(state.selection.amount || 0);
-    const optionData = market.options.find((o) => o.index === option);
-    const total = Number(market.pool_ton || 0);
-    const pool = optionData ? Number(optionData.pool_ton || 0) : 0;
-    const potential = option != null && amount > 0 && total + amount > 0
-      ? (amount * (total + amount)) / (pool + amount)
-      : 0;
     if (option == null) {
       summary.textContent = 'Elige una opción.';
       confirm.disabled = true;
     } else if (!(amount >= Number(state.config.min_stake_ton))) {
       summary.textContent = `Escribe al menos ${state.config.min_stake_ton} TON.`;
       confirm.disabled = true;
+    } else if (!state.quote) {
+      // La economía la calcula el backend (/quote): aquí solo se formatea.
+      summary.textContent = 'Calculando el pago potencial…';
+      confirm.disabled = false;
     } else {
-      summary.innerHTML = `Pago potencial ≈ <b>${fmtTon(potential)} TON</b> · `
+      summary.innerHTML = `Pago potencial ≈ <b>${fmtTon(state.quote.payout_ton)} TON</b> · `
         + `se enviarán <b>${fmtTon(amount + Number(state.config.bet_gas_ton))} TON</b> (incluye gas).`;
       confirm.disabled = false;
     }
+  }
+
+  function scheduleQuote() {
+    clearTimeout(state.quoteTimer);
+    state.quote = null;
+    state.quoteTimer = setTimeout(requestQuote, 250);
+  }
+
+  async function requestQuote() {
+    const market = state.market;
+    const option = state.selection.option;
+    const amount = Number(state.selection.amount || 0);
+    if (!market || option == null || !(amount > 0)) {
+      state.quote = null;
+      updateSheetSummary();
+      return;
+    }
+    const seq = state.quoteSeq + 1;
+    state.quoteSeq = seq;
+    const stake = encodeURIComponent(state.selection.amount);
+    try {
+      const quote = await api(
+        `/api/markets/${market.market_id}/quote?option=${option}&stake_ton=${stake}`,
+        { auth: false },
+      );
+      if (seq !== state.quoteSeq) return;
+      state.quote = quote;
+    } catch (error) {
+      if (seq !== state.quoteSeq) return;
+      state.quote = null;
+    }
+    updateSheetSummary();
   }
 
   /* -------------------------------------------------------------- flows */
@@ -765,8 +841,9 @@
       return;
     }
     const closesAt = Math.floor(new Date(closeValue).getTime() / 1000);
-    if (!isFinite(closesAt) || closesAt < Math.floor(Date.now() / 1000) + 900) {
-      toast('El cierre debe ser al menos 15 minutos en el futuro.', 'error');
+    const minMinutes = Number(state.config.min_market_duration_min || 15);
+    if (!isFinite(closesAt) || closesAt < Math.floor(Date.now() / 1000) + minMinutes * 60) {
+      toast(`El cierre debe ser al menos ${minMinutes} minutos en el futuro.`, 'error');
       return;
     }
     busy(true);
@@ -844,6 +921,162 @@
     }
   }
 
+  /* --------------------------------------------------- contrato escrow */
+
+  const contract = { data: null };
+
+  function renderContract() {
+    const box = $('#contract-state');
+    if (!box || !contract.data) return;
+    const data = contract.data;
+    const paused = !!data.is_paused;
+    const tons = (nano) => `${fmtTon(Number(nano || 0) / 1e9)} TON`;
+    const rows = [
+      ['Estado', paused ? '⏸ pausado' : '▶️ activo'],
+      ['Comisión actual', `${data.fee_percent || '0.00'} %`],
+      ['Apuesta mínima', tons(data.min_stake_nano)],
+      ['Comisiones acumuladas', tons(data.fees_nano)],
+      ['Fondos de usuarios bloqueados', tons(data.total_locked_nano)],
+      ['Mercados creados', String(data.market_count == null ? '—' : data.market_count)],
+    ];
+    if (data.balance_nano != null) rows.push(['Balance del contrato', tons(data.balance_nano)]);
+    if (data.admin) rows.push(['Admin configurado', short(data.admin, 6)]);
+    const warnings = [];
+    if (data.stale) warnings.push('⚠️ Estado sin actualizar: la cadena no respondió.');
+    if (data.admin_matches_wallet === false) {
+      warnings.push('⚠️ Tu wallet vinculada no es la administradora: el contrato rechazaría la firma.');
+    }
+    if (data.admin_matches_wallet === null && data.admin) {
+      warnings.push('ℹ️ Vincula tu wallet en el bot para comprobar quién es el administrador.');
+    }
+    box.innerHTML = `
+      <dl class="contract-rows">
+        ${rows.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('')}
+      </dl>
+      ${warnings.map((text) => `<p class="muted small">${esc(text)}</p>`).join('')}`;
+
+    const pause = $('#contract-pause');
+    if (pause) pause.textContent = paused ? 'Reanudar contrato' : 'Pausar contrato';
+    const amount = $('#contract-withdraw-amount');
+    if (amount) {
+      const availableTon = Number(data.max_withdrawable_nano || data.fees_nano || 0) / 1e9;
+      amount.max = String(availableTon);
+    }
+  }
+
+  async function loadContract(force = false) {
+    const box = $('#contract-state');
+    if (!box) return;
+    if (!state.config || !state.config.escrow_enabled) {
+      box.textContent = 'Esta instancia no tiene contrato escrow configurado.';
+      return;
+    }
+    try {
+      const data = force
+        ? await api('/api/admin/contract?refresh=1')
+        : await api('/api/admin/contract');
+      contract.data = data;
+      renderContract();
+    } catch (error) {
+      contract.data = null;
+      box.textContent = friendlyError(error);
+    }
+  }
+
+  async function signContract(prepare, message) {
+    busy(true);
+    try {
+      const tx = await prepare();
+      busy(false);
+      await signTransaction(tx);
+      toast(message, 'ok');
+      loadContract(true);
+    } catch (error) {
+      busy(false);
+      toast(friendlyError(error), 'error');
+    }
+  }
+
+  async function contractWithdraw(event) {
+    event.preventDefault();
+    const amount = $('#contract-withdraw-amount').value.trim();
+    if (!amount) return;
+    if (!window.confirm(`¿Retirar ${amount} TON de comisiones? La firma la hace tu wallet.`)) return;
+    await signContract(
+      () => api('/api/admin/contract/withdraw/prepare', { method: 'POST', body: { amount } }),
+      'Retiro enviado. El indexador lo confirmará en unos segundos.');
+  }
+
+  async function contractSetFee(event) {
+    event.preventDefault();
+    const percent = $('#contract-fee-percent').value.trim();
+    if (!percent) return;
+    if (!window.confirm(`¿Cambiar la comisión al ${percent} %? Solo afecta a mercados nuevos.`)) return;
+    await signContract(
+      () => api('/api/admin/contract/set-fee/prepare', { method: 'POST', body: { percent } }),
+      'Comisión enviada. Se aplicará a los mercados creados desde ahora.');
+  }
+
+  async function contractSetPaused() {
+    if (!contract.data) return;
+    const paused = !contract.data.is_paused;
+    const question = paused
+      ? '¿Pausar el contrato? Nadie podrá crear mercados ni apostar.'
+      : '¿Reanudar el contrato? Se volverán a aceptar mercados y apuestas.';
+    if (!window.confirm(question)) return;
+    await signContract(
+      () => api('/api/admin/contract/set-paused/prepare', { method: 'POST', body: { paused } }),
+      paused ? 'Contrato pausado.' : 'Contrato reanudado.');
+  }
+
+  async function contractChangeAdmin(event) {
+    event.preventDefault();
+    const address = $('#contract-admin-address').value.trim();
+    if (!address) return;
+    const sure = window.confirm(
+      `Vas a transferir la administración a:\n${address}\n\nEs irreversible. ¿Continuar?`);
+    if (!sure) return;
+    await signContract(
+      () => api('/api/admin/contract/change-admin/prepare', { method: 'POST', body: { address } }),
+      'Cambio de administrador enviado. Verifícalo on-chain antes de cerrar.');
+  }
+
+  async function unlinkWallet() {
+    if (!state.wallet) return;
+    const sure = window.confirm(
+      '¿Desvincular esta wallet de tu cuenta?\n\nPodrás volver a conectarla cuando quieras.');
+    if (!sure) return;
+    busy(true);
+    try {
+      await api('/api/wallet', { method: 'DELETE' });
+      busy(false);
+      state.wallet = null;
+      renderWallet();
+      renderProfile();
+      toast('Wallet desvinculada.', 'ok');
+    } catch (error) {
+      busy(false);
+      toast(friendlyError(error), 'error');
+    }
+  }
+
+  async function adminCancelMarket(marketId) {
+    const sure = window.confirm(
+      `¿Cancelar el mercado #${marketId}?\n\nTodos podrán reclamar su reembolso completo.`);
+    if (!sure) return;
+    busy(true);
+    try {
+      const tx = await api(`/api/admin/markets/${marketId}/cancel/prepare`, { method: 'POST' });
+      busy(false);
+      await signTransaction(tx);
+      toast('Cancelación enviada. El indexador la confirmará.', 'ok');
+      switchView('admin');
+    } catch (error) {
+      busy(false);
+      toast(friendlyError(error), 'error');
+    }
+  }
+
   async function loadAdminStatus() {
     try {
       const status = await api('/api/indexer');
@@ -864,9 +1097,15 @@
       const section = document.getElementById(`view-${name}`);
       if (section) section.classList.toggle('hidden', name !== view);
     });
-    if (view === 'admin') loadAdminStatus();
+    if (view === 'admin') {
+      loadAdminStatus();
+      loadContract();
+    }
     if (view === 'mine') loadMine();
-    if (view === 'markets') loadMarkets(true);
+    if (view === 'markets') {
+      pollNow();
+      loadMarkets(true);
+    }
   }
 
   /* ------------------------------------------------------------- events */
@@ -879,6 +1118,17 @@
     $('#wallet-chip').addEventListener('click', connectWallet);
     $('#reconnect').addEventListener('click', reconnectWallet);
     $('#refresh-markets').addEventListener('click', () => loadMarkets());
+    const contractBindings = [
+      ['#contract-refresh', 'click', () => loadContract(true)],
+      ['#contract-withdraw-form', 'submit', contractWithdraw],
+      ['#contract-fee-form', 'submit', contractSetFee],
+      ['#contract-admin-form', 'submit', contractChangeAdmin],
+      ['#contract-pause', 'click', contractSetPaused],
+    ];
+    contractBindings.forEach(([selector, event, handler]) => {
+      const el = $(selector);
+      if (el) el.addEventListener(event, handler);
+    });
     $('#create-form').addEventListener('submit', createMarket);
     $('#sheet-confirm').addEventListener('click', () => {
       if (state.sheetMode === 'resolve') confirmResolve();
@@ -889,6 +1139,23 @@
     });
 
     document.addEventListener('click', (event) => {
+      const reloadEl = event.target.closest('[data-reload]');
+      if (reloadEl) {
+        window.location.reload();
+        return;
+      }
+      const unlinkEl = event.target.closest('[data-unlink-wallet]');
+      if (unlinkEl) {
+        unlinkWallet();
+        return;
+      }
+      const cancelEl = event.target.closest('[data-admin-cancel]');
+      if (cancelEl) {
+        adminCancelMarket(Number(cancelEl.dataset.adminCancel)).catch((error) => {
+          toast(friendlyError(error), 'error');
+        });
+        return;
+      }
       const openEl = event.target.closest('[data-open-market]');
       if (openEl) {
         openMarket(Number(openEl.dataset.openMarket));
@@ -911,6 +1178,7 @@
         document.querySelectorAll('[data-pick-option]').forEach((el) => {
           el.classList.toggle('selected', el === pick);
         });
+        scheduleQuote();
         updateSheetSummary();
         return;
       }
@@ -928,6 +1196,7 @@
         const input = $('#bet-amount');
         if (input) input.value = quick.dataset.quick;
         state.selection.amount = quick.dataset.quick;
+        scheduleQuote();
         updateSheetSummary();
         return;
       }
@@ -942,12 +1211,14 @@
     document.addEventListener('input', (event) => {
       if (event.target && event.target.id === 'bet-amount') {
         state.selection.amount = event.target.value;
+        scheduleQuote();
         updateSheetSummary();
       }
     });
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
+        pollNow();
         loadMarkets(true);
         loadMine();
       }

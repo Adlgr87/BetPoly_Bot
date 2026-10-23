@@ -148,7 +148,7 @@ class TestMarketLifecycle:
         assert len(market["options"]) == 3
 
     async def test_resolve_and_cancel_events(self, indexer_factory, db):
-        await db.upsert_market(7, ALICE, "Mercado", 2, 1_800_000_100)
+        await db.enrich_market_from_event(7, ALICE, "Mercado", 2, 1_800_000_100)
         txs = [
             make_tx(20, outs=[out_msg(INDEXER_ADDR, resolved_event(7, 1, 5_000, 3_000))]),
             make_tx(21, outs=[out_msg(INDEXER_ADDR, cancelled_event(7))]),
@@ -164,7 +164,7 @@ class TestMarketLifecycle:
 
 class TestBets:
     async def test_bet_is_mirrored_and_pending_intent_consumed(self, indexer_factory, db):
-        await db.upsert_market(1, ALICE, "M", 2, 1_800_003_600)
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
         await db.create_pending_action(1, "bet", match_a=BOB, match_b="1", payload={"option": 0})
         txs = [
             make_tx(30, inbound=BOB, body=bodies.build_place_bet(1, 0, 1_500_000_000)),
@@ -177,20 +177,20 @@ class TestBets:
         assert await db.find_pending_action("bet", match_a=BOB, match_b="1") is None
 
     async def test_rejected_bet_is_not_recorded(self, indexer_factory, db):
-        await db.upsert_market(1, ALICE, "M", 2, 1_800_003_600)
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
         txs = [make_tx(31, inbound=BOB, body=bodies.build_place_bet(1, 0, 1_500_000_000), success=False)]
         result = await indexer_factory(txs).run_once()
         assert result.bets == 0
         assert await db.get_onchain_bet(1, BOB) is None
 
     async def test_bet_below_minimum_is_ignored(self, indexer_factory, db):
-        await db.upsert_market(1, ALICE, "M", 2, 1_800_003_600)
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
         txs = [make_tx(32, inbound=BOB, body=bodies.build_place_bet(1, 0, 1))]
         await indexer_factory(txs).run_once()
         assert await db.get_onchain_bet(1, BOB) is None
 
     async def test_bet_out_of_range_is_ignored(self, indexer_factory, db):
-        await db.upsert_market(1, ALICE, "M", 2, 1_800_003_600)
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
         txs = [make_tx(33, inbound=BOB, body=bodies.build_place_bet(1, 9, 1_500_000_000))]
         await indexer_factory(txs).run_once()
         assert await db.get_onchain_bet(1, BOB) is None
@@ -205,7 +205,7 @@ class TestBets:
         assert bet["stake"] == 2_000_000_000
 
     async def test_claim_marks_bet_as_paid(self, indexer_factory, db):
-        await db.upsert_market(2, ALICE, "M", 2, 1_800_000_000)
+        await db.enrich_market_from_event(2, ALICE, "M", 2, 1_800_000_000)
         await db.record_onchain_bet(2, BOB, 0, 1_000_000_000, "abc", 1)
         txs = [
             make_tx(
@@ -224,7 +224,7 @@ class TestBets:
 
 class TestIdempotency:
     async def test_same_transactions_are_applied_once(self, indexer_factory, db):
-        await db.upsert_market(1, ALICE, "M", 2, 1_800_003_600)
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
         txs = [
             make_tx(50, inbound=BOB, body=bodies.build_place_bet(1, 0, 1_500_000_000)),
             make_tx(51, inbound=CAROL, body=bodies.build_place_bet(1, 1, 1_500_000_000)),
@@ -246,7 +246,7 @@ class TestIdempotency:
         assert tx_hash.startswith(f"{61:016x}")
 
     async def test_new_transactions_after_cursor_are_processed(self, indexer_factory, db):
-        await db.upsert_market(1, ALICE, "M", 2, 1_800_003_600)
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
         txs = [make_tx(70, inbound=BOB, body=bodies.build_place_bet(1, 0, 1_500_000_000))]
         indexer = indexer_factory(txs)
         await indexer.run_once()
@@ -261,3 +261,200 @@ class TestIdempotency:
         status = await db.get_indexer_status()
         assert status["last_lt"] == 80
         assert status["last_error"] is None
+
+
+class TestFailureRecovery:
+    """S-01: un fallo de persistencia no puede perder el evento para siempre."""
+
+    async def test_cursor_stops_before_the_failed_transaction(self, indexer_factory, db, monkeypatch):
+        title_hash = bodies.title_to_hash("Mercado tres")
+        txs = [
+            make_tx(
+                10,
+                inbound=ALICE,
+                body=bodies.build_create_market(bodies.title_to_hash("Uno"), 1_800_003_600, 2),
+                outs=[out_msg(INDEXER_ADDR, created_event(1, ALICE, bodies.title_to_hash("Uno"), 1_800_003_600, 2))],
+            ),
+            make_tx(20, inbound=BOB, body=bodies.build_place_bet(1, 0, 1_500_000_000)),
+            make_tx(
+                30,
+                inbound=ALICE,
+                body=bodies.build_create_market(title_hash, 1_800_003_600, 2),
+                outs=[out_msg(INDEXER_ADDR, created_event(3, ALICE, title_hash, 1_800_003_600, 2))],
+            ),
+        ]
+        indexer = indexer_factory(txs)
+
+        async def explode(*_args, **_kwargs):
+            raise RuntimeError("fallo simulado de persistencia")
+
+        monkeypatch.setattr(indexer, "_apply_bet", explode)
+        result = await indexer.run_once()
+
+        assert result.errors, "el fallo debe quedar registrado en el resultado"
+        cursor_lt, _cursor_hash = await db.get_cursor("escrow")
+        assert cursor_lt == 10, "el cursor debe quedarse en la última tx aplicada"
+        assert await db.get_market(3) is None, "no debe saltarse la tx fallida"
+        assert await db.count_chain_tx_failures() == 1
+
+        # Segundo ciclo sin el fallo: se reprocesa desde el último punto bueno.
+        monkeypatch.undo()
+        result = await indexer.run_once()
+        assert result.errors == []
+        assert await db.get_market(3) is not None
+        assert await db.get_onchain_bet(1, BOB) is not None
+        assert (await db.get_cursor("escrow"))[0] == 30
+        assert await db.count_chain_tx_failures() == 0, "el éxito debe limpiar la dead-letter"
+
+    async def test_poison_transaction_is_parked_and_the_stream_advances(
+        self, indexer_factory, db, monkeypatch
+    ):
+        from bot.chain import indexer as indexer_module
+
+        txs = [make_tx(40), make_tx(50)]
+        indexer = indexer_factory(txs)
+
+        async def explode(*_args, **_kwargs):
+            raise RuntimeError("tx veneno")
+
+        async def process_second_only(tx, result):
+            if tx.lt == 40:
+                raise RuntimeError("tx veneno")
+            result.processed += 1
+
+        monkeypatch.setattr(indexer, "_process_tx", process_second_only)
+
+        parked_at = None
+        for attempt in range(1, indexer_module.MAX_TX_ATTEMPTS + 1):
+            result = await indexer.run_once()
+            if result.parked:
+                parked_at = attempt
+                break
+            assert (await db.get_cursor("escrow"))[0] == 0, "el cursor no debe avanzar mientras reintenta"
+
+        assert parked_at == indexer_module.MAX_TX_ATTEMPTS
+        failures = await db.list_chain_tx_failures()
+        assert len(failures) == 1 and failures[0]["lt"] == 40
+        assert (await db.get_cursor("escrow"))[0] == 50, "la tx veneno no puede detener el stream"
+
+        # Cuando el backoff vence y el fallo desaparece, la tx se recupera sola.
+        monkeypatch.undo()
+        async with db.connection() as conn:
+            await conn.execute("UPDATE chain_tx_failures SET next_retry_at = '2000-01-01T00:00:00+00:00'")
+            await conn.commit()
+        result = await indexer.run_once()
+        assert result.errors == []
+        assert await db.count_chain_tx_failures() == 0
+
+    async def test_a_transient_failure_matches_the_clean_run(self, indexer_factory, db, monkeypatch):
+        """Propiedad: con fallos transitorios el espejo acaba igual que sin ellos."""
+        await db.enrich_market_from_event(1, ALICE, "M", 2, 1_800_003_600)
+        txs = [
+            make_tx(60, inbound=BOB, body=bodies.build_place_bet(1, 0, 1_000_000_000)),
+            make_tx(61, inbound=CAROL, body=bodies.build_place_bet(1, 1, 2_000_000_000)),
+        ]
+        indexer = indexer_factory(txs)
+        failing = {60}
+
+        original = indexer._process_tx
+
+        async def flaky(tx, result):
+            if tx.lt in failing:
+                failing.discard(tx.lt)
+                raise RuntimeError("fallo transitorio")
+            await original(tx, result)
+
+        monkeypatch.setattr(indexer, "_process_tx", flaky)
+        await indexer.run_once()
+        await indexer.run_once()
+
+        bob = await db.get_onchain_bet(1, BOB)
+        carol = await db.get_onchain_bet(1, CAROL)
+        assert bob is not None and bob["stake"] == 1_000_000_000
+        assert carol is not None and carol["stake"] == 2_000_000_000
+        assert await db.count_chain_tx_failures() == 0
+
+
+class TestMarketMetadata:
+    """S-02: el marcador nunca debe ganar a los datos del evento de creación."""
+
+    async def test_bet_before_create_is_enriched_by_the_event(self, indexer_factory, db):
+        title = "¿Llueve el sábado?"
+        title_hash = bodies.title_to_hash(title)
+        await db.create_pending_action(
+            user_id=1,
+            kind="create_market",
+            match_a=ALICE,
+            match_b=title_hash,
+            payload={"title": title, "options": ["Sí", "No"], "closes_at": 1_800_003_600},
+        )
+        txs = [
+            # La apuesta llega antes que el evento de creación (reordenación real).
+            make_tx(10, inbound=BOB, body=bodies.build_place_bet(9, 1, 1_500_000_000)),
+            make_tx(
+                20,
+                inbound=ALICE,
+                body=bodies.build_create_market(title_hash, 1_800_003_600, 2),
+                outs=[out_msg(INDEXER_ADDR, created_event(9, ALICE, title_hash, 1_800_003_600, 2))],
+            ),
+        ]
+        indexer = indexer_factory(txs)
+        await indexer.run_once()
+
+        market = await db.get_market(9)
+        assert market["title"] == title, "el título real debe sustituir al marcador"
+        assert market["closes_at"] == 1_800_003_600
+        assert market["fee_bps"] == 200
+        assert market["option_count"] == 2
+        assert market["metadata_source"] == "event"
+        assert [o["label"] for o in market["options"]] == ["Sí", "No"]
+
+    async def test_placeholder_uses_a_neutral_title_and_zero_close(self, db):
+        created = await db.insert_market_placeholder(3, None, 2)
+        assert created is True
+        market = await db.get_market(3)
+        assert market["title"] == "Mercado #3"
+        assert market["closes_at"] == 0
+        assert market["metadata_source"] == "placeholder"
+        assert await db.insert_market_placeholder(3, None, 4) is False
+
+    async def test_a_second_event_never_overwrites_real_metadata(self, indexer_factory, db):
+        title = "Mercado original"
+        title_hash = bodies.title_to_hash(title)
+        await db.enrich_market_from_event(
+            4, ALICE, title, 2, 1_800_000_000, title_hash=title_hash, fee_bps=100
+        )
+        txs = [
+            make_tx(
+                30,
+                outs=[
+                    out_msg(
+                        INDEXER_ADDR,
+                        created_event(4, ALICE, "aa" * 32, 1_900_000_000, 5),
+                    )
+                ],
+            )
+        ]
+        await indexer_factory(txs).run_once()
+
+        market = await db.get_market(4)
+        assert market["title"] == title
+        assert market["closes_at"] == 1_800_000_000
+        assert market["fee_bps"] == 100
+        assert market["option_count"] == 2
+
+    async def test_enrichment_fills_only_empty_fields(self, db):
+        await db.insert_market_placeholder(5, None, 2)
+        created, enriched = await db.enrich_market_from_event(
+            5, ALICE, "Título", 3, 1_800_000_500, title_hash="bb" * 32, fee_bps=250
+        )
+        assert (created, enriched) == (False, True)
+        market = await db.get_market(5)
+        assert market["creator_address"] == ALICE
+        assert market["title_hash"] == "bb" * 32
+        assert market["fee_bps"] == 250
+
+        # Idempotente: un segundo enriquecimiento no reporta cambios.
+        assert await db.enrich_market_from_event(
+            5, ALICE, "Otro", 9, 1_800_000_900, fee_bps=900
+        ) == (False, False)

@@ -28,8 +28,9 @@ import base64
 import binascii
 import hashlib
 import hmac
+import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Any, Iterable
 
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
@@ -134,11 +135,11 @@ def state_init_data_cell(state_init: Cell) -> Cell:
     return data
 
 
-def _candidate_keys(data_cell: Cell, max_depth: int = 1) -> List[bytes]:
+def _candidate_keys(data_cell: Cell, max_depth: int = 1) -> list[bytes]:
     """Scan 256-bit windows of the data cell (and one level of refs)."""
-    cells: List[Cell] = [data_cell]
+    cells: list[Cell] = [data_cell]
     for _ in range(max_depth):
-        extra: List[Cell] = []
+        extra: list[Cell] = []
         for cell in cells[-1:]:
             try:
                 refs = getattr(cell, "refs", None) or []
@@ -148,7 +149,7 @@ def _candidate_keys(data_cell: Cell, max_depth: int = 1) -> List[bytes]:
                 extra.append(ref)
         cells.extend(extra)
 
-    candidates: List[bytes] = []
+    candidates: list[bytes] = []
     seen = set()
     for cell in cells:
         try:
@@ -192,12 +193,16 @@ def verify_ton_proof(
     expected_domain: str,
     expected_nonce: str,
     max_age_seconds: int = 600,
-    state_init: Optional[str] = None,
-    public_key: Optional[str] = None,
-    onchain_public_key: Optional[str] = None,
-    now: Optional[int] = None,
+    state_init: str | None = None,
+    public_key: str | None = None,
+    onchain_public_key: str | None = None,
+    now: int | None = None,
 ) -> VerifiedWallet:
     """Validate a ``ton_proof`` payload.
+
+    The body is a checklist of small steps; each one raises ``ProofError`` with
+    its own code, so the API can answer with a precise message and this function
+    stays readable (R-07).
 
     Parameters
     ----------
@@ -212,92 +217,26 @@ def verify_ton_proof(
         Fallback key fetched from a public API when the wallet is already
         deployed and no state init was provided.
     """
-    import time as _time
-
     if not isinstance(proof, dict):
         raise ProofError("bad_proof", "Falta el objeto proof.")
 
-    domain = proof.get("domain") or {}
-    domain_value = domain.get("value")
-    domain_len = domain.get("lengthBytes")
-    if not isinstance(domain_value, str) or not domain_value:
-        raise ProofError("bad_domain", "El proof no incluye dominio.")
-    if domain_value != expected_domain:
-        raise ProofError("bad_domain", "El dominio del proof no coincide con el de la app.")
-    if not isinstance(domain_len, int) or domain_len != len(domain_value.encode("utf-8")):
-        raise ProofError("bad_domain", "lengthBytes no coincide con el dominio.")
-
-    try:
-        timestamp = int(proof.get("timestamp"))
-    except (TypeError, ValueError) as exc:
-        raise ProofError("bad_timestamp", "timestamp inválido.") from exc
-    current = int(now if now is not None else _time.time())
-    if abs(current - timestamp) > int(max_age_seconds):
-        raise ProofError("expired_proof", "El proof expiró; vuelve a conectar la wallet.")
-
-    payload = proof.get("payload") or ""
-    if not expected_nonce or not hmac.compare_digest(str(payload), str(expected_nonce)):
-        raise ProofError("bad_payload", "El payload del proof no corresponde a esta sesión.")
-
-    try:
-        signature = base64.b64decode(proof.get("signature") or "", validate=False)
-    except (binascii.Error, ValueError) as exc:
-        raise ProofError("bad_signature", "Firma no es base64 válido.") from exc
-    if len(signature) != 64:
-        raise ProofError("bad_signature", "La firma debe tener 64 bytes.")
-
-    try:
-        parsed = parse_address(address)
-    except AddressError as exc:
-        raise ProofError("bad_address", str(exc)) from exc
-    workchain, address_hash = raw_parts(address)
-    if workchain != 0:
-        raise ProofError("bad_address", "Solo se aceptan wallets de la basechain.")
-    if network not in ("-239", "-3", 0, "0"):
-        raise ProofError("bad_network", "Red no soportada (usa mainnet o testnet).")
+    domain_value = _check_domain(proof, expected_domain)
+    timestamp = _check_timestamp(proof, max_age_seconds, now)
+    payload = _check_payload(proof, expected_nonce)
+    signature = _decode_signature(proof)
+    parsed, workchain, address_hash = _check_address(address, network)
 
     digest = build_proof_digest(
         workchain=workchain,
         address_hash=address_hash,
         domain=domain_value,
         timestamp=timestamp,
-        payload=str(payload),
+        payload=payload,
     )
 
-    resolved_key: Optional[bytes] = None
-    state_init_cell: Optional[Cell] = None
-    if state_init:
-        state_init_cell = parse_state_init(state_init)
-        if state_init_cell.hash != address_hash:
-            raise ProofError(
-                "state_init_mismatch",
-                "walletStateInit no corresponde a la dirección declarada.",
-            )
-
-    if state_init_cell is not None:
-        for candidate in _candidate_keys(state_init_data_cell(state_init_cell)):
-            if _verify(digest, signature, candidate):
-                resolved_key = candidate
-                break
-        if resolved_key is None and onchain_public_key:
-            key = _hex_key(onchain_public_key)
-            if key and _verify(digest, signature, key):
-                resolved_key = key
-    elif onchain_public_key:
-        key = _hex_key(onchain_public_key)
-        if key and _verify(digest, signature, key):
-            resolved_key = key
-
-    if resolved_key is None:
-        raise ProofError(
-            "bad_signature",
-            "No se pudo verificar la firma de la wallet (clave pública desconocida).",
-        )
-
-    if public_key:
-        expected_key = _hex_key(public_key)
-        if expected_key is not None and not hmac.compare_digest(expected_key, resolved_key):
-            raise ProofError("key_mismatch", "La clave pública no coincide con la firma.")
+    state_init_cell = _check_state_init(state_init, address_hash)
+    resolved_key = _resolve_public_key(digest, signature, state_init_cell, onchain_public_key)
+    _check_declared_key(public_key, resolved_key)
 
     raw = normalize_address(parsed.to_str())
     return VerifiedWallet(
@@ -309,7 +248,108 @@ def verify_ton_proof(
     )
 
 
-def _hex_key(value: str) -> Optional[bytes]:
+def _check_domain(proof: dict, expected_domain: str) -> str:
+    domain = proof.get("domain") or {}
+    value = domain.get("value")
+    length_bytes = domain.get("lengthBytes")
+    if not isinstance(value, str) or not value:
+        raise ProofError("bad_domain", "El proof no incluye dominio.")
+    if value != expected_domain:
+        raise ProofError("bad_domain", "El dominio del proof no coincide con el de la app.")
+    if not isinstance(length_bytes, int) or length_bytes != len(value.encode("utf-8")):
+        raise ProofError("bad_domain", "lengthBytes no coincide con el dominio.")
+    return value
+
+
+def _check_timestamp(proof: dict, max_age_seconds: int, now: int | None) -> int:
+    try:
+        timestamp = int(proof.get("timestamp"))
+    except (TypeError, ValueError) as exc:
+        raise ProofError("bad_timestamp", "timestamp inválido.") from exc
+    current = int(now if now is not None else time.time())
+    if abs(current - timestamp) > int(max_age_seconds):
+        raise ProofError("expired_proof", "El proof expiró; vuelve a conectar la wallet.")
+    return timestamp
+
+
+def _check_payload(proof: dict, expected_nonce: str) -> str:
+    payload = proof.get("payload") or ""
+    if not expected_nonce or not hmac.compare_digest(str(payload), str(expected_nonce)):
+        raise ProofError("bad_payload", "El payload del proof no corresponde a esta sesión.")
+    return str(payload)
+
+
+def _decode_signature(proof: dict) -> bytes:
+    try:
+        signature = base64.b64decode(proof.get("signature") or "", validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise ProofError("bad_signature", "Firma no es base64 válido.") from exc
+    if len(signature) != 64:
+        raise ProofError("bad_signature", "La firma debe tener 64 bytes.")
+    return signature
+
+
+def _check_address(address: str, network: str) -> tuple[Any, int, bytes]:
+    try:
+        parsed = parse_address(address)
+    except AddressError as exc:
+        raise ProofError("bad_address", str(exc)) from exc
+    workchain, address_hash = raw_parts(address)
+    if workchain != 0:
+        raise ProofError("bad_address", "Solo se aceptan wallets de la basechain.")
+    if network not in ("-239", "-3", 0, "0"):
+        raise ProofError("bad_network", "Red no soportada (usa mainnet o testnet).")
+    return parsed, workchain, address_hash
+
+
+def _check_state_init(state_init: str | None, address_hash: bytes) -> Cell | None:
+    """El state init debe definir exactamente la dirección declarada."""
+    if not state_init:
+        return None
+    cell = parse_state_init(state_init)
+    if cell.hash != address_hash:
+        raise ProofError(
+            "state_init_mismatch",
+            "walletStateInit no corresponde a la dirección declarada.",
+        )
+    return cell
+
+
+def _resolve_public_key(
+    digest: bytes,
+    signature: bytes,
+    state_init_cell: Cell | None,
+    onchain_public_key: str | None,
+) -> bytes:
+    """Prueba las claves candidatas; solo la firma decide cuál es la buena.
+
+    Primero el ``state_init`` (funciona sin red y cubre cualquier versión de
+    wallet); si no hay o no basta, la clave publicada on-chain.
+    """
+    if state_init_cell is not None:
+        for candidate in _candidate_keys(state_init_data_cell(state_init_cell)):
+            if _verify(digest, signature, candidate):
+                return candidate
+    if onchain_public_key:
+        key = _hex_key(onchain_public_key)
+        if key and _verify(digest, signature, key):
+            return key
+    raise ProofError(
+        "bad_signature",
+        "No se pudo verificar la firma de la wallet (clave pública desconocida).",
+    )
+
+
+def _check_declared_key(public_key: str | None, resolved_key: bytes) -> None:
+    """Si el SDK declaró una clave, tiene que ser la que firmó."""
+    if not public_key:
+        return
+    declared = _hex_key(public_key)
+    if declared is not None and not hmac.compare_digest(declared, resolved_key):
+        raise ProofError("key_mismatch", "La clave pública no coincide con la firma.")
+
+
+def _hex_key(value: str) -> bytes | None:
     try:
         key = bytes.fromhex(value.strip())
     except (ValueError, AttributeError):

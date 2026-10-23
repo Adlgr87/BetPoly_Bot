@@ -6,21 +6,24 @@
   <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#101319" />
   <title>BetPoly · Mercados TON</title>
+  <link rel="icon" type="image/png" href="/static/icon.png" />
+  <link rel="apple-touch-icon" href="/static/icon.png" />
+  <meta property="og:image" content="/static/icon.png" />
   <link rel="stylesheet" href="/static/styles.css" />
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="https://unpkg.com/@tonconnect/ui@5.0.1/dist/tonconnect-ui.min.js" defer></script>
+  <script src="/static/tonconnect-ui.min.js" integrity="sha384-QZvMrS6g6/TQyHjoc44P3RG1Kzfqnwen5A/EZ0LaQZKP8hvNY2stUmyFB5QDIKmp" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
   <div id="boot" class="boot">
-    <div class="boot-logo">◎</div>
+    <img class="boot-logo" src="/static/icon.png" alt="BetPoly" width="96" height="96" />
     <p>Cargando BetPoly…</p>
   </div>
 
   <div id="app" class="app hidden">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark">◎</span>
+        <img class="brand-mark" src="/static/icon.png" alt="" width="38" height="38" />
         <div>
           <h1>BetPoly</h1>
           <p id="mode-label" class="muted small">Mercados no-custodiales</p>
@@ -68,7 +71,7 @@
         <h2>Crear mercado</h2>
         <p class="muted small">
           El mercado se crea on-chain con una transacción firmada por tu wallet.
-          Tú pagas el gas de creación (≈&nbsp;<span id="create-gas">0.05</span>&nbsp;TON).
+          Tú pagas el gas de creación (≈&nbsp;<span id="create-gas">—</span>&nbsp;TON).
         </p>
         <form id="create-form" class="card form">
           <label>
@@ -101,6 +104,54 @@
           (la del administrador) la firma.
         </p>
         <div id="admin-markets" class="list"></div>
+
+        <div class="card">
+          <div class="row-between">
+            <h3>Contrato escrow</h3>
+            <button id="contract-refresh" class="icon-btn" type="button" title="Actualizar">⟳</button>
+          </div>
+          <div id="contract-state" class="muted small">Cargando estado…</div>
+
+          <form id="contract-withdraw-form" class="form">
+            <label>
+              Retirar comisiones (TON)
+              <input id="contract-withdraw-amount" type="number" min="0" step="0.01" required />
+            </label>
+            <button class="primary" type="submit">Retirar comisiones</button>
+            <p class="hint muted small">
+              Solo se pueden retirar las comisiones acumuladas. El contrato nunca
+              permite sacar los fondos de los usuarios.
+            </p>
+          </form>
+
+          <form id="contract-fee-form" class="form">
+            <label>
+              Comisión de la plataforma (%)
+              <input id="contract-fee-percent" type="number" min="0" max="10" step="0.01" required />
+            </label>
+            <button class="ghost" type="submit">Cambiar comisión</button>
+            <p class="hint muted small">Aplica solo a los mercados creados a partir de ahora.</p>
+          </form>
+
+          <form id="contract-admin-form" class="form">
+            <label>
+              Nueva dirección administradora
+              <input id="contract-admin-address" type="text" placeholder="EQ… o 0:hex" required />
+            </label>
+            <button class="ghost" type="submit">Transferir administración</button>
+            <p class="hint muted small">
+              ⚠️ Irreversible: si pierdes esa wallet, pierdes el control del contrato.
+            </p>
+          </form>
+
+          <button id="contract-pause" class="ghost" type="button">Pausar contrato</button>
+          <p class="muted small">
+            Pausado: nadie puede crear mercados ni apostar. Resolver, cancelar y
+            reclamar pagos siguen funcionando. Cada acción se firma en tu wallet:
+            el backend nunca tiene llaves.
+          </p>
+        </div>
+
         <div class="card">
           <h3>Estado del indexador</h3>
           <pre id="indexer-status" class="mono small">—</pre>

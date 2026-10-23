@@ -1,6 +1,15 @@
+<p align="center">
+  <img src="web/branding/logo-card.png" alt="BetPoly Bot" width="320" />
+</p>
+
 # BetPoly_Bot 🎯
 
 Predicciones y mercados de apuestas sobre TON, servidos desde un bot de Telegram y una **Mini App** web. El backend **nunca custodia fondos y nunca firma transacciones**: solo *lee* la blockchain y *prepara* transacciones sin firmar que el usuario (o el admin) firma en su propia wallet.
+
+**Estado:** las 8 fases del plan de implementación están cerradas —676 tests en
+verde, cobertura 85,8 %, contrato con hash reproducible y CI de 4 jobs en verde—.
+Lo que queda es producto, no deuda: oráculo automático (F013) y on-ramp fiat
+(F014).
 
 ---
 
@@ -35,7 +44,7 @@ Dos economías conviven (`BET_MODE`):
 
 | Capa | Tecnología |
 | :--- | :--- |
-| Bot | Python 3.11+, `python-telegram-bot` 21.6 (async, `JobQueue`) |
+| Bot | Python 3.11+, `python-telegram-bot` 22.8 (async, `JobQueue`) |
 | Mini App / API | `aiohttp` (sirve `web/`, sin build step) |
 | Persistencia | SQLite vía `aiosqlite` (una conexión, `BEGIN IMMEDIATE`) |
 | Contrato | FunC (`contracts/escrow.fc`), pari-mutuel, probado en `@ton/sandbox` |
@@ -62,7 +71,10 @@ BetPoly_Bot/
 │   ├── formatting.py        # helpers HTML/formatos TON y fechas
 │   ├── keyboards.py         # teclados inline
 │   └── handlers/            # start, predictions, markets, stats, wallet, admin, help
-├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png)
+├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png,
+│   │                        # tonconnect-ui.min.js vendorizado con SRI)
+│   └── branding/            # lámina del logo (fuente del icono) y tarjeta para el README
+├── scripts/                 # utilidades: build_icon.py, dev_server.py
 ├── contracts/               # escrow.fc, stdlib, build.js, deploy.js, tests
 ├── tests/                   # suite pytest offline
 ├── config.py                # configuración tipada desde el entorno
@@ -78,6 +90,8 @@ git clone https://github.com/Adlgr87/BetPoly_Bot.git
 cd BetPoly_Bot
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# para desarrollo y tests:
+pip install -r requirements-dev.txt
 
 cp .env.example .env      # define BOT_TOKEN y ADMIN_IDS
 python main.py --check    # valida configuración sin arrancar nada
@@ -85,6 +99,14 @@ python main.py            # bot + Mini App + indexer
 ```
 
 Para desarrollo sin Telegram: `WEB_ENABLED=true ALLOW_DEV_SESSION=true python main.py` y abre `http://localhost:8080`.
+
+O con el servidor de demo, que siembra mercados y acepta flags en vez de obligar
+a exportar medio `.env`:
+
+```bash
+python scripts/dev_server.py --help          # --host, --port, --db, --public-base-url, --no-seed
+python scripts/dev_server.py --port 8080 --db /tmp/demo.db
+```
 
 > `ALLOW_DEV_SESSION=true` desactiva la verificación de `initData`: `config.validate()` lo rechaza en producción.
 
@@ -98,7 +120,7 @@ Para desarrollo sin Telegram: `WEB_ENABLED=true ALLOW_DEV_SESSION=true python ma
 cd contracts
 npm install
 npm run build     # contracts/build/escrow.code.boc + escrow.fif
-npm test          # 22 checks sobre @ton/sandbox (sin red)
+npm test          # 25 checks sobre @ton/sandbox (sin red)
 ```
 
 Hash de referencia del código compilado actual:
@@ -134,12 +156,24 @@ El *admin on-chain* debe ser una wallet que controles a mano: es la única que p
 ```dotenv
 BET_MODE=hybrid
 ESCROW_ADDRESS=EQ…        # dirección impresa por deploy.js
-ESCROW_ADMIN_ADDRESS=EQ…  # informativo
+ESCROW_ADMIN_ADDRESS=EQ…  # admin on-chain: se usa para avisar si tu wallet no es la correcta
 PUBLIC_BASE_URL=https://tu-dominio   # https obligatorio (Telegram + TON Connect)
 TON_PROOF_DOMAIN=tu-dominio
 SECRET_KEY=<32+ bytes aleatorios>
 TON_NETWORK=mainnet
 TON_API_KEY=…
+# Importes y ventanas (opcionales; estos son los valores por defecto)
+MAX_STAKE_NANO=5000000000000
+BET_GAS_NANO=30000000
+CREATE_GAS_NANO=50000000
+ADMIN_GAS_NANO=50000000
+CLAIM_GAS_NANO=20000000
+MIN_MARKET_DURATION_MIN=15
+MAX_MARKET_DURATION_DAYS=365
+TX_TTL_SECONDS=300
+# Solo tras un proxy inverso: sin TRUST_PROXY la cabecera X-Forwarded-For se ignora
+TRUST_PROXY=false
+TRUSTED_PROXIES=127.0.0.1/32
 ```
 
 `PUBLIC_BASE_URL` debe servirse por HTTPS y alojar `/tonconnect-manifest.json` y `/static/icon.png`: TON Connect los descarga y verifica el origen.
@@ -163,15 +197,31 @@ Todas las rutas devuelven `{"ok": true, "data": …}` o `{"ok": false, "error": 
 | DELETE | `/api/wallet` | Desvincula la wallet |
 | GET | `/api/me` | Perfil, puntos, wallet |
 | GET | `/api/markets` | Mercados del espejo on-chain |
-| GET | `/api/markets/{id}` | Detalle + tu apuesta + multiplicadores |
+| GET | `/api/markets/{id}` | Detalle + tu apuesta + multiplicadores **netos** de comisión |
+| GET | `/api/markets/{id}/quote?option=&stake_ton=` | Pago estimado de una apuesta (`bot/economics.py`) |
 | POST | `/api/markets/prepare` | Transacción **sin firmar** para crear mercado |
 | POST | `/api/markets/{id}/bets/prepare` | Transacción sin firmar para apostar |
 | POST | `/api/markets/{id}/claim/prepare` | Transacción sin firmar para cobrar |
 | POST | `/api/admin/markets/{id}/resolve/prepare` | Resolución (solo admin) |
 | POST | `/api/admin/markets/{id}/cancel/prepare` | Cancelación (solo admin) |
+| GET | `/api/admin/contract` | Estado on-chain del escrow (solo admin, caché 30 s) |
+| POST | `/api/admin/contract/withdraw/prepare` | Retirar comisiones acumuladas (solo admin) |
+| POST | `/api/admin/contract/set-fee/prepare` | Cambiar la comisión, `fee_bps`/`percent` (solo admin) |
+| POST | `/api/admin/contract/set-paused/prepare` | Pausar o reanudar (solo admin) |
+| POST | `/api/admin/contract/change-admin/prepare` | Transferir la administración (solo admin) |
 | GET | `/api/indexer` | Cursor, últimas transacciones y estado del índice |
 
 Las sesiones viajan en la cabecera `X-Session`. El backend **nunca** devuelve una transacción firmada.
+
+**Caché y sondeo (Fase 6).** `/api/markets` devuelve `ETag` y `Cache-Control:
+no-cache`: un cliente que ya tiene esa versión recibe `304` sin cuerpo, así que
+el sondeo de la Mini App cuesta unas decenas de bytes cuando nada cambió. Los
+activos de `/static` salen con la huella del contenido en la URL (`?v=…`) y
+`Cache-Control: public, max-age=31536000, immutable`; JS y CSS viajan con gzip
+comprimido una sola vez por proceso. El arranque completo (HTML + CSS + JS +
+icono) pesa **~93 KB** comprimidos; con el bundle de TON Connect vendorizado, el
+total que descarga el móvil son **~249 KB** frente a un presupuesto de 350 KB que
+un test hace cumplir (`tests/test_assets_caching.py`).
 
 ---
 
@@ -180,7 +230,22 @@ Las sesiones viajan en la cabecera `X-Session`. El backend **nunca** devuelve un
 * **Autenticación**: `hash = HMAC_SHA256(bot_token, "WebAppData")` sobre el `init_data`; se valida `auth_date` y se exige `ALLOW_DEV_SESSION=false` en producción.
 * **Sesiones**: token `user_id.expira.hmac(secret_key)`; sin `secret_key` persistente las sesiones mueren al reiniciar (solo válido en desarrollo).
 * **ton_proof**: digest `sha256("ton-proof-item-v2/" ‖ wc ‖ address_hash ‖ domain_len ‖ domain ‖ timestamp ‖ payload)`, firmado en Ed25519 con la clave del `StateInit` (que debe hashear a la dirección declarada). Dominio exacto, ventana de 600 s, nonce de un solo uso por `(user_id, purpose)`.
-* **Rate limiting** por IP/usuario en sesión, preparación de transacciones y verificación de wallets.
+* **IP real**: `X-Forwarded-For` es una cabecera que el cliente controla, así que
+  se ignora salvo que `TRUST_PROXY=true` **y** la conexión llegue desde una red de
+  `TRUSTED_PROXIES`. En ese caso se recorre la lista de derecha a izquierda y se
+  toma el primer salto que no sea un proxy de confianza. Una configuración
+  incoherente (confiar sin lista, o lista sin confiar) **falla al arrancar**.
+* **Rate limiting** por IP/usuario en sesión, preparación de transacciones y
+  verificación de wallets, más un **backstop global por endpoint**
+  (`/api/session`, `/api/wallet/*`, `/api/markets/prepare`) que no depende de la
+  identidad: rotar IPs o sesiones no lo esquiva. Las respuestas `429` incluyen
+  `Retry-After`, y el limitador desaloja por LRU real (memoria acotada).
+* **CSP estricta** sin `'unsafe-inline'`: los scripts solo pueden venir del propio
+  dominio (`'self'`) o de `telegram.org`, la Mini App no usa manejadores inline y
+  ambos hechos tienen test. `@tonconnect/ui` —el componente que construye las
+  transacciones que el usuario firma— se sirve desde `web/static` con `integrity`
+  SRI (un `sha384` que el test recalcula), así que un CDN comprometido no puede
+  cambiar el código que firma.
 * **CSP** con `frame-ancestors` configurable (`FRAME_ANCESTORS`) para permitir Telegram y bloquear el resto.
 * **Índice idempotente**: cada transacción se procesa una vez (`chain_txs`), el cursor solo avanza tras confirmar, y un fallo de red nunca bloquea al bot.
 
@@ -196,6 +261,13 @@ Pari-mutuel: cada mercado reparte todo el pozo menos la comisión entre quienes 
 distributable = total_pool − floor(total_pool · fee_bps / 10000)
 payout        = floor(stake · distributable / winning_pool)
 ```
+
+Esa fórmula existe **una sola vez** fuera del contrato: `bot/economics.py`
+(`distributable`, `fee_of`, `payout`, `multiplier`, `preview_payout`). La usan la
+liquidación de puntos, los multiplicadores que muestran el bot y la API, y el
+*quote* de la hoja de apuesta de la Mini App, que ya no calcula nada por su
+cuenta. `contracts/vectors/economics.json` fija vectores compartidos: si el
+contrato y Python se separan, fallan las dos suites.
 
 Si nadie apostó a la opción ganadora, `resolve_market` falla con `412` y el admin debe `cancel_market`: entonces todos cobran su stake completo.
 
@@ -231,7 +303,12 @@ Si nadie apostó a la opción ganadora, `resolve_market` falla con `412` y el ad
 | `416` | Comisión por encima del 10 % |
 | `417` | `withdraw_fees` tocaría fondos bloqueados |
 
-Límites: `min_stake` configurable (0.1 TON por defecto), `max_options = 8`, cierre entre 5 min y 365 días, reserva de 0.01 TON para almacenamiento.
+Límites configurables: `MIN_STAKE_NANO` (0.1 TON), `MAX_STAKE_NANO` (5000 TON),
+`MAX_OPTIONS = 8`, cierre entre `MIN_MARKET_DURATION_MIN` (15 min) y
+`MAX_MARKET_DURATION_DAYS` (365), gas por operación
+(`BET_GAS_NANO`/`CREATE_GAS_NANO`/`ADMIN_GAS_NANO`/`CLAIM_GAS_NANO`) y
+`TX_TTL_SECONDS` (300). `/api/config` publica los mismos valores (en TON) para
+que la Mini App no repita ni un literal.
 
 Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con un único ref; `bot/chain/bodies.py` la desenvuelve.
 
@@ -241,10 +318,135 @@ Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con u
 
 ```bash
 .venv/bin/python -m pytest          # suite offline: contrato espejo, puntos, API, seguridad
+.venv/bin/python -m ruff check .    # estilo y errores comunes
 cd contracts && node tests/escrow.test.js   # contrato real en el sandbox TVM
 ```
 
-La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`, `FakeClient` para el indexer y claves Ed25519 sintéticas para `ton_proof`.
+Reglas de lint: `E`,`F`,`I`,`B`,`C4`,`SIM`,`UP` (sin tipado legacy) más
+`PLR2004` (números mágicos), `ARG` (argumentos sin usar) y `PLC0415` (imports
+perezosos), con excepciones justificadas por fichero para los argumentos que
+impone Telegram/aiohttp.
+
+La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`,
+`FakeClient` para el indexer, claves Ed25519 sintéticas para `ton_proof` y dobles
+de `Update`/`Message`/`CallbackQuery` (`tests/telegram_fakes.py`) para la capa
+Telegram. Cobertura actual: **85,8 %** global (umbral 83) y **89 %** en
+`bot/handlers/*` + `bot/keyboards.py` (umbral propio 70; los teclados, 100 %).
+
+**Dependencias del contrato.** `node scripts/audit.js` aplica `npm audit` con
+`contracts/audit-allowlist.json`: un advisory alto/crítico sin excepción falla el
+build; una excepción **caducada**, sin motivo o que ya no corresponde a ningún
+advisory también falla, así que la lista solo puede encogerse. Hoy hay una
+excepción (`zod` vía `@ton/ton`, sin parche publicado) con fecha de caducidad.
+
+### Marca e icono
+
+El logo vive en `web/branding/logo-card.png` (la lámina completa, la que se ve
+arriba) y `web/branding/logo-source.png` (la original). El avatar de Telegram y el
+icono del manifiesto de TON Connect son **el emblema**, no la lámina entera: a
+300 px el rótulo es ilegible y Telegram recorta el avatar en círculo.
+
+```bash
+pip install pillow                    # solo para regenerar el activo
+python scripts/build_icon.py          # lámina → web/static/icon.png (54 KB)
+python scripts/build_icon.py --check  # verifica tamaño y 512×512
+```
+
+El recorte del emblema y el difuminado del borde son explícitos (`CROP`,
+`MARGIN`, `FEATHER`) y tienen test: si alguien cambia la lámina, el script falla
+en vez de generar un icono descentrado. El PNG resultante se sirve con la huella
+del contenido en la URL y con `integrity` verificado para el bundle de TON
+Connect; el presupuesto de 80 KB lo hace cumplir `tests/test_assets_caching.py`.
+
+**CI** (`.github/workflows/ci.yml`) ejecuta en cada push: lint, tests con umbral de
+cobertura, compilación del contrato con verificación del hash reproducible,
+sandbox TVM, `npm audit` y `pip-audit`.
+
+Estas suites son *guardarraíles* y no pruebas funcionales:
+
+- `tests/test_architecture.py` — dirección de las dependencias entre capas.
+- `tests/test_wiring.py` — conectividad: rutas sin consumidor, botones sin
+  handler, builders on-chain inalcanzables y comandos prometidos en `/help`.
+  Los huérfanos conocidos viven en un baseline que solo puede encogerse (hoy
+  solo queda `/api/health`, endpoint de sondas).
+- `tests/test_web_assets.py` — la Mini App no lleva manejadores inline y la CSP
+  que se publica de verdad los bloquearía.
+- `tests/test_complexity.py` — complejidad de McCabe sobre el AST: ninguna función
+  nueva pasa de 12 y el baseline solo puede encogerse.
+- `tests/test_migrations.py` y `tests/test_keyboards.py` — el esquema se actualiza
+  con `PRAGMA user_version` (y se niega a abrir una base más nueva) y todos los
+  teclados tienen su test.
+- `tests/test_performance.py` y `tests/test_assets_caching.py` — los planes de
+  consulta no hacen `SCAN`, el número de consultas no crece con las filas, la
+  caché/`304`/gzip funcionan y ningún activo se pasa del presupuesto.
+
+### Modo grupo
+
+Las predicciones se guardan por `chat_id`, así que cada grupo tiene su propio
+tablero. Para apostar, el importe **debe ser una respuesta al mensaje del bot**
+que lo pide: en un grupo nadie apuesta por accidente al escribir «100» en la
+conversación. En privado sigue bastando con escribir el número.
+
+### Notificaciones
+
+`bot/database.py` guarda cada aviso en una tabla de salida
+(`notifications`) **dentro de la misma transacción** que liquida la predicción o
+aplica el evento on-chain; `bot/notifications.py` decide el texto y
+`main.job_dispatch_notifications` lo envía cada 30 s en lotes de 20, con
+reintentos y backoff exponencial (60 s → 1 h, máximo 5 intentos). La clave única
+`(user_id, kind, ref_id)` impide duplicados si una liquidación se reintenta.
+
+Se avisa de lo accionable: ganaste puntos, se te reembolsó la apuesta, o tienes
+un pago esperando en el contrato. Una apuesta perdida no genera mensaje. Si
+Telegram falla, el aviso queda pendiente para el siguiente ciclo y la cadena
+sigue indexando: el indexador nunca espera a la mensajería.
+
+### Administración del contrato (Fase 2)
+
+El contrato expone siete *getters* (`get_fee_bps`, `get_paused`, `get_fees`,
+`get_total_locked`, `get_market_count`, `get_min_stake`, `get_market_data`).
+`bot/chain/escrow_state.py` los lee con `runGetMethod` y los sirve como una sola
+foto (`EscrowState`) cacheada **30 s**, con *stale-while-error*: si la cadena no
+responde se sigue mostrando la última lectura buena marcada como `stale`.
+
+Las cuatro operaciones de administración (`withdraw_fees`, `set_fee`,
+`set_paused`, `change_admin`) se preparan **sin firmar** en `bot/markets.py`,
+con validaciones previas al envío:
+
+- `withdraw_fees`: `0 < importe ≤ fees` (el contrato solo deja salir comisiones;
+  los fondos de usuarios están bloqueados on-chain).
+- `set_fee`: `0 ≤ fee_bps ≤ 1000` (0–10 %).
+- `change_admin`: dirección válida, distinta de la actual y no cero.
+- Si `ESCROW_ADMIN_ADDRESS` está definida, se avisa y se rechaza la preparación
+  cuando la wallet vinculada del administrador no coincide con ella: es mejor
+  fallar antes de firmar que gastar gas en una transacción condenada a `401`.
+
+Cada acción se confirma dos veces: en el bot (botón “Confirmar” con el valor en
+el estado de la conversación) o en la Mini App (`confirm()` nativo) y después en
+la wallet del administrador. `ESCROW_ADMIN_ADDRESS` no concede permisos: el
+contrato decide, la configuración solo sirve para avisar.
+
+### Runbook de operación (testnet primero)
+
+1. Despliega con `scripts/deploy.js` y anota `codeHash` y la dirección del
+   escrow; pon esa dirección en `ESCROW_ADDRESS` y la wallet que controlarás en
+   `ESCROW_ADMIN_ADDRESS`.
+2. Abre `/admin` → **⚙️ Contrato escrow** y comprueba el estado: si dice
+   «tu wallet no es la administradora», no sigas: la firma sería rechazada.
+3. Prueba con importes pequeños: `set_fee` → `set_paused`/reanudar → un mercado
+   de prueba → `withdraw_fees` por el importe exacto de las comisiones.
+4. Verifica cada transacción en el explorador (`to` = escrow, `op` = `0x1A0A…`)
+   antes de repetir en mainnet.
+
+`withdraw_fees` mueve TON real: empieza siempre en testnet.
+
+### Resiliencia del indexador
+
+Si una transacción falla al aplicarse, el cursor **no avanza** sobre ella: se
+reintenta en el acto y, si el fallo persiste, se aparca en `chain_tx_failures`
+con retroceso exponencial (60 s → 5 min → 15 min → 1 h) para que una transacción
+envenenada no detenga el resto del flujo. El estado se ve en `/api/indexer`
+(admin) y en el panel `/admin`.
 
 ---
 
@@ -259,7 +461,7 @@ La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path
 | `/crear` | Crear una predicción de puntos (3 pasos) |
 | `/misbets` | Perfil, apuestas y rendimiento |
 | `/ranking` | Top 10 por puntos |
-| `/admin` | Panel de administrador (resolver, cancelar, on-chain) |
+| `/admin` | Panel de administrador (resolver, cancelar, estado y operaciones del contrato) |
 | `/help` | Ayuda |
 | `/cancelar` | Cancelar la operación en curso |
 
@@ -278,7 +480,7 @@ La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path
 | F007 | Recordatorios de cierre y notificación de resolución | ✅ |
 | F008 | Panel de administrador (puntos y on-chain) | ✅ |
 | F009 | Ayuda contextual (`/help`, botón “Cómo funciona”) | ✅ |
-| F010 | Modo grupo (predicciones por `chat_id`) | ✅ |
+| F010 | Modo grupo (predicciones por `chat_id`) | ✅ ver nota |
 | F011 | Mini App con TON Connect y `ton_proof` | ✅ |
 | F012 | Contrato escrow pari-mutuel + índice on-chain | ✅ |
 | F013 | Resolución oráculo automática (resultados deportivos) | ⬜ pendiente |

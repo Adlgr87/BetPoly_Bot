@@ -1,0 +1,44 @@
+[tool.ruff]
+# Explicit configuration so CI does not depend on the linter's default rule set.
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "contracts", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "C4", "SIM", "UP", "PLR2004", "ARG", "PLC0415"]
+ignore = [
+    "UP035",
+    # We deliberately keep timezone.utc on 3.11 for readability parity.
+    "UP017",
+    # Nested `with` blocks are sometimes clearer around aiosqlite cursors.
+    "SIM117",
+    # `dict()` calls in tests are fine.
+    "C408",
+    # `try/except Exception` is intentional in the network/chain boundaries and
+    # is annotated with an explicit noqa comment where it matters.
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Los tests importan módulos dentro de fixtures para aislar `monkeypatch`
+# y para no arrastrar dependencias de arranque.
+"tests/*" = [
+    "B011",
+    "SIM105",
+    "PLR2004",
+    "PLC0415",
+    "ARG001",
+    "ARG002",
+    "ARG005",
+]
+# Los anchos de bits (32/64/256) y los topes del protocolo TON son parte de la
+# especificación: nombrarlos uno a uno oscurecería el parseo binario.
+"bot/chain/*" = ["PLR2004"]
+# Firmas impuestas por Telegram/aiohttp: `context` y `request` no siempre se usan.
+"bot/handlers/*" = ["ARG001"]
+"bot/api.py" = ["ARG001"]
+"main.py" = ["ARG001"]
+"scripts/dev_server.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bot", "config", "main"]

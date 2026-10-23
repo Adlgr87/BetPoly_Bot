@@ -6,9 +6,16 @@ from telegram.ext import ContextTypes
 
 import config
 from bot import database
-from bot.formatting import bold, code, esc, points as fmt_points, ton
-from bot.handlers.common import edit_or_reply, register_user, safe_answer
-from bot.keyboards import back_to_menu_keyboard, refresh_ranking_keyboard
+from bot.formatting import bold, code, esc, ton
+from bot.formatting import points as fmt_points
+from bot.handlers.common import (
+    back_keyboard,
+    edit_or_reply,
+    is_admin,
+    register_user,
+    safe_answer,
+)
+from bot.keyboards import refresh_ranking_keyboard
 
 MEDALS = {0: "🥇", 1: "🥈", 2: "🥉"}
 
@@ -19,15 +26,15 @@ MEDALS = {0: "🥇", 1: "🥈", 2: "🥉"}
 
 async def ranking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update)
-    await _send_ranking(update, context, edit=False)
+    await _send_ranking(update, context)
 
 
 async def ranking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_answer(update.callback_query)
-    await _send_ranking(update, context, edit=True)
+    await _send_ranking(update, context)
 
 
-async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     leaderboard = await database.get_leaderboard(10)
     user_id = update.effective_user.id if update.effective_user else 0
 
@@ -46,10 +53,18 @@ async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
         if all(int(entry["user_id"]) != int(user_id) for entry in leaderboard):
             me = await database.get_user(user_id)
             if me:
-                text += f"\n\n📍 Tu posición: {bold(fmt_points(me['points']))} puntos"
+                # R-03: puesto contado en SQL; antes solo se mostraban los puntos.
+                position = await database.ranking_position(user_id)
+                where = f" (puesto {position})" if position else ""
+                text += (
+                    f"\n\n📍 Tu posición: {bold(fmt_points(me['points']))} puntos{where}"
+                )
         text += "\n\n<i>El ranking premia el modo puntos (sandbox). Las apuestas TON se liquidan en la blockchain.</i>"
 
-    await edit_or_reply(update, text, reply_markup=refresh_ranking_keyboard())
+    user = getattr(update, "effective_user", None)
+    await edit_or_reply(
+        update, text, reply_markup=refresh_ranking_keyboard(is_admin=is_admin(getattr(user, "id", None)))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -58,16 +73,16 @@ async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
 
 async def misbets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update)
-    await _send_profile(update, context, update.effective_user.id, edit=False)
+    await _send_profile(update, context, update.effective_user.id)
 
 
 async def my_bets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_answer(update.callback_query)
-    await _send_profile(update, context, update.callback_query.from_user.id, edit=True)
+    await _send_profile(update, context, update.callback_query.from_user.id)
 
 
 async def _send_profile(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, edit: bool
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> None:
     settings = config.get_settings()
     user_data = await database.get_user(user_id)
@@ -77,20 +92,18 @@ async def _send_profile(
         )
         return
 
+    # R-02: los números salen de un SUM/COUNT en SQL, no de traer 500 filas.
     bets = await database.get_user_bets(user_id, limit=5)
-    all_bets = await database.get_user_bets(user_id, limit=500)
-    wins = sum(1 for b in all_bets if b["result"] == "win")
-    losses = sum(1 for b in all_bets if b["result"] == "lose")
-    refunds = sum(1 for b in all_bets if b["result"] == "refund")
-    pending = sum(1 for b in all_bets if b["result"] is None)
-    accuracy = f"{wins / (wins + losses) * 100:.0f}%" if (wins + losses) else "—"
-    profit = sum(int(b["payout"] or 0) - int(b["amount"]) for b in all_bets if b["result"])
+    stats = await database.get_user_stats(user_id)
+    accuracy = f"{stats['accuracy']:.0f}%" if stats["accuracy"] is not None else "—"
+    profit = stats["net"]
 
     lines = [
         "📊 <b>Tu perfil</b>",
         "",
         f"🪙 Saldo: {bold(fmt_points(user_data['points']))} puntos",
-        f"🎲 Apuestas: {bold(len(all_bets))} · ✅ {wins} · ❌ {losses} · ↩️ {refunds} · ⏳ {pending}",
+        f"🎲 Apuestas: {bold(stats['total'])} · ✅ {stats['wins']} · ❌ {stats['losses']} "
+        f"· ↩️ {stats['refunds']} · ⏳ {stats['pending']}",
         f"🎯 Acierto: {bold(accuracy)}",
         f"📈 Resultado neto: {bold(fmt_points(profit) if profit >= 0 else '-' + fmt_points(abs(profit)))} pts",
     ]
@@ -132,4 +145,4 @@ async def _send_profile(
                 f"Vincula una en la Mini App: {esc(settings.webapp_url)}",
             ]
 
-    await edit_or_reply(update, "\n".join(lines), reply_markup=back_to_menu_keyboard())
+    await edit_or_reply(update, "\n".join(lines), reply_markup=back_keyboard(update))

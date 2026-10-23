@@ -1,5 +1,5 @@
 # --- Telegram -------------------------------------------------------------
-python-telegram-bot[job-queue]==21.6
+python-telegram-bot[job-queue]==22.8
 
 # --- Persistencia ---------------------------------------------------------
 aiosqlite==0.22.1

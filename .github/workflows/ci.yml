@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff + vulture)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - name: Código muerto (vulture)
+        run: vulture bot config.py main.py scripts --min-confidence 80
+
+  test:
+    name: Tests (pytest + cobertura)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Suite offline
+        env:
+          BOT_TOKEN: "123456:CI-TOKEN-NOT-REAL"
+          BET_MODE: points
+          DATABASE_PATH: /tmp/ci.db
+        run: |
+          pytest \
+            --cov=bot --cov=config --cov=main --cov=scripts \
+            --cov-report=term-missing:skip-covered \
+            --cov-fail-under=83
+      - name: Cobertura de la capa Telegram (Fase 5)
+        run: |
+          pytest tests/test_handlers_navigation.py tests/test_handlers_flows.py \
+            --cov=bot.handlers --cov=bot.keyboards --cov-fail-under=70
+
+  contract:
+    name: Contrato (build + sandbox + audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: contracts/package-lock.json
+      - run: npm ci
+      - name: Compilar y verificar hash
+        run: |
+          node scripts/build.js
+          node -e "
+            const fs = require('fs');
+            const boc = fs.readFileSync('build/escrow.code.boc');
+            const { Cell } = require('@ton/core');
+            const hash = Cell.fromBoc(boc)[0].hash().toString('hex');
+            const pinned = require('fs').readFileSync('../tests/test_contract_sync.py', 'utf8')
+              .match(/CODE_HASH = \"([0-9a-f]+)\"/)[1];
+            if (hash !== pinned) {
+              console.error('❌ hash compilado', hash, '≠ pinneado', pinned);
+              process.exit(1);
+            }
+            console.log('✅ hash reproducible', hash);
+          "
+      - name: Sandbox TVM
+        run: node tests/escrow.test.js
+      - name: Excepciones de auditoría (test)
+        run: node tests/audit.test.js
+      - name: npm audit
+        run: node scripts/audit.js
+
+  security:
+    name: Dependencias (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt --strict

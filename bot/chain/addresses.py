@@ -6,12 +6,7 @@ friendly, URL-safe, bounceable form.
 """
 from __future__ import annotations
 
-import hashlib
-from typing import Optional
-
 from pytoniq_core import Address
-
-TESTNET = "testnet"
 
 
 class AddressError(ValueError):
@@ -62,7 +57,7 @@ def to_friendly(value: str, *, bounceable: bool = True, testnet: bool = False) -
     )
 
 
-def is_valid_address(value: Optional[str]) -> bool:
+def is_valid_address(value: str | None) -> bool:
     if not value:
         return False
     try:
@@ -72,7 +67,7 @@ def is_valid_address(value: Optional[str]) -> bool:
         return False
 
 
-def same_address(a: Optional[str], b: Optional[str]) -> bool:
+def same_address(a: str | None, b: str | None) -> bool:
     if not a or not b:
         return False
     try:
@@ -84,8 +79,3 @@ def same_address(a: Optional[str], b: Optional[str]) -> bool:
 def address_hash(value: str) -> bytes:
     _, hash_bytes = raw_parts(value)
     return hash_bytes
-
-
-def derive_address_hash(state_init_hash: bytes) -> str:
-    """Account hash equals the state_init cell hash on the basechain."""
-    return hashlib.sha256(state_init_hash).hexdigest() if len(state_init_hash) != 32 else state_init_hash.hex()

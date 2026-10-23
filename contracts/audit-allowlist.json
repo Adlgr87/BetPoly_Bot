@@ -1,0 +1,8 @@
+{
+  "GHSA-mrhx-c7xc-m3w5": {
+    "module": "zod",
+    "severity": "high",
+    "reason": "Sin parche publicado: @ton/ton 16.3.0 (devDependency, solo la usa scripts/deploy.js) fija zod ^3.21.4 y no hay versión de @ton/ton con zod >= 4.6.6. El advisory es un DoS al validar colecciones acotadas enormes; el deploy solo parsea respuestas de un nodo de confianza. Revisar en cada actualización de @ton/ton.",
+    "expires": "2026-12-31"
+  }
+}

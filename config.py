@@ -15,11 +15,11 @@ Design notes
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import secrets as _secrets
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -41,13 +41,13 @@ def _str(key: str, default: str = "") -> str:
     return (os.getenv(key) or default).strip()
 
 
-def _opt_str(key: str) -> Optional[str]:
+def _opt_str(key: str) -> str | None:
     value = (os.getenv(key) or "").strip()
     return value or None
 
 
-def _int(key: str, default: int, *, minimum: Optional[int] = None,
-         maximum: Optional[int] = None) -> int:
+def _int(key: str, default: int, *, minimum: int | None = None,
+         maximum: int | None = None) -> int:
     raw = (os.getenv(key) or "").strip()
     if not raw:
         return default
@@ -69,7 +69,24 @@ def _bool(key: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "y", "on", "si", "sí")
 
 
-def _ids(key: str) -> Tuple[int, ...]:
+def _cidrs(key: str) -> tuple[str, ...]:
+    """Parse a comma separated list of CIDRs, rejecting anything malformed."""
+    raw = (os.getenv(key) or "").strip()
+    if not raw:
+        return ()
+    out = []
+    for chunk in raw.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            out.append(str(ipaddress.ip_network(chunk, strict=False)))
+        except ValueError as exc:
+            raise ConfigError(f"{key} contains an invalid CIDR: {chunk!r}") from exc
+    return tuple(out)
+
+
+def _ids(key: str) -> tuple[int, ...]:
     raw = (os.getenv(key) or "").strip()
     if not raw:
         return ()
@@ -93,7 +110,7 @@ def _ids(key: str) -> Tuple[int, ...]:
 class Settings:
     # --- Telegram ---------------------------------------------------------
     bot_token: str
-    admin_ids: Tuple[int, ...]
+    admin_ids: tuple[int, ...]
     log_level: str
 
     # --- storage ----------------------------------------------------------
@@ -113,14 +130,24 @@ class Settings:
     # --- TON chain (read only for the bot) --------------------------------
     ton_network: str
     ton_api_url: str
-    ton_api_key: Optional[str]
-    ton_public_key_api: Optional[str]
-    escrow_address: Optional[str]
-    escrow_admin_address: Optional[str]
-    ton_proof_domain: Optional[str]
+    ton_api_key: str | None
+    ton_public_key_api: str | None
+    escrow_address: str | None
+    escrow_admin_address: str | None
+    ton_proof_domain: str | None
     ton_proof_max_age: int
     min_stake_nano: int
+    max_stake_nano: int
     max_options: int
+
+    # --- dinero on-chain: gas y ventanas (una sola fuente) ----------------
+    bet_gas_nano: int
+    create_gas_nano: int
+    admin_gas_nano: int
+    claim_gas_nano: int
+    min_market_duration_min: int
+    max_market_duration_days: int
+    tx_ttl_seconds: int
 
     # --- indexer ----------------------------------------------------------
     indexer_enabled: bool
@@ -136,8 +163,11 @@ class Settings:
     allow_dev_session: bool
     environment: str
     app_title: str
-    support_url: Optional[str] = field(default=None)
+    support_url: str | None = field(default=None)
     frame_ancestors: str = "'self'"
+    #: Only honour ``X-Forwarded-For`` when the peer is one of these proxies.
+    trust_proxy: bool = False
+    trusted_proxies: tuple[str, ...] = ()
 
     # -- derived helpers ---------------------------------------------------
     @property
@@ -198,6 +228,25 @@ class Settings:
             )
         if self.is_production and self.secret_key.startswith("dev-"):
             raise ConfigError("SECRET_KEY must be set to a strong random value in production.")
+        if self.max_stake_nano < self.min_stake_nano:
+            raise ConfigError(
+                "MAX_STAKE_NANO must be >= MIN_STAKE_NANO "
+                f"(got {self.max_stake_nano} < {self.min_stake_nano})."
+            )
+        if self.min_market_duration_min * 60 >= self.max_market_duration_days * 86_400:
+            raise ConfigError(
+                "MIN_MARKET_DURATION_MIN must be shorter than MAX_MARKET_DURATION_DAYS."
+            )
+        if self.trust_proxy and not self.trusted_proxies:
+            raise ConfigError(
+                "TRUST_PROXY=true requires TRUSTED_PROXIES (e.g. 127.0.0.1/32): "
+                "without a proxy list X-Forwarded-For would be trusted from anyone."
+            )
+        if self.trusted_proxies and not self.trust_proxy:
+            raise ConfigError(
+                "TRUSTED_PROXIES is set but TRUST_PROXY is false: the list would have "
+                "no effect. Set TRUST_PROXY=true or remove TRUSTED_PROXIES."
+            )
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -236,7 +285,15 @@ def _build_settings() -> Settings:
         ton_proof_domain=_opt_str("TON_PROOF_DOMAIN"),
         ton_proof_max_age=_int("TON_PROOF_MAX_AGE", 600, minimum=60, maximum=3600),
         min_stake_nano=_int("MIN_STAKE_NANO", 100_000_000, minimum=1),
+        max_stake_nano=_int("MAX_STAKE_NANO", 5_000_000_000_000, minimum=1),
         max_options=_int("MAX_OPTIONS", 8, minimum=2, maximum=20),
+        bet_gas_nano=_int("BET_GAS_NANO", 30_000_000, minimum=0),
+        create_gas_nano=_int("CREATE_GAS_NANO", 50_000_000, minimum=0),
+        admin_gas_nano=_int("ADMIN_GAS_NANO", 50_000_000, minimum=0),
+        claim_gas_nano=_int("CLAIM_GAS_NANO", 20_000_000, minimum=0),
+        min_market_duration_min=_int("MIN_MARKET_DURATION_MIN", 15, minimum=1),
+        max_market_duration_days=_int("MAX_MARKET_DURATION_DAYS", 365, minimum=1),
+        tx_ttl_seconds=_int("TX_TTL_SECONDS", 300, minimum=30, maximum=3600),
         indexer_enabled=_bool("INDEXER_ENABLED", True),
         indexer_poll_interval=_int("INDEXER_POLL_INTERVAL", 20, minimum=5, maximum=3600),
         indexer_batch=_int("INDEXER_BATCH", 50, minimum=1, maximum=200),
@@ -254,6 +311,8 @@ def _build_settings() -> Settings:
             "FRAME_ANCESTORS",
             "'self' https://*.telegram.org https://web.telegram.org https://*.e2b.app",
         ),
+        trust_proxy=_bool("TRUST_PROXY", False),
+        trusted_proxies=_cidrs("TRUSTED_PROXIES"),
     )
     return settings
 
@@ -267,29 +326,6 @@ def get_settings() -> Settings:
 def reset_settings() -> None:
     """Clear the settings cache (used by tests and after env changes)."""
     get_settings.cache_clear()
-
-
-# ---------------------------------------------------------------------------
-# Backwards compatible module level constants
-# ---------------------------------------------------------------------------
-
-def __getattr__(name: str):  # PEP 562
-    """Lazy aliases so ``from config import ADMIN_IDS`` keeps working."""
-    mapping = {
-        "BOT_TOKEN": "bot_token",
-        "ADMIN_IDS": "admin_ids",
-        "DATABASE_PATH": "database_path",
-        "REMINDER_HOURS_BEFORE": "reminder_hours_before",
-        "STARTING_POINTS": "starting_points",
-        "MIN_BET_POINTS": "min_bet_points",
-        "HOUSE_RAKE_BPS": "house_rake_bps",
-        "ESCROW_ADDRESS": "escrow_address",
-        "PUBLIC_BASE_URL": "public_base_url",
-    }
-    field_name = mapping.get(name)
-    if field_name:
-        return getattr(get_settings(), field_name)
-    raise AttributeError(name)
 
 
 def require_bot_token() -> str:

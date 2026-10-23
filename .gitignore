@@ -27,6 +27,14 @@ contracts/build/deploy.json
 *.db-shm
 *.db-wal
 
+# Tests / coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.pytest_cache/
+
 # Logs
 *.log
 

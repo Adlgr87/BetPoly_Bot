@@ -12,11 +12,17 @@ The API never returns, stores or requests private keys or seed phrases.
 """
 from __future__ import annotations
 
+import gzip
+import hashlib
+import ipaddress
+import json
 import logging
+import math
 import re
 import time
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from aiohttp import web
 
@@ -27,16 +33,125 @@ from bot.chain.bodies import BodyError
 from bot.chain.ton_proof import ProofError, verify_ton_proof
 from bot.chain.toncenter import TonApiError
 from bot.formatting import ton
+from bot.parsing import parse_fee_bps, parse_nano
 
 logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+STATIC_DIR = WEB_DIR / "static"
 TON_CLIENT_KEY = web.AppKey("ton_client", object)
 MAX_BODY = 64 * 1024
+
+#: R-09 — un año de caché solo para URLs que llevan la huella del contenido.
+IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+#: Sin `?v=` el fichero se revalida con ETag: barato y nunca sirve código viejo.
+REVALIDATE_CACHE = "no-cache"
+
+#: Tipo MIME por extensión; lo que no esté aquí no se sirve.
+STATIC_TYPES = {
+    ".js": "text/javascript",
+    ".css": "text/css",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".webmanifest": "application/manifest+json",
+}
+#: Solo texto: recomprimir un PNG cuesta RAM y no ahorra un byte.
+COMPRESSIBLE = (".js", ".css", ".svg", ".webmanifest")
+
+
+class _Asset:
+    """Fichero estático en memoria, con su gzip ya hecho y su ETag."""
+
+    __slots__ = ("body", "gzipped", "content_type", "etag")
+
+    def __init__(self, body: bytes, content_type: str, compress: bool) -> None:
+        self.body = body
+        self.content_type = content_type
+        self.etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+        # El gzip se paga una vez, en la primera petición, no en cada sondeo.
+        self.gzipped = gzip.compress(body, 6) if compress else None
+
+
+_assets: dict[str, _Asset] = {}
+
+
+def _asset_version() -> str:
+    """Huella del conjunto JS/CSS: cambia al cambiar cualquier activo.
+
+    Se usa como ``?v=`` en ``index.html`` para que el navegador pida la versión
+    nueva sin perder la caché de un año del resto.
+    """
+    digest = hashlib.sha256()
+    for name in ("app.js", "styles.css"):
+        asset = _load_asset(name)
+        digest.update(asset.etag.encode() if asset else b"-")
+    return digest.hexdigest()[:12]
+
+
+def _load_asset(name: str) -> _Asset | None:
+    """Carga (una vez) un activo de ``web/static`` y lo cachea en memoria.
+
+    Rechaza cualquier ruta que no sea un nombre de fichero simple dentro del
+    directorio estático: la ruta viene del cliente.
+    """
+    if name in _assets:
+        return _assets[name]
+    if not name or name.startswith(".") or "/" in name or "\\" in name:
+        return None
+    path = (STATIC_DIR / name).resolve()
+    try:
+        path.relative_to(STATIC_DIR.resolve())
+    except ValueError:
+        return None
+    suffix = path.suffix.lower()
+    content_type = STATIC_TYPES.get(suffix)
+    if content_type is None or not path.is_file():
+        return None
+    charset = "utf-8" if content_type.startswith("text/") or "json" in content_type else None
+    declared = content_type if charset is None else f"{content_type}; charset=utf-8"
+    asset = _Asset(path.read_bytes(), declared, compress=suffix in COMPRESSIBLE)
+    _assets[name] = asset
+    return asset
+
+
+def reset_asset_cache() -> None:
+    """Olvida los activos en memoria (tests y recarga en caliente)."""
+    _assets.clear()
 
 _prepare_limiter = security.RateLimiter(limit=20, window_seconds=60)
 _session_limiter = security.RateLimiter(limit=30, window_seconds=60)
 _verify_limiter = security.RateLimiter(limit=10, window_seconds=300)
+
+#: Global backstop per endpoint (limit, window seconds). These are *not* keyed by
+#: client: even a client that rotates IPs or sessions hits this ceiling, which is
+#: what makes S-04 impossible to exploit by forging headers (see Fase 3).
+BACKSTOP_LIMITS: dict[str, tuple[int, float]] = {
+    "/api/session": (300, 60),
+    "/api/wallet/nonce": (300, 60),
+    "/api/wallet/verify": (120, 60),
+    "/api/markets/prepare": (120, 60),
+    "/api/wallet": (120, 60),
+}
+
+def _new_backstops(
+    limits: dict[str, tuple[int, float]] | None = None,
+) -> dict[str, security.RateLimiter]:
+    """Fresh limiters per app: a test app must not inherit another's counters."""
+    return {
+        path: security.RateLimiter(limit=limit, window_seconds=window)
+        for path, (limit, window) in (limits or BACKSTOP_LIMITS).items()
+    }
+
+#: Market error codes that are not a plain 400.
+_MARKET_ERROR_STATUS = {
+    "forbidden": 403,
+    "wallet_not_admin": 403,
+    "market_not_found": 404,
+    "chain_unavailable": 503,
+}
 
 
 def _settings() -> config.Settings:
@@ -48,7 +163,7 @@ def _settings() -> config.Settings:
 # ---------------------------------------------------------------------------
 
 def json_ok(data: Any = None, status: int = 200, **extra: Any) -> web.Response:
-    payload: Dict[str, Any] = {"ok": True}
+    payload: dict[str, Any] = {"ok": True}
     if data is not None:
         payload["data"] = data
     payload.update(extra)
@@ -62,12 +177,10 @@ def json_error(code: str, message: str, status: int = 400) -> web.Response:
 
 
 def _dumps(value: Any) -> str:
-    import json
-
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-async def read_json(request: web.Request) -> Dict[str, Any]:
+async def read_json(request: web.Request) -> dict[str, Any]:
     if request.content_length and request.content_length > MAX_BODY:
         raise web.HTTPRequestEntityTooLarge(max_size=MAX_BODY, actual_size=request.content_length)
     try:
@@ -79,9 +192,47 @@ async def read_json(request: web.Request) -> Dict[str, Any]:
     return data
 
 
+@lru_cache(maxsize=32)
+def _networks(cidrs: tuple[str, ...]) -> tuple[Any, ...]:
+    """Parsed networks, cached: ``_client_ip`` runs on every request."""
+    return tuple(ipaddress.ip_network(cidr, strict=False) for cidr in cidrs)
+
+
+def _is_trusted_proxy(ip: str, cidrs: tuple[str, ...]) -> bool:
+    if not cidrs:
+        return False
+    try:
+        address = ipaddress.ip_address(str(ip).strip().strip("[]"))
+    except ValueError:
+        return False
+    return any(address in network for network in _networks(cidrs))
+
+
 def _client_ip(request: web.Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    return (forwarded.split(",")[0].strip() if forwarded else request.remote) or "?"
+    """Peer address used for rate limiting, honouring proxies only when declared.
+
+    ``X-Forwarded-For`` is client controlled, so it is ignored unless
+    ``TRUST_PROXY`` is on *and* the direct peer is one of ``TRUSTED_PROXIES``.
+    The header list is then walked right to left, returning the first hop that
+    is not itself a trusted proxy (the real client as seen by our edge).
+    """
+    remote = request.remote or "?"
+    settings = _settings()
+    if not settings.trust_proxy or not _is_trusted_proxy(remote, settings.trusted_proxies):
+        return remote
+    raw = ",".join(request.headers.getall("X-Forwarded-For", []))
+    hops = [hop.strip() for hop in raw.split(",") if hop.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted_proxy(hop, settings.trusted_proxies):
+            return hop
+    return hops[0] if hops else remote
+
+
+def _rate_limited(message: str, retry_after: float = 0.0) -> web.Response:
+    """429 + ``Retry-After`` (seconds) so clients can back off correctly."""
+    response = json_error("rate_limited", message, 429)
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
+    return response
 
 
 def current_user(request: web.Request) -> int:
@@ -96,23 +247,34 @@ def _admin(user_id: int) -> bool:
     return user_id in _settings().admin_ids
 
 
-TN_RE = re.compile(r"^(?:\d+)(?:[.,]\d{1,9})?$")
+def _user_payload(user_id: int, user: dict[str, Any] | None) -> dict[str, Any]:
+    """Public shape of a user, shared by ``/api/session`` and ``/api/me``."""
+    return {
+        "user_id": user_id,
+        "username": (user or {}).get("username"),
+        "full_name": (user or {}).get("full_name"),
+        "points": (user or {}).get("points", 0),
+        "is_admin": _admin(user_id),
+    }
 
 
-def parse_nano(value: Any) -> int:
-    """Parse ``"1.5"`` TON (or ``1500000000`` nanoTON) into nanoTON."""
-    if isinstance(value, bool) or value is None:
-        raise markets.MarketError("bad_amount", "Importe inválido.")
-    if isinstance(value, int):
-        return value
-    raw = str(value).strip().replace(",", ".")
-    if not TN_RE.match(raw):
-        raise markets.MarketError("bad_amount", "Escribe un importe válido, por ejemplo 1.5")
-    whole, _, frac = raw.partition(".")
-    return int(whole) * 1_000_000_000 + int(frac.ljust(9, "0") or 0)
+def _market_id(request: web.Request) -> int | None:
+    """``market_id`` from the URL, or ``None`` when it is not an integer."""
+    try:
+        return int(request.match_info["market_id"])
+    except (KeyError, ValueError):
+        return None
 
 
-def _wallet_view(wallet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _require_admin(request: web.Request) -> int:
+    """Return the caller's id, raising a domain ``forbidden`` when not admin."""
+    user_id = current_user(request)
+    if not _admin(user_id):
+        raise markets.MarketError("forbidden", "Solo administradores.")
+    return user_id
+
+
+def _wallet_view(wallet: dict[str, Any] | None) -> dict[str, Any] | None:
     if not wallet:
         return None
     return {
@@ -122,7 +284,7 @@ def _wallet_view(wallet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     }
 
 
-def public_config() -> Dict[str, Any]:
+def public_config() -> dict[str, Any]:
     settings = _settings()
     return {
         "mode": settings.mode,
@@ -137,9 +299,14 @@ def public_config() -> Dict[str, Any]:
         "app_title": settings.app_title,
         "ton_proof_domain": settings.proof_domain,
         "support_url": settings.support_url,
-        "bet_gas_ton": ton(markets.BET_GAS_NANO),
-        "create_gas_ton": ton(markets.CREATE_GAS_NANO),
-        "claim_gas_ton": ton(markets.CLAIM_GAS_NANO),
+        "bet_gas_ton": ton(settings.bet_gas_nano),
+        "create_gas_ton": ton(settings.create_gas_nano),
+        "claim_gas_ton": ton(settings.claim_gas_nano),
+        "admin_gas_ton": ton(settings.admin_gas_nano),
+        "max_stake_nano": str(settings.max_stake_nano),
+        "max_stake_ton": ton(settings.max_stake_nano),
+        "min_market_duration_min": settings.min_market_duration_min,
+        "max_market_duration_days": settings.max_market_duration_days,
     }
 
 
@@ -228,11 +395,45 @@ async def privacy_page(request: web.Request) -> web.Response:
     )
 
 
+_STATIC_REF = re.compile(r'(/static/[\w.\-]+)(?!\?v=)')
+
+
 async def index(request: web.Request) -> web.StreamResponse:
+    """Sirve la Mini App con los activos ya versionados (R-09).
+
+    ``index.html`` nunca se cachea; cada ``/static/...`` de dentro sale con
+    ``?v=<huella>``, así que el navegador puede guardarlos para siempre.
+    """
     file = WEB_DIR / "index.html"
     if not file.exists():  # pragma: no cover - packaging guard
         return web.Response(text="Mini App no encontrada", status=503)
-    return web.FileResponse(file, headers={"Cache-Control": "no-store"})
+    html = file.read_text(encoding="utf-8")
+    version = _asset_version()
+    html = _STATIC_REF.sub(lambda match: f"{match.group(1)}?v={version}", html)
+    return web.Response(
+        body=html.encode("utf-8"),
+        content_type="text/html",
+        charset="utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def static_asset(request: web.Request) -> web.StreamResponse:
+    """Activo estático con gzip en memoria y caché inmutable si está versionado."""
+    asset = _load_asset(request.match_info.get("name", ""))
+    if asset is None:
+        raise web.HTTPNotFound()
+    headers = {"ETag": asset.etag, "Cache-Control": REVALIDATE_CACHE}
+    if request.headers.get("If-None-Match") == asset.etag:
+        return web.Response(status=304, headers=headers)
+    if request.query.get("v") == _asset_version():
+        headers["Cache-Control"] = IMMUTABLE_CACHE
+    headers["Content-Type"] = asset.content_type
+    if asset.gzipped is not None and "gzip" in request.headers.get("Accept-Encoding", ""):
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
+        return web.Response(body=asset.gzipped, headers=headers)
+    return web.Response(body=asset.body, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +443,7 @@ async def index(request: web.Request) -> web.StreamResponse:
 async def create_session(request: web.Request) -> web.Response:
     allowed, retry = _session_limiter.allow(_client_ip(request))
     if not allowed:
-        return json_error("rate_limited", "Demasiados intentos. Espera un momento.", 429)
+        return _rate_limited("Demasiados intentos. Espera un momento.", retry)
 
     data = await read_json(request)
     init_data = data.get("init_data") or ""
@@ -279,13 +480,7 @@ async def create_session(request: web.Request) -> web.Response:
             "nonce": nonce,
             "dev_mode": dev,
             "user_id": user_id,
-            "user": {
-                "user_id": user_id,
-                "username": (user or {}).get("username"),
-                "full_name": (user or {}).get("full_name"),
-                "points": (user or {}).get("points", 0),
-                "is_admin": _admin(user_id),
-            },
+            "user": _user_payload(user_id, user),
             "wallet": _wallet_view(wallet),
             "config": public_config(),
         }
@@ -303,9 +498,9 @@ async def wallet_nonce(request: web.Request) -> web.Response:
 
 async def verify_wallet(request: web.Request) -> web.Response:
     user_id = current_user(request)
-    allowed, _ = _verify_limiter.allow(str(user_id))
+    allowed, retry = _verify_limiter.allow(str(user_id))
     if not allowed:
-        return json_error("rate_limited", "Demasiados intentos de verificación.", 429)
+        return _rate_limited("Demasiados intentos de verificación.", retry)
 
     data = await read_json(request)
     address = data.get("address") or ""
@@ -394,13 +589,7 @@ async def me(request: web.Request) -> web.Response:
         bets = await database.list_onchain_bets(wallet["address"], limit=25)
     return json_ok(
         {
-            "user": {
-                "user_id": user_id,
-                "username": (user or {}).get("username"),
-                "full_name": (user or {}).get("full_name"),
-                "points": (user or {}).get("points", 0),
-                "is_admin": _admin(user_id),
-            },
+            "user": _user_payload(user_id, user),
             "wallet": _wallet_view(wallet),
             "bets": [
                 {
@@ -426,6 +615,22 @@ async def me(request: web.Request) -> web.Response:
 # markets
 # ---------------------------------------------------------------------------
 
+def json_cached(request: web.Request, data: Any) -> web.Response:
+    """JSON con ``ETag`` y ``304`` cuando el cliente ya tiene esa versión.
+
+    R-08: el sondeo de la Mini App se abarata a unas pocas decenas de bytes
+    cuando nada cambió; el cuerpo solo se serializa una vez y se compara su
+    huella con ``If-None-Match``.
+    """
+    body = _dumps({"ok": True, "data": data})
+    etag = '"' + hashlib.sha256(body.encode()).hexdigest()[:16] + '"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers=headers)
+    headers["Content-Type"] = "application/json; charset=utf-8"
+    return web.Response(body=body.encode(), headers=headers)
+
+
 async def list_markets(request: web.Request) -> web.Response:
     status = request.query.get("status", "open")
     try:
@@ -433,23 +638,20 @@ async def list_markets(request: web.Request) -> web.Response:
         offset = int(request.query.get("offset", "0"))
     except ValueError:
         return json_error("bad_query", "limit/offset deben ser enteros.")
-    if status == "all":
-        status_value = None
-    else:
-        status_value = status
+    status_value = None if status == "all" else status
     markets_list = await database.list_markets(status=status_value, limit=limit, offset=offset)
-    return json_ok(
+    return json_cached(
+        request,
         {
             "markets": [markets.market_view(m) for m in markets_list],
             "escrow": markets.friendly_escrow() if _settings().escrow_enabled else None,
-        }
+        },
     )
 
 
 async def get_market(request: web.Request) -> web.Response:
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     user_id = None
     try:
@@ -463,11 +665,27 @@ async def get_market(request: web.Request) -> web.Response:
     return json_ok(detail)
 
 
+async def quote_market(request: web.Request) -> web.Response:
+    """Pago estimado de una apuesta nueva (la Mini App no calcula economía)."""
+    market_id = _market_id(request)
+    if market_id is None:
+        return json_error("bad_market", "market_id inválido.")
+    try:
+        option = int(request.query.get("option", ""))
+    except (TypeError, ValueError):
+        return json_error("bad_option", "Selecciona una opción válida.")
+    stake = parse_nano(
+        request.query.get("stake_ton") or request.query.get("stake"), field="importe"
+    )
+    quote = await markets.quote_payout(market_id, option, stake)
+    return json_ok(quote)
+
+
 async def prepare_market(request: web.Request) -> web.Response:
     user_id = current_user(request)
     allowed, retry = _prepare_limiter.allow(f"create:{user_id}")
     if not allowed:
-        return json_error("rate_limited", "Espera un momento antes de crear otro mercado.", 429)
+        return _rate_limited("Espera un momento antes de crear otro mercado.", retry)
 
     data = await read_json(request)
     options = data.get("options") or []
@@ -489,13 +707,12 @@ async def prepare_market(request: web.Request) -> web.Response:
 
 async def prepare_bet(request: web.Request) -> web.Response:
     user_id = current_user(request)
-    allowed, _ = _prepare_limiter.allow(f"bet:{user_id}")
+    allowed, retry = _prepare_limiter.allow(f"bet:{user_id}")
     if not allowed:
-        return json_error("rate_limited", "Espera un momento antes de apostar de nuevo.", 429)
+        return _rate_limited("Espera un momento antes de apostar de nuevo.", retry)
 
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     data = await read_json(request)
     try:
@@ -518,9 +735,8 @@ async def prepare_bet(request: web.Request) -> web.Response:
 
 async def prepare_claim(request: web.Request) -> web.Response:
     user_id = current_user(request)
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     try:
         tx = await markets.prepare_claim(user_id, market_id)
@@ -530,12 +746,9 @@ async def prepare_claim(request: web.Request) -> web.Response:
 
 
 async def prepare_resolve(request: web.Request) -> web.Response:
-    user_id = current_user(request)
-    if not _admin(user_id):
-        return json_error("forbidden", "Solo administradores.", 403)
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    user_id = _require_admin(request)
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     data = await read_json(request)
     try:
@@ -550,17 +763,79 @@ async def prepare_resolve(request: web.Request) -> web.Response:
 
 
 async def prepare_cancel(request: web.Request) -> web.Response:
-    user_id = current_user(request)
-    if not _admin(user_id):
-        return json_error("forbidden", "Solo administradores.", 403)
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    user_id = _require_admin(request)
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     try:
         tx = await markets.prepare_cancel(user_id, market_id)
     except markets.MarketError as exc:
         return json_error(exc.code, str(exc), 400)
+    return json_ok(tx.as_dict())
+
+
+# ---------------------------------------------------------------------------
+# escrow administration (payload builders only: the wallet signs)
+# ---------------------------------------------------------------------------
+
+async def admin_contract_state(request: web.Request) -> web.Response:
+    user_id = _require_admin(request)
+    force = request.query.get("refresh") in ("1", "true", "yes")
+    # Los MarketError (chain_unavailable incluido) los traduce el middleware.
+    state = await markets.escrow_state(force=force)
+    payload = state.as_dict()
+    payload["admin_matches_wallet"] = await _admin_matches_wallet(user_id, state)
+    return json_ok(payload)
+
+
+async def _admin_matches_wallet(user_id: int, state: Any) -> bool | None:
+    """Whether the linked wallet can actually sign these ops (informational)."""
+    if not state.admin:
+        return None
+    wallet = await database.get_wallet(user_id)
+    if not wallet:
+        return None
+    try:
+        return normalize_address(wallet["address"]) == normalize_address(state.admin)
+    except (AddressError, ValueError):
+        return None
+
+
+async def admin_contract_withdraw(request: web.Request) -> web.Response:
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    amount = parse_nano(data.get("amount"), field="importe")
+    tx = await markets.prepare_withdraw_fees(user_id, amount)
+    return json_ok(tx.as_dict())
+
+
+async def admin_contract_set_fee(request: web.Request) -> web.Response:
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    if data.get("fee_bps") is not None:
+        try:
+            fee_bps = int(data["fee_bps"])
+        except (TypeError, ValueError):
+            return json_error("bad_fee", "fee_bps debe ser un entero.")
+    else:
+        fee_bps = parse_fee_bps(data.get("percent"))
+    tx = await markets.prepare_set_fee(user_id, fee_bps)
+    return json_ok(tx.as_dict())
+
+
+async def admin_contract_set_paused(request: web.Request) -> web.Response:
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    if not isinstance(data.get("paused"), bool):
+        return json_error("bad_flag", "paused debe ser true o false.")
+    tx = await markets.prepare_set_paused(user_id, data["paused"])
+    return json_ok(tx.as_dict())
+
+
+async def admin_contract_change_admin(request: web.Request) -> web.Response:
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    tx = await markets.prepare_change_admin(user_id, str(data.get("address") or ""))
     return json_ok(tx.as_dict())
 
 
@@ -576,6 +851,7 @@ async def indexer_status(request: web.Request) -> web.Response:
         "is_admin": _admin(user_id),
     }
     if _admin(user_id):
+        payload["failures"] = await database.list_chain_tx_failures(limit=10)
         async with database.connection() as db:
             async with db.execute(
                 "SELECT COUNT(*) AS n FROM markets WHERE status = 'open'"
@@ -604,12 +880,36 @@ def _error_middleware():
                 )
             raise
         except markets.MarketError as exc:
-            return json_error(exc.code, str(exc), 400)
+            return json_error(
+                exc.code, str(exc), _MARKET_ERROR_STATUS.get(exc.code, 400)
+            )
         except (BodyError, AddressError) as exc:
             return json_error("bad_request", str(exc), 400)
         except Exception:  # noqa: BLE001 - last resort, no stack traces leaked
             logger.exception("Unhandled API error on %s %s", request.method, request.path)
             return json_error("internal_error", "Error interno del servidor.", 500)
+
+    return middleware
+
+
+def _backstop_middleware(backstops: dict[str, security.RateLimiter]):
+    """Ceiling per endpoint, independent of the caller's identity.
+
+    Forging ``X-Forwarded-For`` or minting sessions cannot bypass this: the key
+    is the endpoint itself, so the "rotate keys until it works" attack (S-04)
+    hits a wall even if no proxy is configured.
+    """
+    @web.middleware
+    async def middleware(request: web.Request, handler):
+        limiter = backstops.get(request.path)
+        if limiter is not None:
+            allowed, retry = limiter.allow(request.path)
+            if not allowed:
+                return _rate_limited(
+                    "El servicio recibe demasiadas peticiones. Inténtalo en unos segundos.",
+                    retry,
+                )
+        return await handler(request)
 
     return middleware
 
@@ -626,7 +926,7 @@ def _headers_middleware(allowed_ancestors: str):
                 "Content-Security-Policy",
                 "default-src 'self'; "
                 f"frame-ancestors {allowed_ancestors}; "
-                "script-src 'self' https://telegram.org https://unpkg.com; "
+                "script-src 'self' https://telegram.org; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob: https:; "
                 "connect-src 'self' https: wss:; "
@@ -637,11 +937,19 @@ def _headers_middleware(allowed_ancestors: str):
     return middleware
 
 
-def create_app(ton_client: Any = None) -> web.Application:
+def create_app(
+    ton_client: Any = None,
+    *,
+    backstop_limits: dict[str, tuple[int, float]] | None = None,
+) -> web.Application:
     settings = _settings()
     app = web.Application(
         client_max_size=MAX_BODY,
-        middlewares=[_error_middleware(), _headers_middleware(settings.frame_ancestors)],
+        middlewares=[
+            _error_middleware(),
+            _backstop_middleware(_new_backstops(backstop_limits)),
+            _headers_middleware(settings.frame_ancestors),
+        ],
     )
     app[TON_CLIENT_KEY] = ton_client
 
@@ -659,19 +967,24 @@ def create_app(ton_client: Any = None) -> web.Application:
     app.router.add_get("/api/markets", list_markets)
     app.router.add_get("/api/markets/{market_id}", get_market)
     app.router.add_post("/api/markets/prepare", prepare_market)
+    app.router.add_get("/api/markets/{market_id}/quote", quote_market)
     app.router.add_post("/api/markets/{market_id}/bets/prepare", prepare_bet)
     app.router.add_post("/api/markets/{market_id}/claim/prepare", prepare_claim)
     app.router.add_post("/api/admin/markets/{market_id}/resolve/prepare", prepare_resolve)
     app.router.add_post("/api/admin/markets/{market_id}/cancel/prepare", prepare_cancel)
+    app.router.add_get("/api/admin/contract", admin_contract_state)
+    app.router.add_post("/api/admin/contract/withdraw/prepare", admin_contract_withdraw)
+    app.router.add_post("/api/admin/contract/set-fee/prepare", admin_contract_set_fee)
+    app.router.add_post("/api/admin/contract/set-paused/prepare", admin_contract_set_paused)
+    app.router.add_post("/api/admin/contract/change-admin/prepare", admin_contract_change_admin)
     app.router.add_get("/api/indexer", indexer_status)
 
-    if WEB_DIR.exists():
-        app.router.add_static("/static", path=str(WEB_DIR / "static"), name="static")
+    app.router.add_get("/static/{name}", static_asset, name="static")
     return app
 
 
 async def start_server(
-    *, host: Optional[str] = None, port: Optional[int] = None, ton_client: Any = None
+    *, host: str | None = None, port: int | None = None, ton_client: Any = None
 ) -> web.AppRunner:
     settings = _settings()
     app = create_app(ton_client=ton_client)

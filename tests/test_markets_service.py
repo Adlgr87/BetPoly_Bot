@@ -6,7 +6,7 @@ import time
 import pytest
 
 import config
-from bot import markets
+from bot import economics, markets
 from bot.chain import bodies
 
 WALLET = "0:" + "11" * 32
@@ -20,7 +20,7 @@ async def _linked(db, user_id=1, address=WALLET):
 
 async def _market(db, market_id=1, *, status="open", closes_in=3600, options=("Sí", "No"),
                   winning=None, total=0, winning_pool=0, fee_bps=200):
-    await db.upsert_market(
+    await db.enrich_market_from_event(
         market_id, WALLET, "¿Pasa algo?", len(options), int(time.time()) + closes_in,
         fee_bps=fee_bps,
     )
@@ -39,7 +39,7 @@ class TestPrepareCreate:
         assert parsed.title_hash == bodies.title_to_hash("¿Ganará México?")
         assert parsed.closes_at == close
         assert parsed.option_count == 2
-        assert tx.amount == markets.CREATE_GAS_NANO
+        assert tx.amount == config.get_settings().create_gas_nano
         assert tx.to.startswith("EQ")
         assert "app.tonkeeper.com/transfer/" in tx.deeplink
         assert "bin=" in tx.deeplink
@@ -91,7 +91,7 @@ class TestPrepareBet:
         tx = await markets.prepare_bet(1, 1, 0, 2_000_000_000)
         parsed = bodies.parse_message_body(tx.payload)
         assert (parsed.market_id, parsed.option, parsed.stake) == (1, 0, 2_000_000_000)
-        assert tx.amount == 2_000_000_000 + markets.BET_GAS_NANO
+        assert tx.amount == 2_000_000_000 + config.get_settings().bet_gas_nano
         assert tx.details["stake_ton"] == "2"
 
     async def test_wallet_required(self, users):
@@ -209,7 +209,7 @@ class TestAdminActions:
         tx = await markets.prepare_resolve(1001, 1, 2)
         parsed = bodies.parse_message_body(tx.payload)
         assert (parsed.market_id, parsed.winning_option) == (1, 2)
-        assert tx.amount == markets.ADMIN_GAS_NANO
+        assert tx.amount == config.get_settings().admin_gas_nano
 
     async def test_invalid_winner(self, db):
         await _linked(db, 1001)
@@ -241,10 +241,29 @@ class TestViews:
         detail = await markets.market_detail(1, user_id=1)
         assert detail["pool"] == "4000000000"
         assert detail["pool_ton"] == "4"
-        assert detail["options"][0]["multiplier"] == 4.0
-        assert detail["options"][1]["multiplier"] == 1.3333
+        # F-03: el multiplicador ya descuenta la comisión del mercado (2 %).
+        assert detail["fee_bps"] == 200
+        assert detail["fee_percent"] == "2.00"
+        assert detail["options"][0]["multiplier"] == 3.92   # 4 × 0.98
+        assert detail["options"][1]["multiplier"] == 1.3067  # 1.3333 × 0.98
+        # Y el multiplicador publicado coincide con el pago real por TON.
+        expected = economics.payout(
+            1_000_000_000, economics.distributable(4_000_000_000, 200), 1_000_000_000
+        )
+        assert expected == 3_920_000_000
+        assert detail["options"][0]["multiplier"] == round(expected / 1e9, 4)
         assert detail["my_bet"]["stake"] == "1000000000"
         assert detail["seconds_left"] > 0
+
+    async def test_displayed_payout_matches_the_claim(self, db):
+        """F-03: el «Pago estimado» que pinta la Mini App es lo que se reclama."""
+        await _linked(db)
+        await _market(db, status="resolved", closes_in=-60, winning=0,
+                      total=6_000_000_000, winning_pool=4_000_000_000)
+        await db.record_onchain_bet(1, WALLET, 0, 1_000_000_000, "tx", 1)
+        detail = await markets.market_detail(1, user_id=1)
+        tx = await markets.prepare_claim(1, 1)
+        assert detail["my_estimate"] == tx.details["estimate"] == "1470000000"
 
     async def test_market_detail_missing(self, db):
         with pytest.raises(markets.MarketError):
@@ -255,3 +274,110 @@ class TestViews:
         detail = await markets.market_detail(1)
         assert detail["options"][0]["multiplier"] is None
         assert detail["pool"] == "0"
+
+
+class TestQuote:
+    """F-03: el pago que se muestra sale de la misma fórmula que el contrato."""
+
+    async def test_quote_matches_the_shared_economics(self, db):
+        await _linked(db)
+        await _market(db, options=("A", "B"), fee_bps=200)
+        await db.record_onchain_bet(1, WALLET, 0, 1_000_000_000, "t1", 1)
+        quote = await markets.quote_payout(1, 1, 2_000_000_000)
+        expected = economics.preview_payout(2_000_000_000, 0, 1_000_000_000, 200)
+        assert quote["payout"] == str(expected)
+        assert quote["payout_ton"] == markets.ton(expected)
+        assert quote["stake"] == "2000000000"
+        assert int(quote["payout"]) < 2_000_000_000 + 1_000_000_000  # nunca promete de más
+
+    async def test_quote_rejects_an_unknown_option(self, db):
+        await _market(db, options=("A", "B"))
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.quote_payout(1, 5, 1_000_000_000)
+        assert exc.value.code == "bad_option"
+
+    async def test_quote_rejects_amounts_out_of_range(self, db):
+        await _market(db, options=("A", "B"))
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.quote_payout(1, 0, 1)
+        assert exc.value.code == "stake_too_low"
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.quote_payout(1, 0, config.get_settings().max_stake_nano + 1)
+        assert exc.value.code == "stake_too_high"
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.quote_payout(1, 0, 0)
+        assert exc.value.code == "bad_amount"
+
+    async def test_quote_rejects_an_unknown_market(self, db):
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.quote_payout(999, 0, 1_000_000_000)
+        assert exc.value.code == "market_not_found"
+
+
+class TestCancelPolicy:
+    """F-05: cancelar un mercado vivo y con apuestas exige confirmación explícita."""
+
+    async def test_open_market_with_bets_requires_force(self, db):
+        await _linked(db, 1001)
+        await _market(db, closes_in=3600)
+        await db.record_onchain_bet(1, OTHER_WALLET, 0, 1_000_000_000, "t1", 1)
+
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.prepare_cancel(1001, 1)
+        assert exc.value.code == "cancel_needs_force"
+
+        tx = await markets.prepare_cancel(1001, 1, force=True)
+        assert bodies.parse_message_body(tx.payload).op == bodies.OP_CANCEL_MARKET
+
+    async def test_open_market_without_bets_can_be_cancelled(self, db):
+        await _linked(db, 1001)
+        await _market(db, closes_in=3600)
+        tx = await markets.prepare_cancel(1001, 1)
+        assert bodies.parse_message_body(tx.payload).op == bodies.OP_CANCEL_MARKET
+
+    async def test_closed_market_with_bets_can_be_cancelled(self, db):
+        await _linked(db, 1001)
+        await _market(db, closes_in=-60)
+        await db.record_onchain_bet(1, OTHER_WALLET, 0, 1_000_000_000, "t1", 1)
+        tx = await markets.prepare_cancel(1001, 1)
+        assert bodies.parse_message_body(tx.payload).op == bodies.OP_CANCEL_MARKET
+
+
+class TestResolutionWindow:
+    """F-06: preparar una resolución bloquea apuestas nuevas mientras se confirma."""
+
+    async def test_pending_resolution_blocks_new_bets(self, db):
+        await _linked(db)
+        await _market(db, closes_in=3600)
+        await db.set_market_pending_resolve(1, int(time.time()))
+
+        with pytest.raises(markets.MarketError) as exc:
+            await markets.prepare_bet(1, 1, 0, 1_000_000_000)
+        assert exc.value.code == "market_resolving"
+
+    async def test_window_expires(self, db):
+        await _linked(db)
+        await _market(db, closes_in=3600)
+        expired = int(time.time()) - markets.RESOLVE_WINDOW_SECONDS - 5
+        await db.set_market_pending_resolve(1, expired)
+
+        tx = await markets.prepare_bet(1, 1, 0, 1_000_000_000)
+        assert bodies.parse_message_body(tx.payload).op == bodies.OP_PLACE_BET
+
+    async def test_prepare_resolve_marks_the_window(self, db):
+        await _linked(db, 1001)
+        await _market(db, closes_in=-60)
+        await markets.prepare_resolve(1001, 1, 0)
+        market = await db.get_market(1)
+        assert market["pending_resolve_at"] is not None
+        assert markets.market_view(market)["resolving"] is True
+        assert markets.market_view(market)["is_open"] is False
+
+    async def test_settlement_clears_the_window(self, db):
+        await _linked(db, 1001)
+        await _market(db, closes_in=-60)
+        await db.set_market_pending_resolve(1, int(time.time()))
+        await db.update_market_settled(1, 0, 1_000, 500)
+        market = await db.get_market(1)
+        assert market["pending_resolve_at"] is None
+        assert markets.market_view(market)["resolving"] is False

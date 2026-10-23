@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import sys
+from datetime import datetime, timezone
 
 from telegram import BotCommand, MenuButtonWebApp, Update, WebAppInfo
 from telegram.error import BadRequest, Forbidden
@@ -29,7 +31,7 @@ from telegram.ext import (
 )
 
 import config
-from bot import database
+from bot import database, notifications
 from bot.api import start_server
 from bot.chain.indexer import EscrowIndexer
 from bot.chain.toncenter import TonCenterClient
@@ -37,16 +39,22 @@ from bot.formatting import esc, fmt_ts
 from bot.handlers.admin import (
     admin_chain_callback,
     admin_chain_cancel_callback,
+    admin_chain_cancel_force_callback,
     admin_chain_market_callback,
     admin_chain_options_callback,
     admin_chain_win_callback,
     admin_confirm_callback,
+    admin_contract_callback,
+    admin_contract_ok_callback,
+    admin_contract_pause_callback,
     admin_handler,
     admin_panel_callback,
+    admin_predictions_page_callback,
     admin_resolve_callback,
     admin_winner_callback,
+    build_admin_contract_conversation,
 )
-from bot.handlers.common import safe_answer
+from bot.handlers.common import menu_for, notify_limiter, safe_answer
 from bot.handlers.help import help_callback, help_handler, how_it_works_callback
 from bot.handlers.markets import (
     list_markets_callback,
@@ -75,7 +83,6 @@ from bot.handlers.wallet import (
     wallet_info_callback,
     wallet_unlink_callback,
 )
-from bot.keyboards import main_menu_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -118,19 +125,46 @@ async def job_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _epoch(value) -> int:
-    from datetime import datetime
-
     try:
         if isinstance(value, (int, float)):
             return int(value)
         dt = datetime.fromisoformat(str(value))
         if dt.tzinfo is None:
-            from datetime import timezone
-
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp())
     except Exception:  # noqa: BLE001
         return 0
+
+
+async def job_dispatch_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envía los avisos pendientes (F-04) sin bloquear nada más.
+
+    Lotes de 20 cada 30 s: suficiente para un host de 512 MB y fácil de razonar.
+    Un fallo de envío no se pierde: la fila reaparece con backoff exponencial.
+    """
+    try:
+        rows = await database.due_notifications(20)
+    except Exception:  # noqa: BLE001
+        logger.exception("due_notifications failed")
+        return
+    for row in rows:
+        allowed, retry_after = notify_limiter.allow(f"notify:{row['user_id']}")
+        if not allowed:
+            await database.reschedule_notification(row["id"], int(retry_after) or 60)
+            continue
+        text = notifications.render(row)
+        if text is None:
+            await database.mark_notification_failed(row["id"], "tipo desconocido")
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=int(row["user_id"]), text=text, parse_mode="HTML"
+            )
+        except Exception as exc:  # noqa: BLE001 - Telegram puede fallar por mil motivos
+            logger.debug("No se pudo enviar el aviso %s: %s", row["id"], exc)
+            await database.mark_notification_failed(row["id"], str(exc))
+            continue
+        await database.mark_notification_sent(row["id"])
 
 
 async def job_housekeeping(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -153,13 +187,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     if isinstance(error, (BadRequest, Forbidden)):
         return
     if isinstance(update, Update) and update.effective_message:
-        try:
+        with contextlib.suppress(Exception):
             await update.effective_message.reply_text(
                 "⚠️ Algo salió mal procesando tu solicitud. Inténtalo de nuevo en unos segundos.",
-                reply_markup=main_menu_keyboard(),
+                reply_markup=menu_for(update),
             )
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +308,7 @@ def build_application() -> Application:
 
     # --- Conversations first: they must win over the generic text handler.
     application.add_handler(build_crear_conversation())
+    application.add_handler(build_admin_contract_conversation())
 
     # --- Commands --------------------------------------------------------
     application.add_handler(CommandHandler("start", start_handler))
@@ -307,6 +340,7 @@ def build_application() -> Application:
         (r"^list_markets:\d+$", list_markets_callback),
         (r"^market_view:\d+$", market_view_callback),
         ("^admin_panel$", admin_panel_callback),
+        (r"^admin_preds:\d+$", admin_predictions_page_callback),
         (r"^admin_resolve:\d+$", admin_resolve_callback),
         (r"^admin_winner:\d+:\d+$", admin_winner_callback),
         (r"^admin_confirm:\d+:\d+$", admin_confirm_callback),
@@ -315,13 +349,19 @@ def build_application() -> Application:
         (r"^admin_chain_options:\d+$", admin_chain_options_callback),
         (r"^admin_chain_win:\d+:\d+$", admin_chain_win_callback),
         (r"^admin_chain_cancel:\d+$", admin_chain_cancel_callback),
+        (r"^admin_chain_cancel_force:\d+$", admin_chain_cancel_force_callback),
+        ("^admin_contract$", admin_contract_callback),
+        (r"^admin_contract_pause:\d+$", admin_contract_pause_callback),
+        (r"^admin_contract_ok:[a-z0-9_]+$", admin_contract_ok_callback),
     ]
     for pattern, handler in callbacks:
         application.add_handler(CallbackQueryHandler(handler, pattern=pattern))
 
     # --- Plain text: bet amount input (last, lowest priority) ------------
+    # En privado cualquier número sirve; en grupo el handler exige que sea una
+    # respuesta al mensaje del bot (F-02), así que no hace falta filtrar por chat.
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, bet_amount_message),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, bet_amount_message),
         group=1,
     )
 
@@ -329,6 +369,7 @@ def build_application() -> Application:
     assert application.job_queue is not None, "python-telegram-bot[job-queue] is required"
     application.job_queue.run_repeating(job_close_expired, interval=60, first=10)
     application.job_queue.run_repeating(job_reminders, interval=600, first=60)
+    application.job_queue.run_repeating(job_dispatch_notifications, interval=30, first=20)
     application.job_queue.run_repeating(job_housekeeping, interval=3600, first=300)
 
     application.add_error_handler(error_handler)

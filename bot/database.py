@@ -18,18 +18,35 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    NamedTuple,
+    Sequence,
+)
 
 import aiosqlite
 
 import config
+from bot import economics
 from bot.formatting import iso_now, iso_utc
 
 logger = logging.getLogger(__name__)
+
+#: Tipos de aviso. El texto vive en :mod:`bot.notifications`; la persistencia,
+#: aquí. Coinciden a propósito (una sola lista de tipos).
+NOTIFICATION_PREDICTION_RESULT = "prediction_result"
+NOTIFICATION_MARKET_CLAIM = "market_claim"
+NOTIFICATION_MARKET_REFUND = "market_refund"
 
 __all__ = [
     "DatabaseError", "DuplicateBet", "InsufficientFunds", "WalletConflict",
@@ -40,11 +57,12 @@ __all__ = [
     "get_predictions_to_resolve", "close_expired_predictions",
     "settle_prediction", "resolve_prediction", "get_options",
     "place_bet", "get_user_bets", "get_bettors_for_prediction",
-    "get_prediction_pools", "get_user_bet",
+    "get_prediction_pools", "get_user_bet", "get_user_stats", "ranking_position",
     "claim_reminders", "get_reminder_targets",
     "link_wallet", "get_wallet", "get_wallet_owner", "unlink_wallet",
     "create_nonce", "consume_nonce", "purge_nonces",
-    "upsert_market", "update_market_settled", "update_market_cancelled",
+    "insert_market_placeholder", "enrich_market_from_event",
+    "update_market_settled", "update_market_cancelled",
     "get_market", "list_markets", "set_market_options",
     "record_onchain_bet", "mark_onchain_bet_claimed", "list_onchain_bets",
     "get_onchain_bet", "get_cursor", "set_cursor", "mark_tx_processed",
@@ -74,11 +92,11 @@ class WalletConflict(DatabaseError):
 # ---------------------------------------------------------------------------
 # Connection handling
 # ---------------------------------------------------------------------------
-_conn: Optional[aiosqlite.Connection] = None
-_conn_path: Optional[str] = None
+_conn: aiosqlite.Connection | None = None
+_conn_path: str | None = None
 _lock = asyncio.Lock()
 
-_override_path: Optional[str] = None
+_override_path: str | None = None
 
 
 def configure_database(path: str) -> None:
@@ -153,6 +171,28 @@ async def transaction() -> AsyncIterator[aiosqlite.Connection]:
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+# ``wallet_links`` needs a surrogate key: a Telegram account can unlink and
+# later re-link, and the address must become available to other accounts once it
+# is inactive.  A global UNIQUE(address) made that impossible (S-07), so the
+# table is rebuilt with partial unique indexes instead.
+_WALLET_LINKS_DDL = """
+CREATE TABLE IF NOT EXISTS wallet_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    address     TEXT NOT NULL,
+    network     TEXT NOT NULL DEFAULT 'ton',
+    public_key  TEXT,
+    verified_at TEXT NOT NULL,
+    is_active   INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_active_addr
+    ON wallet_links(address) WHERE is_active = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_active_user
+    ON wallet_links(user_id) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_wallet_history ON wallet_links(user_id, verified_at DESC);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id     INTEGER PRIMARY KEY,
@@ -207,13 +247,19 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 
 -- ---------------------------------------------------------------- on-chain
-CREATE TABLE IF NOT EXISTS wallet_links (
-    user_id     INTEGER PRIMARY KEY,
-    address     TEXT NOT NULL UNIQUE,
-    network     TEXT NOT NULL DEFAULT 'ton',
-    public_key  TEXT,
-    verified_at TEXT NOT NULL,
-    is_active   INTEGER NOT NULL DEFAULT 1
+CREATE TABLE IF NOT EXISTS notifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    ref_id     TEXT NOT NULL,
+    payload    TEXT NOT NULL DEFAULT '{}',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    next_at    INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    sent_at    TEXT,
+    last_error TEXT,
+    UNIQUE (user_id, kind, ref_id)
 );
 
 CREATE TABLE IF NOT EXISTS auth_nonces (
@@ -232,12 +278,14 @@ CREATE TABLE IF NOT EXISTS markets (
     option_count   INTEGER NOT NULL,
     closes_at      INTEGER NOT NULL,
     status         TEXT NOT NULL DEFAULT 'open',
+    pending_resolve_at INTEGER,
     winning_option INTEGER,
     total_pool     INTEGER NOT NULL DEFAULT 0,
     winning_pool   INTEGER NOT NULL DEFAULT 0,
     fee_bps        INTEGER,
     created_lt     INTEGER,
     created_tx     TEXT,
+    metadata_source TEXT NOT NULL DEFAULT 'event',
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -289,6 +337,18 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     consumed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS chain_tx_failures (
+    tx_hash       TEXT NOT NULL,
+    lt            INTEGER NOT NULL,
+    op            INTEGER,
+    error         TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    first_seen    TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen     TEXT NOT NULL DEFAULT (datetime('now')),
+    next_retry_at TEXT,
+    PRIMARY KEY (tx_hash, lt)
+);
+
 CREATE TABLE IF NOT EXISTS indexer_status (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     last_run        TEXT,
@@ -303,22 +363,34 @@ CREATE INDEX IF NOT EXISTS idx_predictions_chat   ON predictions(chat_id, status
 CREATE INDEX IF NOT EXISTS idx_options_pred       ON options(prediction_id);
 CREATE INDEX IF NOT EXISTS idx_bets_pred          ON bets(prediction_id, result);
 CREATE INDEX IF NOT EXISTS idx_bets_user          ON bets(user_id, placed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_markets_status     ON markets(status, closes_at);
+-- R-05: el listado ordena por (closes_at, market_id DESC); sin la tercera
+-- columna SQLite monta un B-TREE temporal para desempatar. Sustituye al antiguo
+-- idx_markets_status(status, closes_at), que era su prefijo exacto.
+DROP INDEX IF EXISTS idx_markets_status;
+CREATE INDEX IF NOT EXISTS idx_markets_status_close ON markets(status, closes_at, market_id DESC);
 CREATE INDEX IF NOT EXISTS idx_onchain_bets_mkt   ON onchain_bets(market_id, bettor);
+-- R-04: «mis apuestas on-chain» filtra por bettor y ordena por id descendente.
+CREATE INDEX IF NOT EXISTS idx_onchain_bets_bettor ON onchain_bets(bettor, id DESC);
+-- R-01: agregar pozos por opción de una página de mercados sin B-TREE temporal.
+CREATE INDEX IF NOT EXISTS idx_onchain_bets_mkt_opt ON onchain_bets(market_id, option);
 CREATE INDEX IF NOT EXISTS idx_pending_match      ON pending_actions(kind, match_a, match_b, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_nonces_user        ON auth_nonces(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tx_failures_retry  ON chain_tx_failures(next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_due  ON notifications(status, next_at);
 """
 
 # Columns added after the first public release.  ``init_db`` adds them only
 # when missing so that an existing betpoly.db keeps working.
-_LEGACY_COLUMNS: Sequence[Tuple[str, str, str]] = (
+_LEGACY_COLUMNS: Sequence[tuple[str, str, str]] = (
     ("users", "updated_at", "TEXT NOT NULL DEFAULT ''"),
     ("predictions", "mode", "TEXT NOT NULL DEFAULT 'points'"),
     ("bets", "payout", "INTEGER NOT NULL DEFAULT 0"),
+    ("markets", "metadata_source", "TEXT NOT NULL DEFAULT 'event'"),
+    ("markets", "pending_resolve_at", "INTEGER"),
 )
 
 
-async def _table_columns(conn: aiosqlite.Connection, table: str) -> List[str]:
+async def _table_columns(conn: aiosqlite.Connection, table: str) -> list[str]:
     try:
         async with conn.execute(f"PRAGMA table_info({table})") as cur:
             return [row["name"] for row in await cur.fetchall()]
@@ -326,24 +398,91 @@ async def _table_columns(conn: aiosqlite.Connection, table: str) -> List[str]:
         return []
 
 
+async def _migrate_wallet_links(db: aiosqlite.Connection) -> None:
+    """Rebuild the legacy ``wallet_links`` table (user_id PK, address UNIQUE)."""
+    columns = await _table_columns(db, "wallet_links")
+    if not columns:
+        await db.executescript(_WALLET_LINKS_DDL)
+        return
+    if "id" in columns:
+        return
+    logger.info("Migrating wallet_links: removing global UNIQUE(address)")
+    await db.execute("ALTER TABLE wallet_links RENAME TO wallet_links_legacy")
+    await db.executescript(_WALLET_LINKS_DDL)
+    await db.execute(
+        """
+        INSERT INTO wallet_links (user_id, address, network, public_key, verified_at, is_active)
+        SELECT user_id, address, network, public_key, verified_at, is_active
+        FROM wallet_links_legacy
+        """
+    )
+    await db.execute("DROP TABLE wallet_links_legacy")
+
+
+#: Versión del esquema en disco. Sube **siempre** que se añada una migración.
+SCHEMA_VERSION = 1
+
+
+async def _schema_version(db: aiosqlite.Connection) -> int:
+    async with db.execute("PRAGMA user_version") as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _migration_1(db: aiosqlite.Connection, settings: config.Settings) -> None:
+    """Primera versión con control de esquema (D-04).
+
+    Absorbe las migraciones ad-hoc anteriores: reconstruye `wallet_links`,
+    añade las columnas tardías y corrige los puntos iniciales de los usuarios
+    que quedaron con el literal histórico 1000.
+    """
+    await _migrate_wallet_links(db)
+    for table, column, ddl in _LEGACY_COLUMNS:
+        columns = await _table_columns(db, table)
+        if columns and column not in columns:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            logger.info("Migración 1: añadida la columna %s.%s", table, column)
+    await db.execute(
+        "UPDATE users SET points = ? WHERE points = 1000 AND created_at = updated_at "
+        "AND ? != 1000 AND NOT EXISTS (SELECT 1 FROM bets WHERE bets.user_id = users.user_id)",
+        (settings.starting_points, settings.starting_points),
+    )
+
+
+#: Migraciones por versión: `_MIGRATIONS[n]` lleva el esquema de n-1 a n.
+_MIGRATIONS: dict[int, Callable[..., Awaitable[None]]] = {1: _migration_1}
+
+
 async def init_db() -> None:
-    """Create/upgrade the schema. Safe to call repeatedly."""
+    """Crea o actualiza el esquema. Seguro de llamar en cada arranque."""
     settings = config.get_settings()
     async with transaction() as db:
         await db.executescript(_SCHEMA)
-        for table, column, ddl in _LEGACY_COLUMNS:
-            columns = await _table_columns(db, table)
-            if columns and column not in columns:
-                await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-                logger.info("Migrated %s: added column %s", table, column)
-        # New databases start with the configured amount of points.
-        await db.execute(
-            "UPDATE users SET points = ? WHERE points = 1000 AND created_at = updated_at "
-            "AND ? != 1000 AND NOT EXISTS (SELECT 1 FROM bets WHERE bets.user_id = users.user_id)",
-            (settings.starting_points, settings.starting_points),
-        )
+        await _apply_migrations(db, settings)
         await db.commit()
     logger.info("Database ready at %s (mode=%s)", database_path(), settings.mode)
+
+
+async def _apply_migrations(db: aiosqlite.Connection, settings: config.Settings) -> None:
+    """Aplica, en orden y una sola vez, las migraciones pendientes.
+
+    `PRAGMA user_version` es el marcador: no hay tabla de control que se pueda
+    desincronizar, y una base de datos de una versión futura se rechaza en vez
+    de corromperse.
+    """
+    current = await _schema_version(db)
+    if current > SCHEMA_VERSION:
+        raise DatabaseError(
+            f"La base de datos es de la versión {current} y este bot entiende hasta "
+            f"la {SCHEMA_VERSION}. Actualiza el bot antes de arrancar."
+        )
+    for version in range(current + 1, SCHEMA_VERSION + 1):
+        migration = _MIGRATIONS.get(version)
+        if migration is None:  # pragma: no cover - guardarraíl de desarrollo
+            raise DatabaseError(f"Falta la migración {version}")
+        await migration(db, settings)
+        await db.execute(f"PRAGMA user_version = {int(version)}")
+        logger.info("Esquema migrado a la versión %s", version)
 
 
 # ---------------------------------------------------------------------------
@@ -368,14 +507,14 @@ class SettlementResult:
     total_pool: int
     winning_pool: int
     rake: int = 0
-    bets: List[BetSettlement] = field(default_factory=list)
+    bets: list[BetSettlement] = field(default_factory=list)
 
     @property
-    def winners(self) -> List[BetSettlement]:
+    def winners(self) -> list[BetSettlement]:
         return [b for b in self.bets if b.result in ("win", "refund")]
 
     @property
-    def losers(self) -> List[BetSettlement]:
+    def losers(self) -> list[BetSettlement]:
         return [b for b in self.bets if b.result == "lose"]
 
     @property
@@ -387,29 +526,36 @@ class SettlementResult:
 # Users
 # ---------------------------------------------------------------------------
 
-async def upsert_user(user_id: int, username: Optional[str], full_name: Optional[str]) -> None:
+async def upsert_user(user_id: int, username: str | None, full_name: str | None) -> None:
+    """Crea o refresca el usuario sin perder datos que Telegram no envía.
+
+    D-05: si el usuario quita su @usuario, Telegram manda ``None``; un
+    ``username = excluded.username`` lo habría borrado. Con ``COALESCE`` se
+    conserva el último conocido.
+    """
+    starting_points = int(config.get_settings().starting_points)
     async with transaction() as db:
         await db.execute(
             """
-            INSERT INTO users (user_id, username, full_name)
-            VALUES (?, ?, ?)
+            INSERT INTO users (user_id, username, full_name, points)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                username   = excluded.username,
+                username   = COALESCE(excluded.username, users.username),
                 full_name  = excluded.full_name,
                 updated_at = ?
             """,
-            (user_id, username, full_name or "", iso_now()),
+            (user_id, username or None, full_name or "", starting_points, iso_now()),
         )
 
 
-async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user(user_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 
-async def get_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
+async def get_leaderboard(limit: int = 10) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 100))
     async with connection() as db:
         async with db.execute(
@@ -440,18 +586,22 @@ async def adjust_points(user_id: int, delta: int) -> int:
 # Predictions (off-chain sandbox mode)
 # ---------------------------------------------------------------------------
 
+#: Un mercado necesita al menos dos opciones para poder repartir.
+MIN_OPTIONS = 2
+
+
 async def create_prediction(
     creator_id: int,
     chat_id: int,
     title: str,
-    options: List[str],
+    options: list[str],
     closes_at: datetime,
     mode: str = "points",
 ) -> int:
     settings = config.get_settings()
     if not title.strip():
         raise DatabaseError("El título no puede estar vacío.")
-    if not 2 <= len(options) <= settings.max_options:
+    if not MIN_OPTIONS <= len(options) <= settings.max_options:
         raise DatabaseError(f"Necesitas entre 2 y {settings.max_options} opciones.")
     async with transaction() as db:
         cur = await db.execute(
@@ -466,38 +616,37 @@ async def create_prediction(
     return pred_id
 
 
-async def get_prediction(pred_id: int) -> Optional[Dict[str, Any]]:
+async def get_prediction(pred_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute("SELECT * FROM predictions WHERE id = ?", (pred_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 
-async def get_open_predictions(chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
+async def get_open_predictions(chat_id: int | None = None) -> list[dict[str, Any]]:
+    """Predicciones abiertas **con su pozo**, en una sola consulta (R-01).
+
+    Antes la lista pedía una consulta por predicción para el pozo: con 8 filas
+    eran 8 idas a SQLite por cada refresco del mensaje.
+    """
     now = iso_now()
+    sql = """
+        SELECT p.*, COALESCE(SUM(b.amount), 0) AS total_pool
+        FROM predictions p
+        LEFT JOIN bets b ON b.prediction_id = p.id
+        WHERE p.status = 'open' AND p.closes_at > ?
+    """
+    params: list[Any] = [now]
+    if chat_id is not None:
+        sql += " AND p.chat_id = ?"
+        params.append(chat_id)
+    sql += " GROUP BY p.id ORDER BY p.closes_at ASC LIMIT 50"
     async with connection() as db:
-        if chat_id is not None:
-            async with db.execute(
-                """
-                SELECT * FROM predictions
-                WHERE status = 'open' AND chat_id = ? AND closes_at > ?
-                ORDER BY closes_at ASC LIMIT 50
-                """,
-                (chat_id, now),
-            ) as cur:
-                return [dict(r) for r in await cur.fetchall()]
-        async with db.execute(
-            """
-            SELECT * FROM predictions
-            WHERE status = 'open' AND closes_at > ?
-            ORDER BY closes_at ASC LIMIT 50
-            """,
-            (now,),
-        ) as cur:
+        async with db.execute(sql, params) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_predictions_to_resolve() -> List[Dict[str, Any]]:
+async def get_predictions_to_resolve() -> list[dict[str, Any]]:
     """Closed predictions that still need a winner (admin panel)."""
     async with connection() as db:
         async with db.execute(
@@ -506,7 +655,7 @@ async def get_predictions_to_resolve() -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def close_expired_predictions() -> List[int]:
+async def close_expired_predictions() -> list[int]:
     """Mark predictions whose ``closes_at`` has passed as ``closed``."""
     now = iso_now()
     async with transaction() as db:
@@ -582,20 +731,22 @@ async def place_bet(user_id: int, pred_id: int, option_id: int, amount: int) -> 
 
 
 def _split_payouts(
-    winners: List[Dict[str, Any]], distributable: int, winning_pool: int
-) -> Dict[int, int]:
-    """Pari-mutuel split with deterministic rounding.
+    winners: list[dict[str, Any]], distributable_pool: int, winning_pool: int
+) -> dict[int, int]:
+    """Reparto pari-mutuel con redondeo determinista.
 
-    Every winner receives ``stake * distributable / winning_pool`` rounded down;
-    the remaining wei are handed out one by one to the largest stakes so the
-    sum of payouts is *exactly* ``distributable`` (no points are created).
+    Cada ganador recibe ``payout(stake, distributable, winning_pool)`` (la única
+    fórmula del proyecto, en :mod:`bot.economics`) redondeada hacia abajo; el
+    sobrante se reparte de uno en uno entre las apuestas mayores para que la
+    suma sea *exactamente* el pozo distribuible (no se crean puntos).
     """
-    if winning_pool <= 0 or distributable <= 0:
+    if winning_pool <= 0 or distributable_pool <= 0:
         return {b["id"]: 0 for b in winners}
     payouts = {
-        b["id"]: (int(b["amount"]) * distributable) // winning_pool for b in winners
+        b["id"]: economics.payout(int(b["amount"]), distributable_pool, winning_pool)
+        for b in winners
     }
-    remainder = distributable - sum(payouts.values())
+    remainder = distributable_pool - sum(payouts.values())
     if remainder > 0:
         order = sorted(winners, key=lambda b: (-int(b["amount"]), b["id"]))
         for i in range(remainder):
@@ -610,83 +761,26 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
     * If nobody picked the winning option (or there are no bets) every stake is
       refunded instead of silently burning points.
     * Idempotent: resolving twice raises instead of paying twice.
+
+    El cuerpo queda como una secuencia de pasos con nombre (R-07): validar,
+    leer, planificar pagos, escribir y encolar avisos. La aritmética vive en
+    `bot/economics.py` y en `_plan_payouts`, nunca aquí.
     """
-    settings = config.get_settings()
     async with transaction() as db:
-        async with db.execute("SELECT * FROM predictions WHERE id = ?", (pred_id,)) as cur:
-            pred = await cur.fetchone()
-        if pred is None:
-            raise DatabaseError("Predicción no encontrada.")
-        if pred["status"] == "resolved":
-            raise DatabaseError("Esta predicción ya fue resuelta.")
-        if pred["status"] not in ("open", "closed"):
-            raise DatabaseError("Esta predicción no se puede resolver.")
+        pred = await _resolvable_prediction(db, pred_id)
+        winning_label = await _winning_label(db, pred_id, winning_option_id)
+        bets = await _prediction_bets(db, pred_id)
+        total_pool, winning_pool = _pool_totals(bets, winning_option_id)
+        plan = _plan_payouts(
+            bets, winning_option_id, total_pool, winning_pool, config.get_settings().house_rake_bps
+        )
 
-        async with db.execute(
-            "SELECT id, label FROM options WHERE id = ? AND prediction_id = ?",
-            (winning_option_id, pred_id),
-        ) as cur:
-            option = await cur.fetchone()
-        if option is None:
-            raise DatabaseError("La opción ganadora no pertenece a esta predicción.")
-        winning_label = option["label"]
-
-        async with db.execute(
-            "SELECT id, user_id, option_id, amount FROM bets WHERE prediction_id = ? ORDER BY id",
-            (pred_id,),
-        ) as cur:
-            bets = [dict(r) for r in await cur.fetchall()]
-
-        total_pool = sum(int(b["amount"]) for b in bets)
-        winners = [b for b in bets if int(b["option_id"]) == int(winning_option_id)]
-        winning_pool = sum(int(b["amount"]) for b in winners)
-
-        settlements: List[BetSettlement] = []
-        rake = 0
-
-        if not bets:
-            payouts: Dict[int, int] = {}
-        elif winning_pool == 0:
-            # Nobody was right: full refund, no rake.
-            payouts = {b["id"]: int(b["amount"]) for b in bets}
-        else:
-            rake = (total_pool * settings.house_rake_bps) // 10_000
-            distributable = total_pool - rake
-            payouts = _split_payouts(winners, distributable, winning_pool)
-
-        now = iso_now()
-        for bet in bets:
-            payout = int(payouts.get(bet["id"], 0))
-            if not bets or winning_pool == 0:
-                result = "refund"
-            elif int(bet["option_id"]) == int(winning_option_id):
-                result = "win"
-            else:
-                result = "lose"
-            await db.execute(
-                "UPDATE bets SET result = ?, payout = ? WHERE id = ?",
-                (result, payout, bet["id"]),
-            )
-            if payout:
-                await db.execute(
-                    "UPDATE users SET points = points + ?, updated_at = ? WHERE user_id = ?",
-                    (payout, now, bet["user_id"]),
-                )
-            settlements.append(
-                BetSettlement(
-                    bet_id=int(bet["id"]),
-                    user_id=int(bet["user_id"]),
-                    option_id=int(bet["option_id"]),
-                    stake=int(bet["amount"]),
-                    payout=payout,
-                    result=result,
-                )
-            )
-
+        settlements = await _write_settlements(db, bets, winning_option_id, plan)
         await db.execute(
             "UPDATE predictions SET status = 'resolved', winner_opt = ?, resolved_at = ? WHERE id = ?",
-            (winning_label, now, pred_id),
+            (winning_label, iso_now(), pred_id),
         )
+        await _queue_result_notifications(db, pred, pred_id, winning_label, settlements)
 
     return SettlementResult(
         prediction_id=pred_id,
@@ -694,9 +788,151 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
         winning_label=winning_label,
         total_pool=total_pool,
         winning_pool=winning_pool,
-        rake=rake,
+        rake=plan.rake,
         bets=settlements,
     )
+
+
+class _SettlementPlan(NamedTuple):
+    """Qué cobra cada apuesta y cuánto se queda el rake."""
+
+    payouts: dict[int, int]
+    rake: int
+    refunded: bool
+
+
+async def _resolvable_prediction(db: aiosqlite.Connection, pred_id: int) -> aiosqlite.Row:
+    async with db.execute("SELECT * FROM predictions WHERE id = ?", (pred_id,)) as cur:
+        pred = await cur.fetchone()
+    if pred is None:
+        raise DatabaseError("Predicción no encontrada.")
+    if pred["status"] == "resolved":
+        raise DatabaseError("Esta predicción ya fue resuelta.")
+    if pred["status"] not in ("open", "closed"):
+        raise DatabaseError("Esta predicción no se puede resolver.")
+    return pred
+
+
+async def _winning_label(
+    db: aiosqlite.Connection, pred_id: int, winning_option_id: int
+) -> str:
+    async with db.execute(
+        "SELECT id, label FROM options WHERE id = ? AND prediction_id = ?",
+        (winning_option_id, pred_id),
+    ) as cur:
+        option = await cur.fetchone()
+    if option is None:
+        raise DatabaseError("La opción ganadora no pertenece a esta predicción.")
+    return option["label"]
+
+
+async def _prediction_bets(db: aiosqlite.Connection, pred_id: int) -> list[dict[str, Any]]:
+    async with db.execute(
+        "SELECT id, user_id, option_id, amount FROM bets WHERE prediction_id = ? ORDER BY id",
+        (pred_id,),
+    ) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+def _pool_totals(bets: list[dict[str, Any]], winning_option_id: int) -> tuple[int, int]:
+    total = sum(int(b["amount"]) for b in bets)
+    winning = sum(
+        int(b["amount"]) for b in bets if int(b["option_id"]) == int(winning_option_id)
+    )
+    return total, winning
+
+
+def _plan_payouts(
+    bets: list[dict[str, Any]],
+    winning_option_id: int,
+    total_pool: int,
+    winning_pool: int,
+    rake_bps: int,
+) -> _SettlementPlan:
+    """Cuánto cobra cada apuesta: reparto pari-mutuel, reembolso total o nada."""
+    if not bets or winning_pool == 0:
+        # Sin apuestas, o sin nadie que acierte: se devuelve todo y no hay rake.
+        return _SettlementPlan({b["id"]: int(b["amount"]) for b in bets}, 0, True)
+    distributable = economics.distributable(total_pool, rake_bps)
+    winners = [b for b in bets if int(b["option_id"]) == int(winning_option_id)]
+    return _SettlementPlan(
+        _split_payouts(winners, distributable, winning_pool),
+        total_pool - distributable,
+        False,
+    )
+
+
+def _bet_result(option_id: int, winning_option_id: int, refunded: bool) -> str:
+    if refunded:
+        return "refund"
+    return "win" if int(option_id) == int(winning_option_id) else "lose"
+
+
+async def _write_settlements(
+    db: aiosqlite.Connection,
+    bets: list[dict[str, Any]],
+    winning_option_id: int,
+    plan: _SettlementPlan,
+) -> list[BetSettlement]:
+    """Marca cada apuesta, paga a quien corresponda y devuelve el resumen."""
+    settlements: list[BetSettlement] = []
+    now = iso_now()
+    for bet in bets:
+        payout = int(plan.payouts.get(bet["id"], 0))
+        result = _bet_result(int(bet["option_id"]), winning_option_id, plan.refunded)
+        await db.execute(
+            "UPDATE bets SET result = ?, payout = ? WHERE id = ?",
+            (result, payout, bet["id"]),
+        )
+        if payout:
+            await db.execute(
+                "UPDATE users SET points = points + ?, updated_at = ? WHERE user_id = ?",
+                (payout, now, bet["user_id"]),
+            )
+        settlements.append(
+            BetSettlement(
+                bet_id=int(bet["id"]),
+                user_id=int(bet["user_id"]),
+                option_id=int(bet["option_id"]),
+                stake=int(bet["amount"]),
+                payout=payout,
+                result=result,
+            )
+        )
+    return settlements
+
+
+async def _queue_result_notifications(
+    db: aiosqlite.Connection,
+    pred: aiosqlite.Row,
+    pred_id: int,
+    winning_label: str,
+    settlements: list[BetSettlement],
+) -> None:
+    """F-04: quien ganó o recuperó puntos merece saberlo.
+
+    Se escribe en la misma transacción, así que no puede haber liquidación sin
+    aviso ni aviso de una liquidación que no ocurrió. `_queue_notification`
+    deduplica. Perder no se notifica: `/misbets` es la fuente de verdad y un
+    aviso por cada derrota sería ruido.
+    """
+    for settlement in settlements:
+        if settlement.result not in ("win", "refund"):
+            continue
+        await _queue_notification(
+            db,
+            settlement.user_id,
+            NOTIFICATION_PREDICTION_RESULT,
+            pred_id,
+            {
+                "prediction_id": pred_id,
+                "title": pred["title"],
+                "winning_label": winning_label,
+                "result": settlement.result,
+                "stake": settlement.stake,
+                "payout": settlement.payout,
+            },
+        )
 
 
 async def resolve_prediction(pred_id: int, winning_option_id: int) -> str:
@@ -709,7 +945,7 @@ async def resolve_prediction(pred_id: int, winning_option_id: int) -> str:
 # Options / history
 # ---------------------------------------------------------------------------
 
-async def get_options(pred_id: int) -> List[Dict[str, Any]]:
+async def get_options(pred_id: int) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM options WHERE prediction_id = ? ORDER BY id", (pred_id,)
@@ -717,7 +953,7 @@ async def get_options(pred_id: int) -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_user_bets(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+async def get_user_bets(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             """
@@ -737,7 +973,54 @@ async def get_user_bets(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_bettors_for_prediction(pred_id: int) -> List[Dict[str, Any]]:
+async def get_user_stats(user_id: int) -> dict[str, Any]:
+    """Resumen del perfil calculado en SQL (R-02).
+
+    Antes se traían hasta 500 apuestas al proceso para contar ganadas, perdidas,
+    reembolsos y neto. Los mismos números salen con un ``SUM``/``COUNT``.
+    """
+    async with connection() as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(amount), 0) AS staked,
+                   COALESCE(SUM(payout), 0) AS payouts,
+                   COALESCE(SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END), 0) AS wins,
+                   COALESCE(SUM(CASE WHEN result = 'lose' THEN 1 ELSE 0 END), 0) AS losses,
+                   COALESCE(SUM(CASE WHEN result = 'refund' THEN 1 ELSE 0 END), 0) AS refunds,
+                   COALESCE(SUM(CASE WHEN result IS NULL THEN 1 ELSE 0 END), 0) AS pending,
+                   COALESCE(SUM(CASE WHEN result IS NOT NULL THEN payout - amount ELSE 0 END), 0)
+                       AS net
+            FROM bets WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ) as cur:
+            row = await cur.fetchone()
+    stats = dict(row) if row else {}
+    for key in ("total", "staked", "payouts", "wins", "losses", "refunds", "pending", "net"):
+        stats[key] = int(stats.get(key) or 0)
+    decided = stats["wins"] + stats["losses"]
+    stats["accuracy"] = (stats["wins"] / decided * 100) if decided else None
+    return stats
+
+
+async def ranking_position(user_id: int) -> int | None:
+    """Puesto en el ranking por puntos, contado en SQL (R-03)."""
+    async with connection() as db:
+        async with db.execute("SELECT points FROM users WHERE user_id = ?", (int(user_id),)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        async with db.execute(
+            "SELECT COUNT(*) AS better FROM users"
+            " WHERE points > ? OR (points = ? AND user_id < ?)",
+            (int(row["points"]), int(row["points"]), int(user_id)),
+        ) as cur:
+            better = await cur.fetchone()
+    return int(better["better"]) + 1
+
+
+async def get_bettors_for_prediction(pred_id: int) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             """
@@ -752,7 +1035,7 @@ async def get_bettors_for_prediction(pred_id: int) -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_prediction_pools(pred_id: int) -> Dict[int, int]:
+async def get_prediction_pools(pred_id: int) -> dict[int, int]:
     """Return ``{option_id: staked_points}`` plus a ``-1`` key with the total."""
     async with connection() as db:
         async with db.execute(
@@ -765,7 +1048,7 @@ async def get_prediction_pools(pred_id: int) -> Dict[int, int]:
     return pools
 
 
-async def get_user_bet(pred_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user_bet(pred_id: int, user_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM bets WHERE prediction_id = ? AND user_id = ?",
@@ -779,7 +1062,7 @@ async def get_user_bet(pred_id: int, user_id: int) -> Optional[Dict[str, Any]]:
 # Reminders (deduplicated push notifications)
 # ---------------------------------------------------------------------------
 
-async def claim_reminders(kind: str = "closing") -> List[Dict[str, Any]]:
+async def claim_reminders(kind: str = "closing") -> list[dict[str, Any]]:
     """Atomically claim due reminders so a job repeat cannot spam users."""
     settings = config.get_settings()
     if settings.reminder_hours_before <= 0:
@@ -802,7 +1085,7 @@ async def claim_reminders(kind: str = "closing") -> List[Dict[str, Any]]:
         ) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
 
-        claimed: List[Dict[str, Any]] = []
+        claimed: list[dict[str, Any]] = []
         for row in rows:
             cur = await db.execute(
                 "INSERT OR IGNORE INTO reminders (prediction_id, user_id, kind, sent_at) VALUES (?, ?, ?, ?)",
@@ -813,7 +1096,7 @@ async def claim_reminders(kind: str = "closing") -> List[Dict[str, Any]]:
         return claimed
 
 
-async def get_reminder_targets(pred_id: int) -> List[int]:
+async def get_reminder_targets(pred_id: int) -> list[int]:
     async with connection() as db:
         async with db.execute(
             "SELECT user_id FROM bets WHERE prediction_id = ?", (pred_id,)
@@ -822,38 +1105,170 @@ async def get_reminder_targets(pred_id: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# Outbox de notificaciones (F-04)
+# ---------------------------------------------------------------------------
+# Los productores (liquidación de puntos e indexador) escriben aquí *dentro* de
+# su propia transacción; el repartidor de `main.py` las envía y reintenta. Así
+# un fallo de Telegram no puede perder el aviso ni bloquear la cadena.
+
+#: Intentos antes de dar el aviso por muerto (usuario que bloqueó el bot, etc.).
+MAX_NOTIFICATION_ATTEMPTS = 5
+#: Backoff exponencial: 60 s, 120 s, 240 s… con techo de una hora.
+NOTIFICATION_MAX_BACKOFF = 3600
+
+
+async def _queue_notification(
+    db: aiosqlite.Connection,
+    user_id: int,
+    kind: str,
+    ref_id: Any,
+    payload: dict[str, Any],
+    *,
+    now: int | None = None,
+    delay: int = 0,
+) -> None:
+    """Inserta un aviso pendiente; el UNIQUE evita duplicados (dedupe)."""
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO notifications (user_id, kind, ref_id, payload, next_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            kind,
+            str(ref_id),
+            json.dumps(payload, ensure_ascii=False),
+            int(now if now is not None else time.time()) + int(delay),
+        ),
+    )
+
+
+async def queue_notification(
+    user_id: int, kind: str, ref_id: Any, payload: dict[str, Any], *, delay: int = 0
+) -> bool:
+    """Encola un aviso fuera de una transacción; devuelve si era nuevo."""
+    async with transaction() as db:
+        cur = await db.execute(
+            """
+            INSERT OR IGNORE INTO notifications (user_id, kind, ref_id, payload, next_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id),
+                kind,
+                str(ref_id),
+                json.dumps(payload, ensure_ascii=False),
+                int(time.time()) + int(delay),
+            ),
+        )
+        return bool(cur.rowcount)
+
+
+async def due_notifications(limit: int = 20, *, now: int | None = None) -> list[dict[str, Any]]:
+    """Avisos pendientes cuya hora de reintento ya pasó."""
+    async with connection() as db:
+        async with db.execute(
+            """
+            SELECT * FROM notifications
+            WHERE status = 'pending' AND next_at <= ?
+            ORDER BY next_at, id
+            LIMIT ?
+            """,
+            (int(now if now is not None else time.time()), max(1, min(int(limit), 200))),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_notification_sent(notification_id: int) -> None:
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE notifications SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
+            (iso_now(), int(notification_id)),
+        )
+
+
+async def mark_notification_failed(notification_id: int, error: str = "") -> None:
+    """Suma un intento y programa el siguiente con backoff exponencial."""
+    async with transaction() as db:
+        async with db.execute(
+            "SELECT attempts FROM notifications WHERE id = ?", (int(notification_id),)
+        ) as cur:
+            row = await cur.fetchone()
+        attempts = int(row["attempts"]) + 1 if row else MAX_NOTIFICATION_ATTEMPTS
+        status = "failed" if attempts >= MAX_NOTIFICATION_ATTEMPTS else "pending"
+        delay = min(NOTIFICATION_MAX_BACKOFF, 60 * 2 ** max(0, attempts - 1))
+        await db.execute(
+            "UPDATE notifications SET attempts = ?, status = ?, next_at = ?, last_error = ?"
+            " WHERE id = ?",
+            (
+                attempts,
+                status,
+                int(time.time()) + delay,
+                (error or "")[:300],
+                int(notification_id),
+            ),
+        )
+
+
+async def reschedule_notification(notification_id: int, delay: int) -> None:
+    """Aplaza un aviso sin gastar un intento (p. ej. limitador de tasa)."""
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE notifications SET next_at = ? WHERE id = ?",
+            (int(time.time()) + max(1, int(delay)), int(notification_id)),
+        )
+
+
+async def notifications_for(user_id: int, status: str | None = None) -> list[dict[str, Any]]:
+    """Avisos de un usuario; útil para `/misbets` y para los tests."""
+    query = "SELECT * FROM notifications WHERE user_id = ?"
+    params: list[Any] = [int(user_id)]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    async with connection() as db:
+        async with db.execute(query + " ORDER BY id", params) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+# ---------------------------------------------------------------------------
 # Wallet links
 # ---------------------------------------------------------------------------
 
 async def link_wallet(
-    user_id: int, address: str, network: str = "ton", public_key: Optional[str] = None
+    user_id: int, address: str, network: str = "ton", public_key: str | None = None
 ) -> None:
     address = address.strip()
     if not address:
         raise WalletConflict("Dirección vacía.")
     async with transaction() as db:
         async with db.execute(
-            "SELECT user_id FROM wallet_links WHERE address = ?", (address,)
+            "SELECT user_id FROM wallet_links WHERE address = ? AND is_active = 1", (address,)
         ) as cur:
             owner = await cur.fetchone()
         if owner and int(owner["user_id"]) != int(user_id):
             raise WalletConflict("Esta wallet ya está vinculada a otra cuenta de Telegram.")
+        # One active wallet per account: deactivate the previous one first so the
+        # partial unique index stays satisfied and the history is preserved.
         await db.execute(
-            """
-            INSERT INTO wallet_links (user_id, address, network, public_key, verified_at, is_active)
-            VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(user_id) DO UPDATE SET
-                address = excluded.address,
-                network = excluded.network,
-                public_key = excluded.public_key,
-                verified_at = excluded.verified_at,
-                is_active = 1
-            """,
-            (user_id, address, network, public_key, iso_now()),
+            "UPDATE wallet_links SET is_active = 0 WHERE user_id = ? AND is_active = 1",
+            (int(user_id),),
         )
+        try:
+            await db.execute(
+                """
+                INSERT INTO wallet_links (user_id, address, network, public_key, verified_at, is_active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (int(user_id), address, network, public_key, iso_now()),
+            )
+        except aiosqlite.IntegrityError as exc:
+            # Two concurrent verifications of the same address: exactly one wins.
+            raise WalletConflict(
+                "Esta wallet ya está vinculada a otra cuenta de Telegram."
+            ) from exc
 
 
-async def get_wallet(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_wallet(user_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM wallet_links WHERE user_id = ? AND is_active = 1", (user_id,)
@@ -862,7 +1277,7 @@ async def get_wallet(user_id: int) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
-async def get_wallet_owner(address: str) -> Optional[Dict[str, Any]]:
+async def get_wallet_owner(address: str) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM wallet_links WHERE address = ? AND is_active = 1", (address,)
@@ -883,18 +1298,16 @@ async def unlink_wallet(user_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 async def create_nonce(user_id: int, purpose: str, ttl_seconds: int = 600) -> str:
-    import secrets as _s
 
-    nonce = _s.token_hex(16)
+    nonce = secrets.token_hex(16)
     now = int(datetime.now(timezone.utc).timestamp())
     async with transaction() as db:
         await db.execute(
             "INSERT INTO auth_nonces (nonce, user_id, purpose, created_at) VALUES (?, ?, ?, ?)",
             (nonce, user_id, purpose, now),
         )
-        await db.execute(
-            "DELETE FROM auth_nonces WHERE created_at < ?", (now - max(ttl_seconds, 3600),)
-        )
+    # D-01: la política de caducidad vive en `purge_nonces`, no duplicada aquí.
+    await purge_nonces(max(ttl_seconds, 3600))
     return nonce
 
 
@@ -925,33 +1338,115 @@ async def purge_nonces(older_than_seconds: int = 86_400) -> None:
 # On-chain mirror: markets
 # ---------------------------------------------------------------------------
 
-async def upsert_market(
+async def insert_market_placeholder(
     market_id: int,
-    creator_address: Optional[str],
-    title: str,
+    creator_address: str | None,
     option_count: int,
-    closes_at: int,
-    title_hash: Optional[str] = None,
-    created_lt: Optional[int] = None,
-    created_tx: Optional[str] = None,
-    fee_bps: Optional[int] = None,
+    created_lt: int | None = None,
+    created_tx: str | None = None,
 ) -> bool:
-    """Insert a market discovered on-chain. Returns True when it was new."""
+    """Create a minimal row for a market we only know through a bet.
+
+    The row is explicitly marked ``metadata_source='placeholder'`` so the real
+    metadata can replace it later without ever trusting a placeholder over an
+    on-chain event (S-02).
+    """
     async with transaction() as db:
         cur = await db.execute(
             """
             INSERT OR IGNORE INTO markets
-                (market_id, creator_address, title, title_hash, option_count, closes_at,
-                 created_lt, created_tx, fee_bps, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (market_id, creator_address, title, option_count, closes_at,
+                 created_lt, created_tx, metadata_source, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?, 'placeholder', ?)
             """,
             (
-                int(market_id), creator_address, title[:200], title_hash,
-                int(option_count), int(closes_at), created_lt, created_tx,
-                int(fee_bps) if fee_bps is not None else None, iso_now(),
+                int(market_id), creator_address, f"Mercado #{int(market_id)}",
+                int(option_count), created_lt, created_tx, iso_now(),
             ),
         )
         return cur.rowcount == 1
+
+
+def _is_placeholder_title(title: str | None, market_id: int) -> bool:
+    return not title or title.strip() == f"Mercado #{int(market_id)}"
+
+
+async def enrich_market_from_event(
+    market_id: int,
+    creator_address: str | None,
+    title: str,
+    option_count: int,
+    closes_at: int,
+    title_hash: str | None = None,
+    created_lt: int | None = None,
+    created_tx: str | None = None,
+    fee_bps: int | None = None,
+) -> tuple[bool, bool]:
+    """Apply the authoritative metadata of a ``market_created`` event.
+
+    Returns ``(created, enriched)``. Only empty or placeholder fields are
+    filled: a market that already carries real metadata is never overwritten.
+    """
+    async with transaction() as db:
+        async with db.execute(
+            "SELECT * FROM markets WHERE market_id = ?", (int(market_id),)
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row is None:
+            await db.execute(
+                """
+                INSERT INTO markets
+                    (market_id, creator_address, title, title_hash, option_count, closes_at,
+                     created_lt, created_tx, fee_bps, metadata_source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'event', ?)
+                """,
+                (
+                    int(market_id), creator_address, title[:200], title_hash,
+                    int(option_count), int(closes_at), created_lt, created_tx,
+                    int(fee_bps) if fee_bps is not None else None, iso_now(),
+                ),
+            )
+            return True, False
+
+        current = dict(row)
+        if current.get("metadata_source") == "event":
+            return False, False
+
+        updates: dict[str, Any] = {}
+        if title and _is_placeholder_title(current.get("title"), market_id):
+            updates["title"] = title[:200]
+        if int(current.get("closes_at") or 0) == 0 and int(closes_at or 0) > 0:
+            updates["closes_at"] = int(closes_at)
+        if int(option_count or 0) > int(current.get("option_count") or 0):
+            updates["option_count"] = int(option_count)
+        for column, value in (
+            ("creator_address", creator_address),
+            ("title_hash", title_hash),
+            ("created_lt", created_lt),
+            ("created_tx", created_tx),
+            ("fee_bps", int(fee_bps) if fee_bps is not None else None),
+        ):
+            if value is not None and current.get(column) in (None, ""):
+                updates[column] = value
+        updates["metadata_source"] = "event"
+        updates["updated_at"] = iso_now()
+
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        await db.execute(
+            f"UPDATE markets SET {assignments} WHERE market_id = ?",  # noqa: S608 - column names are literals
+            (*updates.values(), int(market_id)),
+        )
+        return False, True
+
+
+async def set_market_pending_resolve(market_id: int, timestamp: int) -> None:
+    """Mark that a resolution/cancellation was prepared (blocks new bets, F-06)."""
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE markets SET pending_resolve_at = ?, updated_at = ? WHERE market_id = ?",
+            (int(timestamp), iso_now(), int(market_id)),
+        )
 
 
 async def update_market_settled(
@@ -961,22 +1456,58 @@ async def update_market_settled(
         await db.execute(
             """
             UPDATE markets
-            SET status = ?, winning_option = ?, total_pool = ?, winning_pool = ?, updated_at = ?
+            SET status = ?, winning_option = ?, total_pool = ?, winning_pool = ?,
+                pending_resolve_at = NULL, updated_at = ?
             WHERE market_id = ?
             """,
             (status, int(winning_option), int(total_pool), int(winning_pool), iso_now(), int(market_id)),
+        )
+        if status == "resolved":
+            await _queue_market_notifications(db, int(market_id), cancelled=False)
+
+
+async def _queue_market_notifications(
+    db: aiosqlite.Connection, market_id: int, *, cancelled: bool
+) -> None:
+    """Avisa a quien puede reclamar: ganadores y, si se cancela, a todos."""
+    async with db.execute(
+        "SELECT title, winning_option FROM markets WHERE market_id = ?", (int(market_id),)
+    ) as cur:
+        market = await cur.fetchone()
+    if market is None:
+        return
+    query = """
+        SELECT wl.user_id, ob.option
+        FROM onchain_bets ob
+        JOIN wallet_links wl
+          ON wl.address = ob.bettor AND wl.is_active = 1
+        WHERE ob.market_id = ?
+    """
+    async with db.execute(query, (int(market_id),)) as cur:
+        rows = [dict(r) for r in await cur.fetchall()]
+    for row in rows:
+        if not cancelled and int(row["option"]) != int(market["winning_option"] or 0):
+            continue
+        await _queue_notification(
+            db,
+            row["user_id"],
+            NOTIFICATION_MARKET_REFUND if cancelled else NOTIFICATION_MARKET_CLAIM,
+            market_id,
+            {"market_id": market_id, "title": market["title"]},
         )
 
 
 async def update_market_cancelled(market_id: int) -> None:
     async with transaction() as db:
         await db.execute(
-            "UPDATE markets SET status = 'cancelled', updated_at = ? WHERE market_id = ?",
+            "UPDATE markets SET status = 'cancelled', pending_resolve_at = NULL,"
+            " updated_at = ? WHERE market_id = ?",
             (iso_now(), int(market_id)),
         )
+        await _queue_market_notifications(db, int(market_id), cancelled=True)
 
 
-async def get_market(market_id: int) -> Optional[Dict[str, Any]]:
+async def get_market(market_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute("SELECT * FROM markets WHERE market_id = ?", (market_id,)) as cur:
             row = await cur.fetchone()
@@ -987,7 +1518,7 @@ async def get_market(market_id: int) -> Optional[Dict[str, Any]]:
         return market
 
 
-async def _market_options(db: aiosqlite.Connection, market_id: int) -> List[Dict[str, Any]]:
+async def _market_options(db: aiosqlite.Connection, market_id: int) -> list[dict[str, Any]]:
     async with db.execute(
         "SELECT idx, label FROM market_options WHERE market_id = ? ORDER BY idx", (market_id,)
     ) as cur:
@@ -998,16 +1529,21 @@ async def _market_options(db: aiosqlite.Connection, market_id: int) -> List[Dict
     async with db.execute("SELECT option_count FROM markets WHERE market_id = ?", (market_id,)) as cur:
         row = await cur.fetchone()
     count = int(row["option_count"]) if row else 0
-    return [{"idx": i, "label": f"Opción {i + 1}"} for i in range(count)]
+    return _default_options(count)
+
+
+def _default_options(count: int) -> list[dict[str, Any]]:
+    """Etiquetas de relleno para mercados creados fuera de la Mini App."""
+    return [{"idx": i, "label": f"Opción {i + 1}"} for i in range(max(0, int(count)))]
 
 
 async def list_markets(
-    status: Optional[str] = "open", limit: int = 25, offset: int = 0
-) -> List[Dict[str, Any]]:
+    status: str | None = "open", limit: int = 25, offset: int = 0
+) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
     sql = "SELECT * FROM markets"
-    params: List[Any] = []
+    params: list[Any] = []
     if status:
         sql += " WHERE status = ?"
         params.append(status)
@@ -1016,25 +1552,63 @@ async def list_markets(
     async with connection() as db:
         async with db.execute(sql, params) as cur:
             markets = [dict(r) for r in await cur.fetchall()]
+        if not markets:
+            return []
+        # R-01: opciones y pozos de toda la página en dos consultas, no tres por
+        # mercado. `/api/markets` se sondea cada pocos segundos, así que la
+        # diferencia se nota.
+        ids = [int(m["market_id"]) for m in markets]
+        placeholders = ",".join("?" * len(ids))
+        labels = await _labels_for(db, ids, placeholders)
+        pools, totals, counts = await _pools_for(db, ids, placeholders)
         for market in markets:
-            market["options"] = await _market_options(db, int(market["market_id"]))
-            async with db.execute(
-                "SELECT COALESCE(SUM(stake),0) AS pool, COUNT(*) AS bets FROM onchain_bets WHERE market_id = ?",
-                (market["market_id"],),
-            ) as cur:
-                agg = await cur.fetchone()
-            market["pool"] = int(agg["pool"] or 0)
-            market["bets"] = int(agg["bets"] or 0)
-            market["option_pools"] = await _option_pools(db, int(market["market_id"]))
+            market_id = int(market["market_id"])
+            market["options"] = labels.get(market_id) or _default_options(
+                int(market.get("option_count") or 0)
+            )
+            market["option_pools"] = pools.get(market_id, {})
+            market["pool"] = totals.get(market_id, 0)
+            market["bets"] = counts.get(market_id, 0)
         return markets
 
 
-async def _option_pools(db: aiosqlite.Connection, market_id: int) -> Dict[str, int]:
+async def _labels_for(
+    db: aiosqlite.Connection, ids: list[int], placeholders: str
+) -> dict[int, list[dict[str, Any]]]:
     async with db.execute(
-        "SELECT option, COALESCE(SUM(stake),0) AS pool FROM onchain_bets WHERE market_id = ? GROUP BY option",
-        (market_id,),
+        "SELECT market_id, idx, label FROM market_options"
+        f" WHERE market_id IN ({placeholders}) ORDER BY market_id, idx",
+        ids,
     ) as cur:
-        return {str(int(r["option"])): int(r["pool"]) for r in await cur.fetchall()}
+        rows = await cur.fetchall()
+    labels: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        labels.setdefault(int(row["market_id"]), []).append(
+            {"idx": int(row["idx"]), "label": row["label"]}
+        )
+    return labels
+
+
+async def _pools_for(
+    db: aiosqlite.Connection, ids: list[int], placeholders: str
+) -> tuple[dict[int, dict[str, int]], dict[int, int], dict[int, int]]:
+    async with db.execute(
+        "SELECT market_id, option, COALESCE(SUM(stake),0) AS pool, COUNT(*) AS bets"
+        f" FROM onchain_bets WHERE market_id IN ({placeholders})"
+        " GROUP BY market_id, option",
+        ids,
+    ) as cur:
+        rows = await cur.fetchall()
+    pools: dict[int, dict[str, int]] = {}
+    totals: dict[int, int] = {}
+    counts: dict[int, int] = {}
+    for row in rows:
+        market_id = int(row["market_id"])
+        stake = int(row["pool"] or 0)
+        pools.setdefault(market_id, {})[str(int(row["option"]))] = stake
+        totals[market_id] = totals.get(market_id, 0) + stake
+        counts[market_id] = counts.get(market_id, 0) + int(row["bets"] or 0)
+    return pools, totals, counts
 
 
 async def set_market_options(market_id: int, labels: Iterable[str]) -> None:
@@ -1073,7 +1647,7 @@ async def record_onchain_bet(
             return False
 
 
-async def mark_onchain_bet_claimed(market_id: int, bettor: str, payout: Optional[int] = None) -> None:
+async def mark_onchain_bet_claimed(market_id: int, bettor: str, payout: int | None = None) -> None:
     async with transaction() as db:
         await db.execute(
             "UPDATE onchain_bets SET claimed = 1, payout = COALESCE(?, payout) "
@@ -1082,7 +1656,7 @@ async def mark_onchain_bet_claimed(market_id: int, bettor: str, payout: Optional
         )
 
 
-async def get_onchain_bet(market_id: int, bettor: str) -> Optional[Dict[str, Any]]:
+async def get_onchain_bet(market_id: int, bettor: str) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM onchain_bets WHERE market_id = ? AND bettor = ?",
@@ -1092,7 +1666,7 @@ async def get_onchain_bet(market_id: int, bettor: str) -> Optional[Dict[str, Any
             return dict(row) if row else None
 
 
-async def list_onchain_bets(bettor: str, limit: int = 50) -> List[Dict[str, Any]]:
+async def list_onchain_bets(bettor: str, limit: int = 50) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             """
@@ -1122,7 +1696,7 @@ async def market_pool(market_id: int) -> int:
 # Indexer bookkeeping
 # ---------------------------------------------------------------------------
 
-async def get_cursor(name: str) -> Tuple[int, Optional[str]]:
+async def get_cursor(name: str) -> tuple[int, str | None]:
     async with connection() as db:
         async with db.execute(
             "SELECT lt, last_hash FROM chain_cursors WHERE name = ?", (name,)
@@ -1131,7 +1705,7 @@ async def get_cursor(name: str) -> Tuple[int, Optional[str]]:
         return (int(row["lt"]), row["last_hash"]) if row else (0, None)
 
 
-async def set_cursor(name: str, lt: int, last_hash: Optional[str]) -> None:
+async def set_cursor(name: str, lt: int, last_hash: str | None) -> None:
     async with transaction() as db:
         await db.execute(
             """
@@ -1143,7 +1717,7 @@ async def set_cursor(name: str, lt: int, last_hash: Optional[str]) -> None:
         )
 
 
-async def mark_tx_processed(tx_hash: str, lt: int, account: Optional[str], op: Optional[int]) -> bool:
+async def mark_tx_processed(tx_hash: str, lt: int, account: str | None, op: int | None) -> bool:
     async with transaction() as db:
         try:
             cur = await db.execute(
@@ -1161,8 +1735,75 @@ async def unmark_tx_processed(tx_hash: str, lt: int) -> None:
         await db.execute("DELETE FROM chain_txs WHERE tx_hash = ? AND lt = ?", (tx_hash, int(lt)))
 
 
+async def register_chain_tx_failure(
+    tx_hash: str, lt: int, op: int | None, error: str
+) -> int:
+    """Record a failed transaction and return how many times it has failed.
+
+    The row is the *dead-letter queue* of the indexer: it survives restarts and
+    is retried with backoff after the cursor has moved past it.
+    """
+    message = (error or "")[:500]
+    async with transaction() as db:
+        await db.execute(
+            """
+            INSERT INTO chain_tx_failures (tx_hash, lt, op, error, attempts, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(tx_hash, lt) DO UPDATE SET
+                attempts  = chain_tx_failures.attempts + 1,
+                error     = excluded.error,
+                last_seen = excluded.last_seen
+            """,
+            (tx_hash, int(lt), op, message, iso_now(), iso_now()),
+        )
+        async with db.execute(
+            "SELECT attempts FROM chain_tx_failures WHERE tx_hash = ? AND lt = ?",
+            (tx_hash, int(lt)),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["attempts"]) if row else 1
+
+
+async def schedule_chain_tx_retry(tx_hash: str, lt: int, delay_seconds: int) -> None:
+    """Push the next retry attempt into the future (exponential backoff)."""
+    retry_at = iso_now(offset_seconds=max(0, int(delay_seconds)))
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE chain_tx_failures SET next_retry_at = ? WHERE tx_hash = ? AND lt = ?",
+            (retry_at, tx_hash, int(lt)),
+        )
+
+
+async def list_chain_tx_failures(limit: int = 100, *, due_only: bool = False) -> list[dict[str, Any]]:
+    """Failed transactions, oldest first. ``due_only`` filters by backoff."""
+    sql = "SELECT * FROM chain_tx_failures"
+    params: list[Any] = []
+    if due_only:
+        sql += " WHERE next_retry_at IS NULL OR next_retry_at <= ?"
+        params.append(iso_now())
+    sql += " ORDER BY lt ASC LIMIT ?"
+    params.append(max(1, min(int(limit), 500)))
+    async with connection() as db:
+        async with db.execute(sql, params) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def count_chain_tx_failures() -> int:
+    async with connection() as db:
+        async with db.execute("SELECT COUNT(*) AS n FROM chain_tx_failures") as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+
+async def clear_chain_tx_failure(tx_hash: str, lt: int) -> None:
+    async with transaction() as db:
+        await db.execute(
+            "DELETE FROM chain_tx_failures WHERE tx_hash = ? AND lt = ?", (tx_hash, int(lt))
+        )
+
+
 async def record_indexer_run(
-    last_lt: Optional[int], error: Optional[str], processed: int = 0
+    last_lt: int | None, error: str | None, processed: int = 0
 ) -> None:
     async with transaction() as db:
         await db.execute(
@@ -1179,13 +1820,19 @@ async def record_indexer_run(
         )
 
 
-async def get_indexer_status() -> Dict[str, Any]:
+async def get_indexer_status() -> dict[str, Any]:
     async with connection() as db:
         async with db.execute("SELECT * FROM indexer_status WHERE id = 1") as cur:
             row = await cur.fetchone()
-        if row is None:
-            return {"last_run": None, "last_error": None, "last_lt": None, "processed_total": 0}
-        return dict(row)
+        status = (
+            {"last_run": None, "last_error": None, "last_lt": None, "processed_total": 0}
+            if row is None
+            else dict(row)
+        )
+        async with db.execute("SELECT COUNT(*) AS n FROM chain_tx_failures") as cur:
+            failures = await cur.fetchone()
+        status["failures"] = int(failures["n"]) if failures else 0
+        return status
 
 
 # ---------------------------------------------------------------------------
@@ -1195,9 +1842,9 @@ async def get_indexer_status() -> Dict[str, Any]:
 async def create_pending_action(
     user_id: int,
     kind: str,
-    match_a: Optional[str] = None,
-    match_b: Optional[str] = None,
-    payload: Optional[Dict[str, Any]] = None,
+    match_a: str | None = None,
+    match_b: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> int:
     async with transaction() as db:
         cur = await db.execute(
@@ -1211,10 +1858,10 @@ async def create_pending_action(
 
 
 async def find_pending_action(
-    kind: str, match_a: Optional[str] = None, match_b: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
+    kind: str, match_a: str | None = None, match_b: str | None = None
+) -> dict[str, Any] | None:
     sql = "SELECT * FROM pending_actions WHERE kind = ? AND consumed_at IS NULL"
-    params: List[Any] = [kind]
+    params: list[Any] = [kind]
     if match_a is not None:
         sql += " AND match_a = ?"
         params.append(match_a)

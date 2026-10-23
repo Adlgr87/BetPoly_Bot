@@ -20,6 +20,7 @@ const OP = {
   claimPayout: 0x1a0a0005,
   setPaused: 0x1a0a0101,
   setFee: 0x1a0a0102,
+  changeAdmin: 0x1a0a0103,
   withdrawFees: 0x1a0a0104,
 };
 
@@ -76,6 +77,8 @@ const body = {
     beginCell().storeUint(OP.claimPayout, 32).storeUint(marketId, 32).endCell(),
   setPaused: (value) => beginCell().storeUint(OP.setPaused, 32).storeUint(value, 8).endCell(),
   setFee: (bps) => beginCell().storeUint(OP.setFee, 32).storeUint(bps, 16).endCell(),
+  changeAdmin: (address) =>
+    beginCell().storeUint(OP.changeAdmin, 32).storeAddress(address).endCell(),
   withdrawFees: (amount) =>
     beginCell().storeUint(OP.withdrawFees, 32).storeCoins(amount).endCell(),
 };
@@ -139,8 +142,56 @@ async function getMarket(blockchain, address, marketId) {
   };
 }
 
+/**
+ * Vectores compartidos con `bot/economics.py` (Fase 4, F-03).
+ *
+ * Reproduce la aritmética de `escrow.fc`:
+ *   distributable = total - muldiv(total, fee_bps, 10000)
+ *   payout        = muldiv(stake, distributable, winning_pool)
+ * con división entera BigInt (truncada, igual que `muldiv` del TVM).
+ */
+function checkEconomicsVectors() {
+  const vectors = require(path.join(__dirname, '..', 'vectors', 'economics.json'));
+  const muldiv = (a, b, c) => (a * b) / c;
+  const big = (value) => BigInt(value);
+  const expectedPayout = (stake, distributable, winningPool) =>
+    stake > 0n && distributable > 0n && winningPool > 0n
+      ? muldiv(stake, distributable, winningPool)
+      : 0n;
+
+  for (const c of vectors.payouts) {
+    const total = big(c.total);
+    const fee = big(c.fee_bps);
+    const stake = big(c.stake);
+    const winningPool = big(c.winning_pool);
+    const distributable = total > 0n ? total - muldiv(total, fee, 10000n) : 0n;
+    assert.strictEqual(
+      Number(distributable), c.distributable,
+      `distributable mismatch for ${JSON.stringify(c)}`,
+    );
+    assert.strictEqual(
+      Number(expectedPayout(stake, distributable, winningPool)), c.payout,
+      `payout mismatch for ${JSON.stringify(c)}`,
+    );
+  }
+
+  for (const c of vectors.previews) {
+    const stake = big(c.stake);
+    const total = big(c.total) + stake;
+    const pool = big(c.option_pool) + stake;
+    const distributable = total - muldiv(total, big(c.fee_bps), 10000n);
+    assert.strictEqual(
+      Number(expectedPayout(stake, distributable, pool)), c.payout,
+      `preview mismatch for ${JSON.stringify(c)}`,
+    );
+  }
+  step('economía pari-mutuel: vectores compartidos con bot/economics.py');
+}
+
+
 async function main() {
   console.log('\nBetPoly escrow · TVM sandbox tests\n');
+  checkEconomicsVectors();
 
   const code = await compile();
   const blockchain = await Blockchain.create();
@@ -462,6 +513,29 @@ async function main() {
     'balance must always cover accrued fees',
   );
   step('accounting invariant holds (locked = 0, balance ≥ fees)');
+
+  // -------------------------------------------------------- change admin
+  // El contrato no expone get_admin: la prueba observable es que el admin
+  // anterior deja de poder operar y el nuevo sí puede.
+  const nextAdmin = await blockchain.treasury('admin2');
+  okExit(
+    await admin.send({
+      to: address,
+      value: toNano('0.01'),
+      body: body.changeAdmin(nextAdmin.address),
+    }),
+  );
+  step('admin can transfer administration');
+
+  failedWith(
+    await admin.send({ to: address, value: toNano('0.01'), body: body.setFee(150) }),
+    401,
+  );
+  okExit(
+    await nextAdmin.send({ to: address, value: toNano('0.01'), body: body.setFee(150) }),
+  );
+  assert.strictEqual(await getNumber(blockchain, address, 'get_fee_bps'), 150);
+  step('former admin loses control and the new one takes over');
 
   console.log(`\n${passed} checks passed ✅\n`);
 }

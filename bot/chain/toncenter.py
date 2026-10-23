@@ -11,7 +11,7 @@ import base64
 import binascii
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import aiohttp
 
@@ -34,19 +34,19 @@ class ChainTransaction:
     utime: int
     success: bool
     aborted: bool
-    inbound_source: Optional[str] = None
+    inbound_source: str | None = None
     inbound_value: int = 0
-    inbound_body: Optional[str] = None      # base64 BoC
-    inbound_body_hash: Optional[str] = None
-    out_messages: List[Dict[str, Any]] = field(default_factory=list)
-    raw: Dict[str, Any] = field(default_factory=dict)
+    inbound_body: str | None = None      # base64 BoC
+    inbound_body_hash: str | None = None
+    out_messages: list[dict[str, Any]] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_internal_inbound(self) -> bool:
         return bool(self.inbound_source)
 
 
-def _hash_b64_to_hex(value: Optional[str]) -> str:
+def _hash_b64_to_hex(value: str | None) -> str:
     if not value:
         return ""
     try:
@@ -55,7 +55,7 @@ def _hash_b64_to_hex(value: Optional[str]) -> str:
         return value
 
 
-def _msg_body(msg: Dict[str, Any]) -> Optional[str]:
+def _msg_body(msg: dict[str, Any]) -> str | None:
     data = msg.get("msg_data") or {}
     body = data.get("body")
     if isinstance(body, str) and body:
@@ -63,14 +63,14 @@ def _msg_body(msg: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _msg_value(msg: Dict[str, Any]) -> int:
+def _msg_value(msg: dict[str, Any]) -> int:
     try:
         return int(str(msg.get("value") or 0))
     except ValueError:
         return 0
 
 
-def parse_transaction(raw: Dict[str, Any]) -> ChainTransaction:
+def parse_transaction(raw: dict[str, Any]) -> ChainTransaction:
     tx_id = raw.get("transaction_id") or {}
     description = raw.get("description") or {}
     compute = description.get("compute_ph") or {}
@@ -95,18 +95,38 @@ def parse_transaction(raw: Dict[str, Any]) -> ChainTransaction:
     )
 
 
+def _parse_stack_entry(item: Any) -> Any:
+    """Normalise one ``runGetMethod`` stack entry.
+
+    ``["num", "0x2a"]`` -> ``42``; cells/slices stay as ``{"type", "value"}`` so a
+    caller that needs them can still use them.
+    """
+    if not isinstance(item, (list, tuple)) or not item:
+        return item
+    kind = item[0]
+    value = item[1] if len(item) > 1 else None
+    if kind == "num" and isinstance(value, str):
+        try:
+            return int(value, 16) if value.lower().startswith("0x") else int(value)
+        except ValueError:
+            return value
+    if kind == "num":
+        return value
+    return {"type": kind, "value": value}
+
+
 class TonCenterClient:
     """Thin async wrapper around toncenter v2 (and optional tonapi)."""
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        public_key_api: Optional[str] = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        public_key_api: str | None = None,
         *,
         timeout: float = 20.0,
         retries: int = 3,
-        session: Optional[aiohttp.ClientSession] = None,
+        session: aiohttp.ClientSession | None = None,
     ) -> None:
         settings = config.get_settings()
         self.base_url = (base_url or settings.ton_api_url).rstrip("/")
@@ -138,7 +158,7 @@ class TonCenterClient:
         params = dict(kwargs.pop("params", {}) or {})
         if self.api_key and "toncenter" in self.base_url:
             params.setdefault("api_key", self.api_key)
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         for attempt in range(self.retries):
             try:
                 async with session.request(method, url, params=params, **kwargs) as resp:
@@ -153,7 +173,7 @@ class TonCenterClient:
                     if isinstance(payload, dict) and payload.get("ok") is False:
                         raise TonApiError(str(payload.get("error") or "TON API returned ok=false"))
                     return payload
-            except (aiohttp.ClientError, asyncio.TimeoutError, TonApiError) as exc:
+            except (TimeoutError, aiohttp.ClientError, TonApiError) as exc:
                 last_error = exc
                 if attempt == self.retries - 1:
                     break
@@ -162,10 +182,10 @@ class TonCenterClient:
 
     # -- endpoints ---------------------------------------------------------
     async def get_transactions(
-        self, address: str, *, lt: Optional[int] = None, limit: int = 50
-    ) -> List[ChainTransaction]:
+        self, address: str, *, lt: int | None = None, limit: int = 50
+    ) -> list[ChainTransaction]:
         """Return transactions for ``address``, newest first."""
-        params: Dict[str, Any] = {"address": address, "limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"address": address, "limit": max(1, min(limit, 100))}
         if lt:
             params["lt"] = int(lt)
         payload = await self._request("GET", f"{self.base_url}/getTransactions", params=params)
@@ -174,14 +194,14 @@ class TonCenterClient:
             raise TonApiError("Unexpected /getTransactions payload")
         return [parse_transaction(tx) for tx in result]
 
-    async def get_wallet_information(self, address: str) -> Dict[str, Any]:
+    async def get_wallet_information(self, address: str) -> dict[str, Any]:
         payload = await self._request(
             "GET", f"{self.base_url}/getWalletInformation", params={"address": address}
         )
         result = payload.get("result") if isinstance(payload, dict) else None
         return result if isinstance(result, dict) else {}
 
-    async def get_public_key(self, address: str) -> Optional[str]:
+    async def get_public_key(self, address: str) -> str | None:
         """Best-effort public key lookup for already deployed wallets."""
         try:
             info = await self.get_wallet_information(address)
@@ -202,7 +222,31 @@ class TonCenterClient:
                 logger.debug("public key API failed for %s: %s", address, exc)
         return None
 
-    async def get_account_state(self, address: str) -> Dict[str, Any]:
+    async def run_get_method(
+        self, address: str, method: str, stack: list[Any] | None = None
+    ) -> list[Any]:
+        """Call a get method and return its stack, numbers as ``int``.
+
+        TON Center v2 returns numbers as hex or decimal strings, so they are
+        normalised here: callers never deal with the wire encoding.
+        """
+        payload = await self._request(
+            "POST",
+            f"{self.base_url}/runGetMethod",
+            json={"address": address, "method": method, "stack": stack or []},
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            raise TonApiError(f"Unexpected /runGetMethod payload for {method}")
+        exit_code = result.get("exit_code")
+        if exit_code not in (0, None):
+            raise TonApiError(f"get method {method} failed with exit code {exit_code}")
+        values: list[Any] = []
+        for item in result.get("stack") or []:
+            values.append(_parse_stack_entry(item))
+        return values
+
+    async def get_account_state(self, address: str) -> dict[str, Any]:
         payload = await self._request(
             "GET", f"{self.base_url}/getAddressInformation", params={"address": address}
         )

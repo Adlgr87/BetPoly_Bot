@@ -6,9 +6,9 @@ from telegram.ext import ContextTypes
 
 import config
 from bot import database
+from bot.chain.addresses import to_friendly
 from bot.formatting import bold, esc, points, ton
-from bot.handlers.common import is_admin, register_user
-from bot.keyboards import main_menu_keyboard
+from bot.handlers.common import edit_or_reply, menu_for, register_user, safe_answer
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -43,7 +43,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "• Resolución y pagos se ejecutan on-chain.",
             "",
             (
-                f"👛 Wallet vinculada: {bold(wallet['address'])}"
+                f"👛 Wallet vinculada: {bold(esc(to_friendly(wallet['address'])))}"
                 if wallet
                 else "👛 Aún no has vinculado una wallet. Usa /wallet o la Mini App."
             ),
@@ -61,13 +61,12 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text(
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard(is_admin=is_admin(user.id), wallet=wallet),
+        reply_markup=menu_for(update, wallet=wallet),
         disable_web_page_preview=True,
     )
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from bot.handlers.common import edit_or_reply, safe_answer
 
     query = update.callback_query
     await safe_answer(query)
@@ -90,5 +89,5 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         + "\nElige una opción:"
     )
     await edit_or_reply(
-        update, text, reply_markup=main_menu_keyboard(is_admin=is_admin(user.id), wallet=wallet)
+        update, text, reply_markup=menu_for(update, wallet=wallet)
     )

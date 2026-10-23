@@ -19,16 +19,16 @@ import hashlib
 import hmac
 import json
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Dict, Deque, Optional, Tuple
 from urllib.parse import parse_qsl
 
 import config
 
-from collections import deque
-
 SESSION_TTL = 60 * 60  # 1 hour
 MAX_INIT_DATA_AGE = 24 * 60 * 60
+#: Tolerancia de reloj hacia el futuro antes de rechazar un `auth_date`.
+MAX_CLOCK_SKEW = 300
 
 
 class AuthError(ValueError):
@@ -40,9 +40,9 @@ class AuthError(ValueError):
 @dataclass(frozen=True)
 class TelegramUser:
     user_id: int
-    username: Optional[str]
+    username: str | None
     full_name: str
-    language_code: Optional[str] = None
+    language_code: str | None = None
     is_premium: bool = False
 
 
@@ -56,10 +56,10 @@ def _hmac(key: bytes, message: bytes) -> bytes:
 
 def validate_init_data(
     init_data: str,
-    bot_token: Optional[str] = None,
+    bot_token: str | None = None,
     *,
     max_age: int = MAX_INIT_DATA_AGE,
-    now: Optional[int] = None,
+    now: int | None = None,
 ) -> TelegramUser:
     """Validate Telegram WebApp ``initData`` and return the user."""
     token = bot_token or config.require_bot_token()
@@ -89,7 +89,7 @@ def validate_init_data(
         raise AuthError("bad_init_data", "auth_date inválido.") from exc
     if auth_date <= 0 or current - auth_date > max_age:
         raise AuthError("expired_init_data", "La sesión de Telegram expiró; reabre la Mini App.")
-    if auth_date - current > 300:
+    if auth_date - current > MAX_CLOCK_SKEW:
         raise AuthError("bad_init_data", "auth_date está en el futuro.")
 
     try:
@@ -124,7 +124,7 @@ def _unb64(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + padding)
 
 
-def issue_session(user_id: int, *, ttl: int = SESSION_TTL, now: Optional[int] = None) -> str:
+def issue_session(user_id: int, *, ttl: int = SESSION_TTL, now: int | None = None) -> str:
     settings = config.get_settings()
     issued = int(now if now is not None else time.time())
     expires = issued + max(60, ttl)
@@ -133,7 +133,7 @@ def issue_session(user_id: int, *, ttl: int = SESSION_TTL, now: Optional[int] = 
     return f"{body}.{_b64(signature)}"
 
 
-def verify_session(token: str, *, now: Optional[int] = None) -> int:
+def verify_session(token: str, *, now: int | None = None) -> int:
     settings = config.get_settings()
     if not token:
         raise AuthError("missing_session", "Falta el token de sesión.")
@@ -154,7 +154,7 @@ def verify_session(token: str, *, now: Optional[int] = None) -> int:
     return user_id
 
 
-def dev_session(init_data: Optional[str]) -> Optional[str]:
+def dev_session(init_data: str | None) -> str | None:
     """Explicit, opt-in bypass used only when the Mini App runs outside Telegram.
 
     Disabled by default and rejected in production by ``Settings.validate()``.
@@ -172,28 +172,42 @@ def dev_session(init_data: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
-    """Sliding window limiter (per key) for API and chat actions."""
+    """Sliding window limiter (per key) for API and chat actions.
 
-    def __init__(self, limit: int, window_seconds: float) -> None:
+    Memory is bounded by real LRU eviction (``max_keys``): the least recently
+    used key is dropped, not just the buckets that happen to be empty. Without
+    that, a client rotating keys could grow the dict without limit while every
+    bucket stays "full" and therefore never empty — the old bug behind S-04.
+    """
+
+    def __init__(self, limit: int, window_seconds: float, *, max_keys: int = 10_000) -> None:
         self.limit = max(1, int(limit))
         self.window = float(window_seconds)
-        self._hits: Dict[str, Deque[float]] = {}
+        self.max_keys = max(1, int(max_keys))
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
 
-    def allow(self, key: str, *, now: Optional[float] = None) -> Tuple[bool, float]:
+    def allow(self, key: str, *, now: float | None = None) -> tuple[bool, float]:
         current = float(now if now is not None else time.time())
-        bucket = self._hits.setdefault(key, deque())
+        bucket = self._hits.get(key)
+        if bucket is None:
+            bucket = deque()
+            self._hits[key] = bucket
+        else:
+            self._hits.move_to_end(key)
         while bucket and current - bucket[0] > self.window:
             bucket.popleft()
         if len(bucket) >= self.limit:
             retry_after = max(0.0, self.window - (current - bucket[0]))
             return False, retry_after
         bucket.append(current)
-        if len(self._hits) > 10_000:  # bound memory on long running bots
-            for stale in [k for k, v in self._hits.items() if not v]:
-                self._hits.pop(stale, None)
+        while len(self._hits) > self.max_keys:  # LRU real, no solo cubetas vacías
+            self._hits.popitem(last=False)
         return True, 0.0
 
-    def reset(self, key: Optional[str] = None) -> None:
+    def __len__(self) -> int:
+        return len(self._hits)
+
+    def reset(self, key: str | None = None) -> None:
         if key is None:
             self._hits.clear()
         else:
