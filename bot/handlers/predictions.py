@@ -1,4 +1,8 @@
-"""Handlers for predictions — F002, F003, F004."""
+"""Handlers for off-chain predictions — F002, F003, F004.
+
+Everything here is the *sandbox* economy: virtual points, no money, no custody.
+The on-chain markets live in :mod:`bot.handlers.markets`.
+"""
 from __future__ import annotations
 
 import logging
@@ -14,18 +18,23 @@ from telegram.ext import (
     filters,
 )
 
-from bot.database import (
-    create_prediction,
-    get_open_predictions,
-    get_options,
-    get_prediction,
-    get_user,
-    place_bet,
-    upsert_user,
+import config
+from bot import database
+from bot.formatting import bold, code, esc, fmt_local, parse_local_datetime, points as fmt_points
+from bot.handlers.common import (
+    bet_limiter,
+    create_limiter,
+    edit_or_reply,
+    is_group,
+    rate_limited,
+    register_user,
+    safe_answer,
 )
 from bot.keyboards import (
     back_to_menu_keyboard,
+    cancel_conversation_keyboard,
     confirm_bet_keyboard,
+    confirm_create_keyboard,
     main_menu_keyboard,
     options_keyboard,
     predictions_list_keyboard,
@@ -33,354 +42,499 @@ from bot.keyboards import (
 
 logger = logging.getLogger(__name__)
 
-# ConversationHandler states
 ASK_TITLE, ASK_OPTIONS, ASK_CLOSES_AT, CONFIRM_CREATE = range(4)
-
-# Number of predictions shown per page
-PAGE_SIZE = 3
+PAGE_SIZE = 4
+MAX_TITLE = 160
+MAX_OPTION = 60
+MAX_DURATION = timedelta(days=365)
 
 
 # ---------------------------------------------------------------------------
-# F003 — List open predictions
+# F003 — list open predictions
 # ---------------------------------------------------------------------------
 
 async def predicciones_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point via /predicciones command."""
-    user = update.effective_user
-    await upsert_user(user.id, user.username, user.full_name)
+    await register_user(update)
     await _show_predictions_page(update, context, page=0, edit=False)
 
 
 async def list_predictions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles list_predictions:<page> callback."""
     query = update.callback_query
-    await query.answer()
-    page = int(query.data.split(":")[1])
+    await safe_answer(query)
+    try:
+        page = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        page = 0
     await _show_predictions_page(update, context, page=page, edit=True)
 
 
+def _scope_chat_id(update: Update):
+    return update.effective_chat.id if is_group(update) else None
+
+
 async def _show_predictions_page(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    page: int,
-    edit: bool,
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int, edit: bool
 ) -> None:
-    predictions = await get_open_predictions()
+    settings = config.get_settings()
+    if not settings.points_enabled:
+        await edit_or_reply(
+            update,
+            "ℹ️ Este bot funciona solo con mercados on-chain. Abre la Mini App para apostar TON.",
+            reply_markup=main_menu_keyboard(is_admin=False),
+        )
+        return
+
+    predictions = await database.get_open_predictions(chat_id=_scope_chat_id(update))
     if not predictions:
-        text = "📭 No hay predicciones abiertas ahora mismo.\n\n¿Quieres crear la primera?"
-        kb = main_menu_keyboard()
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(text, reply_markup=kb)
-        else:
-            await update.effective_message.reply_text(text, reply_markup=kb)
+        await edit_or_reply(
+            update,
+            "📭 No hay predicciones abiertas ahora mismo.\n\n"
+            "Crea la primera con /crear o apuesta TON en la Mini App.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     total_pages = max(1, (len(predictions) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     chunk = predictions[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
 
-    lines = [f"📋 *Predicciones Abiertas* (página {page + 1}/{total_pages})\n"]
-    pred_ids = []
-    for i, p in enumerate(chunk, start=page * PAGE_SIZE + 1):
-        closes = p["closes_at"][:16].replace("T", " ")
-        lines.append(f"{i}\\. *{p['title']}*\n    ⏰ Cierra: `{closes}`\n")
-        pred_ids.append(p["id"])
-
-    text = "\n".join(lines)
-    keyboard = predictions_list_keyboard(page, total_pages, pred_ids)
-
-    if edit and update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="MarkdownV2", reply_markup=keyboard
+    lines = [f"📋 <b>Predicciones abiertas</b> ({page + 1}/{total_pages})", ""]
+    for index, pred in enumerate(chunk, start=page * PAGE_SIZE + 1):
+        closes = fmt_local(datetime.fromisoformat(pred["closes_at"]))
+        pools = await database.get_prediction_pools(pred["id"])
+        lines.append(
+            f"{index}. <b>{esc(pred['title'])}</b>\n"
+            f"    ⏰ Cierra: {code(closes)} · 🪙 pozo: {bold(fmt_points(pools[-1]))}"
         )
-    else:
-        await update.effective_message.reply_text(
-            text, parse_mode="MarkdownV2", reply_markup=keyboard
-        )
+    lines += ["", "Toca una predicción para apostar tus puntos."]
+
+    await edit_or_reply(
+        update,
+        "\n".join(lines),
+        reply_markup=predictions_list_keyboard(page, total_pages, chunk),
+    )
 
 
 # ---------------------------------------------------------------------------
-# F004 — Bet on a prediction
+# F004 — bet
 # ---------------------------------------------------------------------------
 
 async def bet_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show options for a prediction. callback_data: bet_select:<pred_id>"""
     query = update.callback_query
-    await query.answer()
-    pred_id = int(query.data.split(":")[1])
+    await safe_answer(query)
+    try:
+        pred_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        return
 
-    prediction = await get_prediction(pred_id)
+    prediction = await database.get_prediction(pred_id)
     if not prediction or prediction["status"] != "open":
-        await query.edit_message_text(
-            "⚠️ Esta predicción ya no está abierta.", reply_markup=back_to_menu_keyboard()
+        await edit_or_reply(
+            update,
+            "⚠️ Esta predicción ya no está abierta.",
+            reply_markup=back_to_menu_keyboard(),
         )
         return
 
-    options = await get_options(pred_id)
-    closes = prediction["closes_at"][:16].replace("T", " ")
-    text = (
-        f"🎲 *{prediction['title']}*\n"
-        f"⏰ Cierra: `{closes}`\n\n"
-        "Selecciona la opción en la que quieres apostar:"
-    )
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=options_keyboard(pred_id, options),
-    )
+    existing = await database.get_user_bet(pred_id, query.from_user.id)
+    options = await database.get_options(pred_id)
+    pools = await database.get_prediction_pools(pred_id)
+    total_pool = pools.pop(-1, 0)
+    lines = [
+        f"🎲 <b>{esc(prediction['title'])}</b>",
+        f"⏰ Cierra: {code(fmt_local(datetime.fromisoformat(prediction['closes_at'])))}",
+        f"🪙 Pozo total: {bold(fmt_points(total_pool))} puntos",
+        "",
+    ]
+    if existing:
+        lines.append(
+            f"ℹ️ Ya apostaste <b>{fmt_points(existing['amount'])}</b> puntos aquí "
+            f"(una apuesta por predicción)."
+        )
+    lines.append("Elige la opción por la que quieres apostar:")
+    await edit_or_reply(update, "\n".join(lines), reply_markup=options_keyboard(pred_id, options))
 
 
 async def bet_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """User selected an option; ask for amount. callback_data: bet_option:<pred_id>:<opt_id>"""
     query = update.callback_query
-    await query.answer()
-    _, pred_id_str, opt_id_str = query.data.split(":")
-    pred_id, opt_id = int(pred_id_str), int(opt_id_str)
+    await safe_answer(query)
+    try:
+        _, pred_id_raw, opt_id_raw = query.data.split(":")
+        pred_id, opt_id = int(pred_id_raw), int(opt_id_raw)
+    except (ValueError, TypeError):
+        return
 
-    # Store in context for next step
+    settings = config.get_settings()
+    prediction = await database.get_prediction(pred_id)
+    options = await database.get_options(pred_id)
+    if not prediction or not any(o["id"] == opt_id for o in options):
+        await edit_or_reply(update, "⚠️ Opción no válida.", reply_markup=back_to_menu_keyboard())
+        return
+    if prediction["status"] != "open":
+        await edit_or_reply(update, "⚠️ La predicción ya cerró.", reply_markup=back_to_menu_keyboard())
+        return
+
+    user = await database.get_user(query.from_user.id)
+    balance = int(user["points"]) if user else 0
     context.user_data["pending_bet"] = {"pred_id": pred_id, "opt_id": opt_id}
+    context.user_data["awaiting_bet_amount"] = True
 
-    user = await get_user(query.from_user.id)
-    balance = user["points"] if user else 0
-
-    await query.edit_message_text(
-        f"💰 Tu saldo actual: *{balance} puntos*\n\n"
-        "¿Cuántos puntos quieres apostar? (mínimo 10)\n"
-        "_Responde con un número en el chat:_",
-        parse_mode="Markdown",
+    await edit_or_reply(
+        update,
+        f"💰 Saldo disponible: <b>{fmt_points(balance)} puntos</b>\n"
+        f"🎯 Predicción: {esc(prediction['title'])}\n"
+        f"✅ Opción: <b>{esc(next(o['label'] for o in options if o['id'] == opt_id))}</b>\n\n"
+        f"Escribe cuántos puntos quieres apostar "
+        f"(mínimo {bold(settings.min_bet_points)}, máximo {bold(fmt_points(balance))}).\n"
+        "Envía /cancelar para salir.",
         reply_markup=back_to_menu_keyboard(),
     )
-    context.user_data["awaiting_bet_amount"] = True
 
 
 async def bet_amount_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Receive the bet amount from a plain text message."""
     if not context.user_data.get("awaiting_bet_amount"):
+        return  # ignoramos texto suelto sin flujo activo
+    if rate_limited(update, bet_limiter, "bet_amount"):
+        await update.effective_message.reply_text("⏳ Vas muy rápido. Espera unos segundos.")
         return
 
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ Por favor, introduce un número entero.")
-        return
-
-    amount = int(text)
-    if amount < 10:
-        await update.message.reply_text("❌ La apuesta mínima es de 10 puntos.")
-        return
-
-    pending = context.user_data.get("pending_bet", {})
-    pred_id = pending.get("pred_id")
-    opt_id = pending.get("opt_id")
-
-    if not pred_id or not opt_id:
-        await update.message.reply_text("❌ Error interno. Vuelve a intentarlo con /predicciones.")
-        context.user_data.pop("awaiting_bet_amount", None)
-        return
-
-    prediction = await get_prediction(pred_id)
-    options = await get_options(pred_id)
-    opt_label = next((o["label"] for o in options if o["id"] == opt_id), "?")
-
-    text_confirm = (
-        f"📝 *Resumen de tu apuesta:*\n\n"
-        f"🎯 Predicción: *{prediction['title']}*\n"
-        f"✅ Opción elegida: *{opt_label}*\n"
-        f"💰 Puntos apostados: *{amount}*\n\n"
-        "¿Confirmas la apuesta?"
-    )
-    await update.message.reply_text(
-        text_confirm,
-        parse_mode="Markdown",
-        reply_markup=confirm_bet_keyboard(pred_id, opt_id, amount),
-    )
-    context.user_data["awaiting_bet_amount"] = False
-
-
-async def bet_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Confirm and place the bet. callback_data: bet_confirm:<pred_id>:<opt_id>:<amount>"""
-    query = update.callback_query
-    await query.answer()
-    _, pred_id_str, opt_id_str, amount_str = query.data.split(":")
-    pred_id, opt_id, amount = int(pred_id_str), int(opt_id_str), int(amount_str)
-
-    user = query.from_user
-    await upsert_user(user.id, user.username, user.full_name)
-
-    try:
-        await place_bet(user.id, pred_id, opt_id, amount)
-    except ValueError as exc:
-        await query.edit_message_text(
-            f"❌ {exc}", reply_markup=back_to_menu_keyboard()
+    raw = (update.effective_message.text or "").strip().replace(".", "").replace(",", "")
+    if not raw.isdigit():
+        await update.effective_message.reply_text(
+            "❌ Escribe un número entero de puntos, por ejemplo 250."
         )
         return
 
-    new_user = await get_user(user.id)
-    balance = new_user["points"] if new_user else "?"
+    amount = int(raw)
+    settings = config.get_settings()
+    if amount < settings.min_bet_points:
+        await update.effective_message.reply_text(
+            f"❌ La apuesta mínima es de {settings.min_bet_points} puntos."
+        )
+        return
 
-    await query.edit_message_text(
-        f"🎉 ¡Apuesta registrada!\n\n"
-        f"💰 Saldo restante: *{balance} puntos*\n\n"
+    pending = context.user_data.get("pending_bet") or {}
+    pred_id, opt_id = pending.get("pred_id"), pending.get("opt_id")
+    if not pred_id or opt_id is None:
+        context.user_data["awaiting_bet_amount"] = False
+        await update.effective_message.reply_text(
+            "❌ Se perdió el contexto. Vuelve a empezar con /predicciones."
+        )
+        return
+
+    prediction = await database.get_prediction(pred_id)
+    user = await database.get_user(update.effective_user.id)
+    if not prediction or not user:
+        await update.effective_message.reply_text("❌ Predicción no encontrada.")
+        context.user_data["awaiting_bet_amount"] = False
+        return
+    if amount > int(user["points"]):
+        await update.effective_message.reply_text(
+            f"❌ Tu saldo es de {fmt_points(user['points'])} puntos."
+        )
+        return
+
+    options = await database.get_options(pred_id)
+    label = next((o["label"] for o in options if o["id"] == opt_id), "?")
+    pools = await database.get_prediction_pools(pred_id)
+    option_pool = pools.get(opt_id, 0)
+    total_pool = pools.get(-1, 0)
+
+    potential = ""
+    if total_pool + amount > 0:
+        new_total = total_pool + amount
+        new_option_pool = option_pool + amount
+        multiplier = new_total / new_option_pool if new_option_pool else 1
+        potential = (
+            f"\n📈 Pago potencial: <b>~{fmt_points(int(amount * multiplier))} puntos</b> "
+            f"(x{multiplier:.2f} si ganas)\n"
+        )
+
+    context.user_data["awaiting_bet_amount"] = False
+    await update.effective_message.reply_text(
+        "📝 <b>Resumen de tu apuesta</b>\n\n"
+        f"🎯 {esc(prediction['title'])}\n"
+        f"✅ Opción: <b>{esc(label)}</b>\n"
+        f"🪙 Puntos: <b>{fmt_points(amount)}</b>\n"
+        f"{potential}\n"
+        "El pago es pari-mutuel: los ganadores se reparten todo el pozo "
+        "en proporción a lo apostado.",
+        parse_mode="HTML",
+        reply_markup=confirm_bet_keyboard(pred_id, opt_id, amount),
+    )
+
+
+async def bet_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await safe_answer(query)
+    try:
+        _, pred_id_raw, opt_id_raw, amount_raw = query.data.split(":")
+        pred_id, opt_id, amount = int(pred_id_raw), int(opt_id_raw), int(amount_raw)
+    except (ValueError, TypeError):
+        return
+
+    if rate_limited(update, bet_limiter, "bet_confirm"):
+        await edit_or_reply(update, "⏳ Espera un momento antes de apostar otra vez.")
+        return
+
+    user = query.from_user
+    await register_user(update)
+    try:
+        balance = await database.place_bet(user.id, pred_id, opt_id, amount)
+    except database.InsufficientFunds as exc:
+        await edit_or_reply(update, f"❌ {esc(exc)}", reply_markup=back_to_menu_keyboard())
+        return
+    except (database.DuplicateBet, database.DatabaseError) as exc:
+        await edit_or_reply(update, f"❌ {esc(exc)}", reply_markup=back_to_menu_keyboard())
+        return
+
+    context.user_data.pop("pending_bet", None)
+    context.user_data["awaiting_bet_amount"] = False
+    await edit_or_reply(
+        update,
+        "🎉 <b>¡Apuesta registrada!</b>\n\n"
+        f"🪙 Apostado: <b>{fmt_points(amount)}</b>\n"
+        f"💰 Saldo restante: <b>{fmt_points(balance)}</b>\n\n"
         "¡Mucha suerte! 🤞",
-        parse_mode="Markdown",
         reply_markup=back_to_menu_keyboard(),
     )
+
+
+async def cancel_bet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("pending_bet", None)
+    context.user_data["awaiting_bet_amount"] = False
+    await update.effective_message.reply_text(
+        "❌ Apuesta cancelada.", reply_markup=main_menu_keyboard()
+    )
 
 
 # ---------------------------------------------------------------------------
-# F002 — Create prediction (ConversationHandler)
+# F002 — create prediction (conversation)
 # ---------------------------------------------------------------------------
 
 async def crear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for /crear command or cmd_crear callback."""
-    user = update.effective_user
-    await upsert_user(user.id, user.username, user.full_name)
+    settings = config.get_settings()
+    if not settings.points_enabled:
+        await edit_or_reply(
+            update,
+            "ℹ️ En este bot las predicciones se crean on-chain desde la Mini App.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    if rate_limited(update, create_limiter, "create"):
+        await edit_or_reply(update, "⏳ Has creado demasiadas predicciones. Prueba más tarde.")
+        return ConversationHandler.END
+
+    await register_user(update)
+    context.user_data.clear()
     text = (
-        "➕ *Crear Predicción — Paso 1/3*\n\n"
-        "Escribe el *título* o pregunta de tu predicción:\n"
-        "_(Ej: ¿Ganará el Real Madrid el próximo partido?)_"
+        "➕ <b>Crear predicción — Paso 1/3</b>\n\n"
+        "Escribe el <b>título</b> o pregunta:\n"
+        "<i>Ej: ¿Ganará el Real Madrid el próximo partido?</i>"
     )
     if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+        await safe_answer(update.callback_query)
+        await edit_or_reply(update, text, reply_markup=cancel_conversation_keyboard())
     else:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.effective_message.reply_text(
+            text, parse_mode="HTML", reply_markup=cancel_conversation_keyboard()
+        )
     return ASK_TITLE
 
 
 async def ask_title_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_pred_title"] = update.message.text.strip()
-    await update.message.reply_text(
+    title = " ".join((update.effective_message.text or "").split())
+    if len(title) < 6:
+        await update.effective_message.reply_text(
+            "❌ El título debe tener al menos 6 caracteres. Inténtalo de nuevo."
+        )
+        return ASK_TITLE
+    if len(title) > MAX_TITLE:
+        await update.effective_message.reply_text(
+            f"❌ El título no puede superar {MAX_TITLE} caracteres."
+        )
+        return ASK_TITLE
+    context.user_data["new_pred_title"] = title
+    await update.effective_message.reply_text(
         "✅ Título guardado.\n\n"
-        "➕ *Crear Predicción — Paso 2/3*\n\n"
-        "Escribe las *opciones* separadas por comas:\n"
-        "_(Ej: Sí gana, No gana, Empate)_",
-        parse_mode="Markdown",
+        "➕ <b>Paso 2/3</b>\n\n"
+        "Escribe las <b>opciones</b> separadas por comas:\n"
+        "<i>Ej: Sí, No, Empate</i>",
+        parse_mode="HTML",
+        reply_markup=cancel_conversation_keyboard(),
     )
     return ASK_OPTIONS
 
 
 async def ask_options_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-    options = [o.strip() for o in raw.split(",") if o.strip()]
-    if len(options) < 2:
-        await update.message.reply_text("❌ Necesitas al menos 2 opciones separadas por comas.")
+    settings = config.get_settings()
+    raw = update.effective_message.text or ""
+    options: list[str] = []
+    for chunk in raw.split(","):
+        label = " ".join(chunk.split())
+        if label:
+            options.append(label)
+
+    if not 2 <= len(options) <= settings.max_options:
+        await update.effective_message.reply_text(
+            f"❌ Necesitas entre 2 y {settings.max_options} opciones separadas por comas."
+        )
         return ASK_OPTIONS
+    if len({o.lower() for o in options}) != len(options):
+        await update.effective_message.reply_text("❌ Las opciones deben ser distintas.")
+        return ASK_OPTIONS
+    if any(len(o) > MAX_OPTION for o in options):
+        await update.effective_message.reply_text(
+            f"❌ Cada opción puede tener hasta {MAX_OPTION} caracteres."
+        )
+        return ASK_OPTIONS
+
     context.user_data["new_pred_options"] = options
-    await update.message.reply_text(
+    now_local = fmt_local(datetime.now(timezone.utc))
+    await update.effective_message.reply_text(
         "✅ Opciones guardadas.\n\n"
-        "➕ *Crear Predicción — Paso 3/3*\n\n"
-        "Escribe la fecha y hora de cierre en formato `DD/MM/YYYY HH:MM`:\n"
-        "_(Ej: 25/12/2025 20:00)_",
-        parse_mode="Markdown",
+        "➕ <b>Paso 3/3</b>\n\n"
+        "Escribe la fecha y hora de cierre en formato "
+        f"{code('DD/MM/YYYY HH:MM')} (zona {code(config.get_settings().timezone)}):\n"
+        f"<i>Ej: 25/12/2025 20:00 — ahora son las {esc(now_local)}</i>",
+        parse_mode="HTML",
+        reply_markup=cancel_conversation_keyboard(),
     )
     return ASK_CLOSES_AT
 
 
 async def ask_closes_at_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
+    raw = (update.effective_message.text or "").strip()
     try:
-        closes_at = datetime.strptime(raw, "%d/%m/%Y %H:%M")
-        if closes_at <= datetime.now(timezone.utc).replace(tzinfo=None):
-            await update.message.reply_text("❌ La fecha debe ser futura. Inténtalo de nuevo.")
-            return ASK_CLOSES_AT
+        closes_at = parse_local_datetime(raw)
     except ValueError:
-        await update.message.reply_text(
-            "❌ Formato inválido. Usa `DD/MM/YYYY HH:MM`.", parse_mode="Markdown"
+        await update.effective_message.reply_text(
+            "❌ Formato inválido. Usa DD/MM/YYYY HH:MM, por ejemplo 25/12/2025 20:00."
         )
         return ASK_CLOSES_AT
 
-    context.user_data["new_pred_closes_at"] = closes_at
-    title = context.user_data["new_pred_title"]
-    options = context.user_data["new_pred_options"]
+    now = datetime.now(timezone.utc)
+    if closes_at <= now + timedelta(minutes=10):
+        await update.effective_message.reply_text(
+            "❌ La fecha de cierre debe ser al menos 10 minutos en el futuro."
+        )
+        return ASK_CLOSES_AT
+    if closes_at > now + MAX_DURATION:
+        await update.effective_message.reply_text("❌ El cierre no puede estar a más de un año.")
+        return ASK_CLOSES_AT
 
-    opts_text = "\n".join(f"   • {o}" for o in options)
-    await update.message.reply_text(
-        f"📝 *Resumen de la predicción:*\n\n"
-        f"🎯 *{title}*\n"
+    context.user_data["new_pred_closes_at"] = closes_at.isoformat()
+    title = context.user_data.get("new_pred_title", "")
+    options = context.user_data.get("new_pred_options", [])
+    opts_text = "\n".join(f"   • {esc(o)}" for o in options)
+    await update.effective_message.reply_text(
+        "📝 <b>Resumen de la predicción</b>\n\n"
+        f"🎯 <b>{esc(title)}</b>\n"
         f"📌 Opciones:\n{opts_text}\n"
-        f"⏰ Cierre: `{raw}`\n\n"
+        f"⏰ Cierre: {code(fmt_local(closes_at))}\n\n"
         "¿Confirmas la creación?",
-        parse_mode="Markdown",
-        reply_markup=_confirm_create_keyboard(),
+        parse_mode="HTML",
+        reply_markup=confirm_create_keyboard(),
     )
     return CONFIRM_CREATE
 
 
-def _confirm_create_keyboard():
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Confirmar", callback_data="create_confirm"),
-                InlineKeyboardButton("❌ Cancelar", callback_data="create_cancel"),
-            ]
-        ]
-    )
-
-
 async def confirm_create_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     if query.data == "create_cancel":
-        await query.edit_message_text(
-            "❌ Predicción cancelada.", reply_markup=back_to_menu_keyboard()
+        context.user_data.clear()
+        await edit_or_reply(
+            update, "❌ Predicción cancelada.", reply_markup=main_menu_keyboard()
+        )
+        return ConversationHandler.END
+
+    title = context.user_data.get("new_pred_title")
+    options = context.user_data.get("new_pred_options")
+    closes_raw = context.user_data.get("new_pred_closes_at")
+    if not title or not options or not closes_raw:
+        await edit_or_reply(
+            update, "❌ Se perdió el contexto. Empieza de nuevo con /crear."
         )
         context.user_data.clear()
         return ConversationHandler.END
 
-    user = query.from_user
-    title = context.user_data["new_pred_title"]
-    options = context.user_data["new_pred_options"]
-    closes_at = context.user_data["new_pred_closes_at"]
-    chat_id = update.effective_chat.id
+    await register_user(update)
+    try:
+        pred_id = await database.create_prediction(
+            creator_id=query.from_user.id,
+            chat_id=update.effective_chat.id,
+            title=title,
+            options=options,
+            closes_at=datetime.fromisoformat(closes_raw),
+        )
+    except database.DatabaseError as exc:
+        await edit_or_reply(update, f"❌ {esc(exc)}")
+        context.user_data.clear()
+        return ConversationHandler.END
 
-    pred_id = await create_prediction(user.id, chat_id, title, options, closes_at)
-
-    await query.edit_message_text(
-        f"🎉 *¡Predicción creada!*\n\n"
-        f"📌 ID: `{pred_id}`\n"
-        f"🎯 *{title}*\n\n"
-        "Los usuarios ya pueden apostar con /predicciones",
-        parse_mode="Markdown",
+    context.user_data.clear()
+    await edit_or_reply(
+        update,
+        "🎉 <b>¡Predicción creada!</b>\n\n"
+        f"🆔 {code(pred_id)}\n"
+        f"🎯 <b>{esc(title)}</b>\n\n"
+        "Los demás ya pueden apostar con /predicciones.",
         reply_markup=back_to_menu_keyboard(),
     )
-    context.user_data.clear()
     return ConversationHandler.END
 
 
 async def cancel_conv_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("❌ Operación cancelada.", reply_markup=main_menu_keyboard())
+    await update.effective_message.reply_text(
+        "❌ Operación cancelada.", reply_markup=main_menu_keyboard()
+    )
+    return ConversationHandler.END
+
+
+async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "⌛ El formulario expiró por inactividad. Empieza de nuevo con /crear."
+    )
     return ConversationHandler.END
 
 
 def build_crear_conversation() -> ConversationHandler:
-    """Build and return the ConversationHandler for /crear."""
     return ConversationHandler(
         entry_points=[
             CommandHandler("crear", crear_handler),
+            # The inline menu button must enter the conversation, otherwise the
+            # next plain-text message would be consumed by the global handler.
+            CallbackQueryHandler(crear_handler, pattern=r"^cmd_crear$"),
         ],
         states={
             ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_title_handler)],
             ASK_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_options_handler)],
             ASK_CLOSES_AT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_closes_at_handler)],
             CONFIRM_CREATE: [
-                CallbackQueryHandler(confirm_create_callback, pattern="^create_confirm$"),
-                CallbackQueryHandler(confirm_create_callback, pattern="^create_cancel$"),
+                CallbackQueryHandler(confirm_create_callback, pattern=r"^create_(confirm|cancel)$")
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, timeout_handler),
+                CallbackQueryHandler(timeout_handler),
             ],
         },
-        fallbacks=[MessageHandler(filters.COMMAND, cancel_conv_handler)],
+        fallbacks=[
+            CommandHandler(["cancelar", "cancel"], cancel_conv_handler),
+            CallbackQueryHandler(
+                confirm_create_callback, pattern=r"^create_cancel$"
+            ),
+        ],
+        allow_reentry=True,
+        conversation_timeout=900,
         per_user=True,
         per_chat=False,
     )
 
 
-# ---------------------------------------------------------------------------
-# Callback: cmd_crear (from inline button)
-# ---------------------------------------------------------------------------
-
-async def cmd_crear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Trigger crear flow from the main menu inline button."""
-    await crear_handler(update, context)
+# Kept as a public alias for backwards compatibility with older imports.
+cmd_crear_callback = crear_handler
