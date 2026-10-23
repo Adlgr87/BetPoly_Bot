@@ -48,7 +48,7 @@ __all__ = [
     "get_predictions_to_resolve", "close_expired_predictions",
     "settle_prediction", "resolve_prediction", "get_options",
     "place_bet", "get_user_bets", "get_bettors_for_prediction",
-    "get_prediction_pools", "get_user_bet",
+    "get_prediction_pools", "get_user_bet", "get_user_stats", "ranking_position",
     "claim_reminders", "get_reminder_targets",
     "link_wallet", "get_wallet", "get_wallet_owner", "unlink_wallet",
     "create_nonce", "consume_nonce", "purge_nonces",
@@ -354,8 +354,16 @@ CREATE INDEX IF NOT EXISTS idx_predictions_chat   ON predictions(chat_id, status
 CREATE INDEX IF NOT EXISTS idx_options_pred       ON options(prediction_id);
 CREATE INDEX IF NOT EXISTS idx_bets_pred          ON bets(prediction_id, result);
 CREATE INDEX IF NOT EXISTS idx_bets_user          ON bets(user_id, placed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_markets_status     ON markets(status, closes_at);
+-- R-05: el listado ordena por (closes_at, market_id DESC); sin la tercera
+-- columna SQLite monta un B-TREE temporal para desempatar. Sustituye al antiguo
+-- idx_markets_status(status, closes_at), que era su prefijo exacto.
+DROP INDEX IF EXISTS idx_markets_status;
+CREATE INDEX IF NOT EXISTS idx_markets_status_close ON markets(status, closes_at, market_id DESC);
 CREATE INDEX IF NOT EXISTS idx_onchain_bets_mkt   ON onchain_bets(market_id, bettor);
+-- R-04: «mis apuestas on-chain» filtra por bettor y ordena por id descendente.
+CREATE INDEX IF NOT EXISTS idx_onchain_bets_bettor ON onchain_bets(bettor, id DESC);
+-- R-01: agregar pozos por opción de una página de mercados sin B-TREE temporal.
+CREATE INDEX IF NOT EXISTS idx_onchain_bets_mkt_opt ON onchain_bets(market_id, option);
 CREATE INDEX IF NOT EXISTS idx_pending_match      ON pending_actions(kind, match_a, match_b, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_nonces_user        ON auth_nonces(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tx_failures_retry  ON chain_tx_failures(next_retry_at);
@@ -551,26 +559,25 @@ async def get_prediction(pred_id: int) -> Optional[Dict[str, Any]]:
 
 
 async def get_open_predictions(chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Predicciones abiertas **con su pozo**, en una sola consulta (R-01).
+
+    Antes la lista pedía una consulta por predicción para el pozo: con 8 filas
+    eran 8 idas a SQLite por cada refresco del mensaje.
+    """
     now = iso_now()
+    sql = """
+        SELECT p.*, COALESCE(SUM(b.amount), 0) AS total_pool
+        FROM predictions p
+        LEFT JOIN bets b ON b.prediction_id = p.id
+        WHERE p.status = 'open' AND p.closes_at > ?
+    """
+    params: List[Any] = [now]
+    if chat_id is not None:
+        sql += " AND p.chat_id = ?"
+        params.append(chat_id)
+    sql += " GROUP BY p.id ORDER BY p.closes_at ASC LIMIT 50"
     async with connection() as db:
-        if chat_id is not None:
-            async with db.execute(
-                """
-                SELECT * FROM predictions
-                WHERE status = 'open' AND chat_id = ? AND closes_at > ?
-                ORDER BY closes_at ASC LIMIT 50
-                """,
-                (chat_id, now),
-            ) as cur:
-                return [dict(r) for r in await cur.fetchall()]
-        async with db.execute(
-            """
-            SELECT * FROM predictions
-            WHERE status = 'open' AND closes_at > ?
-            ORDER BY closes_at ASC LIMIT 50
-            """,
-            (now,),
-        ) as cur:
+        async with db.execute(sql, params) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
@@ -835,6 +842,53 @@ async def get_user_bets(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
             (user_id, max(1, min(int(limit), 500))),
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_user_stats(user_id: int) -> Dict[str, Any]:
+    """Resumen del perfil calculado en SQL (R-02).
+
+    Antes se traían hasta 500 apuestas al proceso para contar ganadas, perdidas,
+    reembolsos y neto. Los mismos números salen con un ``SUM``/``COUNT``.
+    """
+    async with connection() as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(amount), 0) AS staked,
+                   COALESCE(SUM(payout), 0) AS payouts,
+                   COALESCE(SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END), 0) AS wins,
+                   COALESCE(SUM(CASE WHEN result = 'lose' THEN 1 ELSE 0 END), 0) AS losses,
+                   COALESCE(SUM(CASE WHEN result = 'refund' THEN 1 ELSE 0 END), 0) AS refunds,
+                   COALESCE(SUM(CASE WHEN result IS NULL THEN 1 ELSE 0 END), 0) AS pending,
+                   COALESCE(SUM(CASE WHEN result IS NOT NULL THEN payout - amount ELSE 0 END), 0)
+                       AS net
+            FROM bets WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ) as cur:
+            row = await cur.fetchone()
+    stats = dict(row) if row else {}
+    for key in ("total", "staked", "payouts", "wins", "losses", "refunds", "pending", "net"):
+        stats[key] = int(stats.get(key) or 0)
+    decided = stats["wins"] + stats["losses"]
+    stats["accuracy"] = (stats["wins"] / decided * 100) if decided else None
+    return stats
+
+
+async def ranking_position(user_id: int) -> Optional[int]:
+    """Puesto en el ranking por puntos, contado en SQL (R-03)."""
+    async with connection() as db:
+        async with db.execute("SELECT points FROM users WHERE user_id = ?", (int(user_id),)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        async with db.execute(
+            "SELECT COUNT(*) AS better FROM users"
+            " WHERE points > ? OR (points = ? AND user_id < ?)",
+            (int(row["points"]), int(row["points"]), int(user_id)),
+        ) as cur:
+            better = await cur.fetchone()
+    return int(better["better"]) + 1
 
 
 async def get_bettors_for_prediction(pred_id: int) -> List[Dict[str, Any]]:
@@ -1348,7 +1402,12 @@ async def _market_options(db: aiosqlite.Connection, market_id: int) -> List[Dict
     async with db.execute("SELECT option_count FROM markets WHERE market_id = ?", (market_id,)) as cur:
         row = await cur.fetchone()
     count = int(row["option_count"]) if row else 0
-    return [{"idx": i, "label": f"Opción {i + 1}"} for i in range(count)]
+    return _default_options(count)
+
+
+def _default_options(count: int) -> List[Dict[str, Any]]:
+    """Etiquetas de relleno para mercados creados fuera de la Mini App."""
+    return [{"idx": i, "label": f"Opción {i + 1}"} for i in range(max(0, int(count)))]
 
 
 async def list_markets(
@@ -1366,17 +1425,63 @@ async def list_markets(
     async with connection() as db:
         async with db.execute(sql, params) as cur:
             markets = [dict(r) for r in await cur.fetchall()]
+        if not markets:
+            return []
+        # R-01: opciones y pozos de toda la página en dos consultas, no tres por
+        # mercado. `/api/markets` se sondea cada pocos segundos, así que la
+        # diferencia se nota.
+        ids = [int(m["market_id"]) for m in markets]
+        placeholders = ",".join("?" * len(ids))
+        labels = await _labels_for(db, ids, placeholders)
+        pools, totals, counts = await _pools_for(db, ids, placeholders)
         for market in markets:
-            market["options"] = await _market_options(db, int(market["market_id"]))
-            async with db.execute(
-                "SELECT COALESCE(SUM(stake),0) AS pool, COUNT(*) AS bets FROM onchain_bets WHERE market_id = ?",
-                (market["market_id"],),
-            ) as cur:
-                agg = await cur.fetchone()
-            market["pool"] = int(agg["pool"] or 0)
-            market["bets"] = int(agg["bets"] or 0)
-            market["option_pools"] = await _option_pools(db, int(market["market_id"]))
+            market_id = int(market["market_id"])
+            market["options"] = labels.get(market_id) or _default_options(
+                int(market.get("option_count") or 0)
+            )
+            market["option_pools"] = pools.get(market_id, {})
+            market["pool"] = totals.get(market_id, 0)
+            market["bets"] = counts.get(market_id, 0)
         return markets
+
+
+async def _labels_for(
+    db: aiosqlite.Connection, ids: List[int], placeholders: str
+) -> Dict[int, List[Dict[str, Any]]]:
+    async with db.execute(
+        "SELECT market_id, idx, label FROM market_options"
+        f" WHERE market_id IN ({placeholders}) ORDER BY market_id, idx",
+        ids,
+    ) as cur:
+        rows = await cur.fetchall()
+    labels: Dict[int, List[Dict[str, Any]]] = {}
+    for row in rows:
+        labels.setdefault(int(row["market_id"]), []).append(
+            {"idx": int(row["idx"]), "label": row["label"]}
+        )
+    return labels
+
+
+async def _pools_for(
+    db: aiosqlite.Connection, ids: List[int], placeholders: str
+) -> Tuple[Dict[int, Dict[str, int]], Dict[int, int], Dict[int, int]]:
+    async with db.execute(
+        "SELECT market_id, option, COALESCE(SUM(stake),0) AS pool, COUNT(*) AS bets"
+        f" FROM onchain_bets WHERE market_id IN ({placeholders})"
+        " GROUP BY market_id, option",
+        ids,
+    ) as cur:
+        rows = await cur.fetchall()
+    pools: Dict[int, Dict[str, int]] = {}
+    totals: Dict[int, int] = {}
+    counts: Dict[int, int] = {}
+    for row in rows:
+        market_id = int(row["market_id"])
+        stake = int(row["pool"] or 0)
+        pools.setdefault(market_id, {})[str(int(row["option"]))] = stake
+        totals[market_id] = totals.get(market_id, 0) + stake
+        counts[market_id] = counts.get(market_id, 0) + int(row["bets"] or 0)
+    return pools, totals, counts
 
 
 async def _option_pools(db: aiosqlite.Connection, market_id: int) -> Dict[str, int]:

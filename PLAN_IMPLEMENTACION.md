@@ -127,7 +127,7 @@ Cada decisión incluye la alternativa descartada y **por qué es subóptima para
 | ✅ | **3** | Endurecimiento de la API | **S-04, S-05**, D-01 (api), D-02 | 2 | 0 |
 | ✅ | **4** | Economía única y coherencia mostrada | F-03, H-*, U-05 | 2-3 | 1 |
 | ✅ | **5** | Capa Telegram: navegación, entrada, notificaciones | F-01, F-14, F-02, F-04, **S-06**, U-01…U-04, U-06 | 4 | 1, 4 |
-| ⬜ | **6** | Rendimiento y activos | R-01…R-09 | 2-3 | 1, 5 |
+| ✅ | **6** | Rendimiento y activos | R-01…R-09 | 2-3 | 1, 5 |
 | ⬜ | **7** | Mantenibilidad, dependencias, contrato-tooling | 5.1, D-04, D-05, D-06, F-07, F-08, F-09, F-12, F-13, T-02 | 3 | 3, 4 |
 
 \* Días de trabajo efectivo de una persona, indicativos. Las fases 3 y 6 pueden ejecutarse en paralelo si hay más de un desarrollador; 1 → 2 → 5 es una cadena estricta.
@@ -426,17 +426,35 @@ Formato *friendly* en `/start`, fecha de ejemplo dinámica (`+7 días`), texto d
 
 ## 9. Fase 6 — Rendimiento y activos
 
-| # | Acción | Verificación |
-| :--- | :--- | :--- |
-| R-04 | Índice `idx_onchain_bets_bettor(bettor, id DESC)` | test que ejecuta `EXPLAIN QUERY PLAN` y falla si aparece `SCAN` |
-| R-05 | Índice compuesto `markets(status, closes_at)` | idem (elimina el B-TREE temporal) |
-| R-01 | Una sola consulta para la página de predicciones (JOIN + `GROUP BY`) | test de conteo de queries con un `Connection` instrumentado |
-| R-02/R-03 | `get_user_stats(user_id)` con `SUM/COUNT` en SQL + `ranking_position(user_id)` | test de equivalencia con el cálculo actual |
-| R-06 | `icon.png` a 512×512 WebP/PNG optimizado (<80 KB) | test que falla si un asset estático supera el presupuesto |
-| R-09 | `Cache-Control: public, max-age=31536000, immutable` para assets versionados; gzip en memoria para `/static/*.js|css` | test de cabeceras |
-| R-08 | Polling adaptativo: `setInterval` 25 s → backoff 15/30/60 s; `ETag` en `/api/markets` con `304` | test de que un segundo GET devuelve 304 |
+**Estado: ✅ completada.** Medido, no estimado: los planes de consulta se
+comprueban con `EXPLAIN QUERY PLAN` y el comportamiento de la caché con un
+cliente HTTP real. Todo queda fijado en `tests/test_performance.py` y
+`tests/test_assets_caching.py`.
 
-**Presupuesto de arranque de la Mini App:** HTML+CSS+JS+icono < 350 KB comprimidos (hoy el icono solo son 921 KB).
+| # | Acción | Verificación | Resultado |
+| :--- | :--- | :--- | :--- |
+| R-04 | Índice `idx_onchain_bets_bettor(bettor, id DESC)` | test que ejecuta `EXPLAIN QUERY PLAN` y falla si aparece `SCAN` | ✅ `SCAN onchain_bets` → `SEARCH … USING INDEX` |
+| R-05 | Índice compuesto `markets(status, closes_at)` | idem (elimina el B-TREE temporal) | ✅ `idx_markets_status_close` + `idx_onchain_bets_mkt_opt`: dos `TEMP B-TREE` menos |
+| R-01 | Una sola consulta para la página de predicciones (JOIN + `GROUP BY`) | test de conteo de queries con un `Connection` instrumentado | ✅ la página hace **3 consultas** con 1 o con 11 mercados; la lista de predicciones, 1 |
+| R-02/R-03 | `get_user_stats(user_id)` con `SUM/COUNT` en SQL + `ranking_position(user_id)` | test de equivalencia con el cálculo actual | ✅ equivalencia exacta con el cálculo en Python; el ranking ya muestra puesto |
+| R-06 | `icon.png` a 512×512 WebP/PNG optimizado (<80 KB) | test que falla si un asset estático supera el presupuesto | ✅ 921 682 B → **79 408 B** (−91 %), `scripts/build_icon.py` reproducible |
+| R-09 | `Cache-Control: public, max-age=31536000, immutable` para assets versionados; gzip en memoria para `/static/*.js|css` | test de cabeceras | ✅ `?v=<huella>` → inmutable; gzip memoizado; `ETag` + `304` en el resto |
+| R-08 | Polling adaptativo: `setInterval` 25 s → backoff 15/30/60 s; `ETag` en `/api/markets` con `304` | test de que un segundo GET devuelve 304 | ✅ sin `setInterval`; escalones 15/30/60 s con reinicio por actividad; `/api/markets` responde `304` |
+
+**Presupuesto de arranque de la Mini App:** HTML+CSS+JS+icono < 350 KB comprimidos.
+Medido: **93.3 KB** (index.html 2.4 + styles.css 3.0 + app.js 10.5 + icono 77.5),
+frente a los 921 KB del icono anterior.
+
+**Detalles de implementación que importan**
+
+- El `ETag` se calcula sobre el cuerpo serializado, no sobre la hora: dos
+  peticiones iguales dan el mismo `304` aunque cambie el proceso.
+- El gzip se paga **una vez por proceso** (`_Asset.gzipped`), nunca por petición;
+  es lo que hace viable comprimir en un host de 512 MB.
+- El sondeo adaptativo usa `setTimeout` encadenado, no `setInterval`: un ciclo
+  lento nunca encola el siguiente y volver a la pestaña reinicia en 15 s.
+- El presupuesto de activos es un test (`STARTUP_BUDGET_BYTES`, `ICON_BUDGET_BYTES`),
+  no una convención: un PNG de 900 KB falla el CI.
 
 ---
 

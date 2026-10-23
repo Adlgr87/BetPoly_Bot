@@ -53,7 +53,12 @@ async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if all(int(entry["user_id"]) != int(user_id) for entry in leaderboard):
             me = await database.get_user(user_id)
             if me:
-                text += f"\n\n📍 Tu posición: {bold(fmt_points(me['points']))} puntos"
+                # R-03: puesto contado en SQL; antes solo se mostraban los puntos.
+                position = await database.ranking_position(user_id)
+                where = f" (puesto {position})" if position else ""
+                text += (
+                    f"\n\n📍 Tu posición: {bold(fmt_points(me['points']))} puntos{where}"
+                )
         text += "\n\n<i>El ranking premia el modo puntos (sandbox). Las apuestas TON se liquidan en la blockchain.</i>"
 
     user = getattr(update, "effective_user", None)
@@ -87,20 +92,18 @@ async def _send_profile(
         )
         return
 
+    # R-02: los números salen de un SUM/COUNT en SQL, no de traer 500 filas.
     bets = await database.get_user_bets(user_id, limit=5)
-    all_bets = await database.get_user_bets(user_id, limit=500)
-    wins = sum(1 for b in all_bets if b["result"] == "win")
-    losses = sum(1 for b in all_bets if b["result"] == "lose")
-    refunds = sum(1 for b in all_bets if b["result"] == "refund")
-    pending = sum(1 for b in all_bets if b["result"] is None)
-    accuracy = f"{wins / (wins + losses) * 100:.0f}%" if (wins + losses) else "—"
-    profit = sum(int(b["payout"] or 0) - int(b["amount"]) for b in all_bets if b["result"])
+    stats = await database.get_user_stats(user_id)
+    accuracy = f"{stats['accuracy']:.0f}%" if stats["accuracy"] is not None else "—"
+    profit = stats["net"]
 
     lines = [
         "📊 <b>Tu perfil</b>",
         "",
         f"🪙 Saldo: {bold(fmt_points(user_data['points']))} puntos",
-        f"🎲 Apuestas: {bold(len(all_bets))} · ✅ {wins} · ❌ {losses} · ↩️ {refunds} · ⏳ {pending}",
+        f"🎲 Apuestas: {bold(stats['total'])} · ✅ {stats['wins']} · ❌ {stats['losses']} "
+        f"· ↩️ {stats['refunds']} · ⏳ {stats['pending']}",
         f"🎯 Acierto: {bold(accuracy)}",
         f"📈 Resultado neto: {bold(fmt_points(profit) if profit >= 0 else '-' + fmt_points(abs(profit)))} pts",
     ]

@@ -12,9 +12,12 @@ The API never returns, stores or requests private keys or seed phrases.
 """
 from __future__ import annotations
 
+import gzip
+import hashlib
 import ipaddress
 import logging
 import math
+import re
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -34,8 +37,88 @@ from bot.parsing import parse_fee_bps, parse_nano
 logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+STATIC_DIR = WEB_DIR / "static"
 TON_CLIENT_KEY = web.AppKey("ton_client", object)
 MAX_BODY = 64 * 1024
+
+#: R-09 — un año de caché solo para URLs que llevan la huella del contenido.
+IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+#: Sin `?v=` el fichero se revalida con ETag: barato y nunca sirve código viejo.
+REVALIDATE_CACHE = "no-cache"
+
+#: Tipo MIME por extensión; lo que no esté aquí no se sirve.
+STATIC_TYPES = {
+    ".js": "text/javascript",
+    ".css": "text/css",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".webmanifest": "application/manifest+json",
+}
+#: Solo texto: recomprimir un PNG cuesta RAM y no ahorra un byte.
+COMPRESSIBLE = (".js", ".css", ".svg", ".webmanifest")
+
+
+class _Asset:
+    """Fichero estático en memoria, con su gzip ya hecho y su ETag."""
+
+    __slots__ = ("body", "gzipped", "content_type", "etag")
+
+    def __init__(self, body: bytes, content_type: str, compress: bool) -> None:
+        self.body = body
+        self.content_type = content_type
+        self.etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+        # El gzip se paga una vez, en la primera petición, no en cada sondeo.
+        self.gzipped = gzip.compress(body, 6) if compress else None
+
+
+_assets: Dict[str, _Asset] = {}
+
+
+def _asset_version() -> str:
+    """Huella del conjunto JS/CSS: cambia al cambiar cualquier activo.
+
+    Se usa como ``?v=`` en ``index.html`` para que el navegador pida la versión
+    nueva sin perder la caché de un año del resto.
+    """
+    digest = hashlib.sha256()
+    for name in ("app.js", "styles.css"):
+        asset = _load_asset(name)
+        digest.update(asset.etag.encode() if asset else b"-")
+    return digest.hexdigest()[:12]
+
+
+def _load_asset(name: str) -> Optional[_Asset]:
+    """Carga (una vez) un activo de ``web/static`` y lo cachea en memoria.
+
+    Rechaza cualquier ruta que no sea un nombre de fichero simple dentro del
+    directorio estático: la ruta viene del cliente.
+    """
+    if name in _assets:
+        return _assets[name]
+    if not name or name.startswith(".") or "/" in name or "\\" in name:
+        return None
+    path = (STATIC_DIR / name).resolve()
+    try:
+        path.relative_to(STATIC_DIR.resolve())
+    except ValueError:
+        return None
+    suffix = path.suffix.lower()
+    content_type = STATIC_TYPES.get(suffix)
+    if content_type is None or not path.is_file():
+        return None
+    charset = "utf-8" if content_type.startswith("text/") or "json" in content_type else None
+    declared = content_type if charset is None else f"{content_type}; charset=utf-8"
+    asset = _Asset(path.read_bytes(), declared, compress=suffix in COMPRESSIBLE)
+    _assets[name] = asset
+    return asset
+
+
+def reset_asset_cache() -> None:
+    """Olvida los activos en memoria (tests y recarga en caliente)."""
+    _assets.clear()
 
 _prepare_limiter = security.RateLimiter(limit=20, window_seconds=60)
 _session_limiter = security.RateLimiter(limit=30, window_seconds=60)
@@ -313,11 +396,45 @@ async def privacy_page(request: web.Request) -> web.Response:
     )
 
 
+_STATIC_REF = re.compile(r'(/static/[\w.\-]+)(?!\?v=)')
+
+
 async def index(request: web.Request) -> web.StreamResponse:
+    """Sirve la Mini App con los activos ya versionados (R-09).
+
+    ``index.html`` nunca se cachea; cada ``/static/...`` de dentro sale con
+    ``?v=<huella>``, así que el navegador puede guardarlos para siempre.
+    """
     file = WEB_DIR / "index.html"
     if not file.exists():  # pragma: no cover - packaging guard
         return web.Response(text="Mini App no encontrada", status=503)
-    return web.FileResponse(file, headers={"Cache-Control": "no-store"})
+    html = file.read_text(encoding="utf-8")
+    version = _asset_version()
+    html = _STATIC_REF.sub(lambda match: f"{match.group(1)}?v={version}", html)
+    return web.Response(
+        body=html.encode("utf-8"),
+        content_type="text/html",
+        charset="utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def static_asset(request: web.Request) -> web.StreamResponse:
+    """Activo estático con gzip en memoria y caché inmutable si está versionado."""
+    asset = _load_asset(request.match_info.get("name", ""))
+    if asset is None:
+        raise web.HTTPNotFound()
+    headers = {"ETag": asset.etag, "Cache-Control": REVALIDATE_CACHE}
+    if request.headers.get("If-None-Match") == asset.etag:
+        return web.Response(status=304, headers=headers)
+    if request.query.get("v") == _asset_version():
+        headers["Cache-Control"] = IMMUTABLE_CACHE
+    headers["Content-Type"] = asset.content_type
+    if asset.gzipped is not None and "gzip" in request.headers.get("Accept-Encoding", ""):
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
+        return web.Response(body=asset.gzipped, headers=headers)
+    return web.Response(body=asset.body, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +616,22 @@ async def me(request: web.Request) -> web.Response:
 # markets
 # ---------------------------------------------------------------------------
 
+def json_cached(request: web.Request, data: Any) -> web.Response:
+    """JSON con ``ETag`` y ``304`` cuando el cliente ya tiene esa versión.
+
+    R-08: el sondeo de la Mini App se abarata a unas pocas decenas de bytes
+    cuando nada cambió; el cuerpo solo se serializa una vez y se compara su
+    huella con ``If-None-Match``.
+    """
+    body = _dumps({"ok": True, "data": data})
+    etag = '"' + hashlib.sha256(body.encode()).hexdigest()[:16] + '"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers=headers)
+    headers["Content-Type"] = "application/json; charset=utf-8"
+    return web.Response(body=body.encode(), headers=headers)
+
+
 async def list_markets(request: web.Request) -> web.Response:
     status = request.query.get("status", "open")
     try:
@@ -508,11 +641,12 @@ async def list_markets(request: web.Request) -> web.Response:
         return json_error("bad_query", "limit/offset deben ser enteros.")
     status_value = None if status == "all" else status
     markets_list = await database.list_markets(status=status_value, limit=limit, offset=offset)
-    return json_ok(
+    return json_cached(
+        request,
         {
             "markets": [markets.market_view(m) for m in markets_list],
             "escrow": markets.friendly_escrow() if _settings().escrow_enabled else None,
-        }
+        },
     )
 
 
@@ -846,8 +980,7 @@ def create_app(
     app.router.add_post("/api/admin/contract/change-admin/prepare", admin_contract_change_admin)
     app.router.add_get("/api/indexer", indexer_status)
 
-    if WEB_DIR.exists():
-        app.router.add_static("/static", path=str(WEB_DIR / "static"), name="static")
+    app.router.add_get("/static/{name}", static_asset, name="static")
     return app
 
 

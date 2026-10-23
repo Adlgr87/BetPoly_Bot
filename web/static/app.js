@@ -22,6 +22,8 @@
     sheetMode: 'bet',
     verifying: false,
     pollTimer: null,
+    pollStep: 0,
+    marketsFingerprint: '',
     quote: null,
     quoteSeq: 0,
     quoteTimer: null,
@@ -178,9 +180,37 @@
     bindEvents();
     await Promise.all([loadMarkets(), loadMine()]);
 
-    state.pollTimer = setInterval(() => {
-      if (document.visibilityState === 'visible' && state.view === 'markets') loadMarkets(true);
-    }, 25000);
+    schedulePoll();
+  }
+
+  /* R-08: sondeo adaptativo. Empieza en 15 s y, si nada cambia, se relaja a
+     30 s y luego a 60 s. Cualquier actividad del usuario (o un cambio real en
+     los mercados) vuelve a 15 s: se refresca rápido cuando importa y se deja
+     de gastar batería y datos cuando no pasa nada. */
+  const POLL_DELAYS = [15000, 30000, 60000];
+
+  function schedulePoll() {
+    const delay = POLL_DELAYS[Math.min(state.pollStep, POLL_DELAYS.length - 1)];
+    clearTimeout(state.pollTimer);
+    state.pollTimer = setTimeout(pollOnce, delay);
+  }
+
+  async function pollOnce() {
+    if (document.visibilityState === 'visible' && state.view === 'markets') {
+      const before = state.marketsFingerprint;
+      try {
+        await loadMarkets(true);
+      } catch (error) { /* se reintenta en el siguiente ciclo */ }
+      const changed = state.marketsFingerprint !== before;
+      state.pollStep = changed ? 0 : Math.min(state.pollStep + 1, POLL_DELAYS.length - 1);
+    }
+    schedulePoll();
+  }
+
+  function pollNow() {
+    // Interacción del usuario: el siguiente refresco vuelve a ser el más rápido.
+    state.pollStep = 0;
+    schedulePoll();
   }
 
   function showFatal(message) {
@@ -509,6 +539,8 @@
     try {
       const data = await api('/api/markets?status=open&limit=50', { auth: !!state.session });
       state.markets = data.markets || [];
+      // Huella para el sondeo adaptativo (R-08): si no cambió, se relaja.
+      state.marketsFingerprint = JSON.stringify(state.markets);
       renderMarkets();
       if (state.view === 'admin') renderAdmin();
     } catch (error) {
@@ -1070,7 +1102,10 @@
       loadContract();
     }
     if (view === 'mine') loadMine();
-    if (view === 'markets') loadMarkets(true);
+    if (view === 'markets') {
+      pollNow();
+      loadMarkets(true);
+    }
   }
 
   /* ------------------------------------------------------------- events */
@@ -1183,6 +1218,7 @@
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
+        pollNow();
         loadMarkets(true);
         loadMine();
       }

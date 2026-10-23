@@ -295,32 +295,48 @@ No se encontraron secretos, mnemónicos ni direcciones hardcodeadas. Lo que sí 
 
 ## 7. Rendimiento y optimalidad (R)
 
-### R-01 — 🟡 N+1 en la página de una predicción
+### R-01 — ✅ N+1 en la página de una predicción
 `bot/handlers/predictions.py:104` llama a `get_prediction_pools()` dentro del bucle que recorre la página (una consulta por predicción). Con 8 filas son 8 consultas donde bastaría una sola agregación.
 
-### R-02 — 🟡 El perfil consulta las apuestas dos veces y agrega en Python
+**Resuelto (Fase 6):** `get_open_predictions()` devuelve el pozo con un `LEFT JOIN` + `GROUP BY`; `list_markets()` pide opciones y pozos de toda la página en dos consultas. Un test cuenta las consultas con `aiosqlite` instrumentado y falla si crecen con el número de filas.
+
+### R-02 — ✅ El perfil consulta las apuestas dos veces y agrega en Python
 `bot/handlers/stats.py:80-81` trae la misma información con `limit=5` y `limit=500` (y `:111` repite el patrón con `limit=100` para las apuestas on-chain) y calcula ganadas/perdidas/beneficio en un bucle. Dos consultas pesadas por `/misbets` y trabajo que SQLite haría mejor con `SUM`/`COUNT`.
 
-### R-03 — 🟡 «Tu posición» no es una posición
+**Resuelto (Fase 6):** `get_user_stats(user_id)` calcula totales, ganadas, perdidas, reembolsos, pendientes y neto con `SUM`/`COUNT`. El perfil bajó de dos consultas de 500 filas a una agregación. Test de equivalencia contra el cálculo anterior.
+
+### R-03 — ✅ «Tu posición» no es una posición
 `bot/handlers/stats.py:49` muestra `📍 Tu posición` pero imprime los puntos (`me['points']`), no el puesto en el ranking; además nunca se calcula ese puesto (no hay conteo de usuarios con más puntos).
 
-### R-04 — 🟡 Índice faltante en la tabla más caliente
+**Resuelto (Fase 6):** `ranking_position(user_id)` cuenta los usuarios con más puntos (con desempate por `user_id`) y el mensaje muestra el puesto real.
+
+### R-04 — ✅ Índice faltante en la tabla más caliente
 `onchain_bets` solo tiene `idx_onchain_bets_mkt(market_id)`. La consulta de «mis apuestas» (`WHERE bettor = ?`) hace **`SCAN` completo**, verificado con `EXPLAIN QUERY PLAN`. Añadir un índice por `bettor` es la mejora de rendimiento más rentable del proyecto.
 
-### R-05 — 🟡 Planes de consulta que ordenan en memoria
+**Resuelto (Fase 6):** `idx_onchain_bets_bettor(bettor, id DESC)`; `EXPLAIN QUERY PLAN` pasó de `SCAN onchain_bets` a `SEARCH … USING INDEX`. Un test lo comprueba.
+
+### R-05 — ✅ Planes de consulta que ordenan en memoria
 `markets` con `ORDER BY closes_at` sobre un índice por `status` produce `USE TEMP B-TREE FOR RIGHT PART OF ORDER BY`; `_option_pools` agrupa con B-TREE temporal. Aceptable hoy, pero escala mal en cuanto crezcan los mercados.
 
-### R-06 — 🟡 `icon.png` de 921 KB en cada carga de la Mini App
+**Resuelto (Fase 6):** `idx_markets_status_close(status, closes_at, market_id DESC)` e `idx_onchain_bets_mkt_opt(market_id, option)` eliminan los dos B-TREE temporales (verificado con `EXPLAIN` y fijado en tests).
+
+### R-06 — ✅ `icon.png` de 921 KB en cada carga de la Mini App
 `web/static/icon.png` es 1024×1024, RGB (sin canal alfa), 921 682 bytes, y se sirve tal cual dentro de Telegram, donde el ancho útil ronda los 300 px. Es el activo más pesado del proyecto con diferencia.
+
+**Resuelto (Fase 6):** regenerado a 512×512 con paleta de 64 colores: **79 408 B** (−91 %). `scripts/build_icon.py` lo reproduce de forma idempotente y falla si supera los 80 KB; un test vigila el presupuesto.
 
 ### R-07 — 🟡 Complejidad alta en el núcleo de dinero
 `radon`: `verify_ton_proof` E36, `_process_tx` D26, `_send_profile` D25, `validate_init_data` D22, `verify_wallet` C19, `settle_prediction` C18, `_fetch` C18, `market_view` C16, `prepare_transaction_payload` C16, `bet_amount_message` C16, `prepare_create_market` C14, `Settings.validate` C14. `verify_ton_proof` y `settle_prediction` son las que más se beneficiarían de dividirse en pasos.
 
-### R-08 — 🟡 Encuesta cada 25 s con la pestaña visible
+### R-08 — ✅ Encuesta cada 25 s con la pestaña visible
 `web/static/app.js` mantiene `setInterval(... 25000)` sobre `/api/markets` mientras la vista de mercados está activa, además de `pollMarket` (12 × 6 s) y `pollForMarket` (15 × 5 s) tras cada acción. En un servidor de 512 MB con muchos usuarios concurrentes, es el mayor consumidor de CPU. El indexador por defecto también encuesta cada 20 s (`INDEXER_POLL_INTERVAL`).
 
-### R-09 — 🟡 Sin caché ni compresión HTTP
+**Resuelto (Fase 6):** el `setInterval` fijo desaparece. El sondeo parte de 15 s, se relaja a 30 s y 60 s cuando nada cambia y vuelve a 15 s con la actividad del usuario. `/api/markets` responde `ETag` y `304` con cuerpo vacío cuando el cliente ya tiene esa versión.
+
+### R-09 — ✅ Sin caché ni compresión HTTP
 `bot/api.py:669` monta estáticos sin `Content-Encoding` ni `Cache-Control`. aiohttp sí envía `Last-Modified`/`ETag` (revalidación → 304), pero cuando responde `200` manda el icono completo de 921 KB sin comprimir y sin política de caché explícita.
+
+**Resuelto (Fase 6):** `index.html` versiona sus activos con `?v=<huella>`; esos ficheros salen con `Cache-Control: public, max-age=31536000, immutable`. JS/CSS se sirven con gzip en memoria (comprimido una vez por proceso) y ETag para el resto. Arranque medido: **93.3 KB** comprimidos frente a un presupuesto de 350 KB.
 
 ### R-10 — 🔵 Estilo y tipado (ruff)
 `UP006`/`UP045` (tipado legacy `List`, `Optional`), `PLR2004` (números mágicos en `bodies.py`), `ARG001` (6 handlers de `api.py` con argumentos sin usar), `PLC0415` (imports dentro de funciones), `UP041`. Nada funcional; es deuda de estilo coherente en todo el repo.

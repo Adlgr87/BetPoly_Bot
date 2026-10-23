@@ -44,7 +44,7 @@ jobs:
           pytest \
             --cov=bot --cov=config --cov=main --cov=scripts \
             --cov-report=term-missing:skip-covered \
-            --cov-fail-under=80
+            --cov-fail-under=83
       - name: Cobertura de la capa Telegram (Fase 5)
         run: |
           pytest tests/test_handlers_navigation.py tests/test_handlers_flows.py \

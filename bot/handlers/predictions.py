@@ -108,10 +108,10 @@ async def _show_predictions_page(
     lines = [f"📋 <b>Predicciones abiertas</b> ({page + 1}/{total_pages})", ""]
     for index, pred in enumerate(chunk, start=page * PAGE_SIZE + 1):
         closes = fmt_local(datetime.fromisoformat(pred["closes_at"]))
-        pools = await database.get_prediction_pools(pred["id"])
+        # El pozo viene en la misma fila (R-01): cero consultas por predicción.
         lines.append(
             f"{index}. <b>{esc(pred['title'])}</b>\n"
-            f"    ⏰ Cierra: {code(closes)} · 🪙 pozo: {bold(fmt_points(pools[-1]))}"
+            f"    ⏰ Cierra: {code(closes)} · 🪙 pozo: {bold(fmt_points(pred['total_pool']))}"
         )
     lines += ["", "Toca una predicción para apostar tus puntos."]
 

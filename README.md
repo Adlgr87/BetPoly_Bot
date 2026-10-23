@@ -63,6 +63,7 @@ BetPoly_Bot/
 │   ├── keyboards.py         # teclados inline
 │   └── handlers/            # start, predictions, markets, stats, wallet, admin, help
 ├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png)
+├── scripts/                 # utilidades: build_icon.py, dev_server.py
 ├── contracts/               # escrow.fc, stdlib, build.js, deploy.js, tests
 ├── tests/                   # suite pytest offline
 ├── config.py                # configuración tipada desde el entorno
@@ -193,6 +194,15 @@ Todas las rutas devuelven `{"ok": true, "data": …}` o `{"ok": false, "error": 
 
 Las sesiones viajan en la cabecera `X-Session`. El backend **nunca** devuelve una transacción firmada.
 
+**Caché y sondeo (Fase 6).** `/api/markets` devuelve `ETag` y `Cache-Control:
+no-cache`: un cliente que ya tiene esa versión recibe `304` sin cuerpo, así que
+el sondeo de la Mini App cuesta unas decenas de bytes cuando nada cambió. Los
+activos de `/static` salen con la huella del contenido en la URL (`?v=…`) y
+`Cache-Control: public, max-age=31536000, immutable`; JS y CSS viajan con gzip
+comprimido una sola vez por proceso. El arranque completo (HTML + CSS + JS +
+icono) pesa **~93 KB** comprimidos, con un presupuesto de 350 KB que un test
+hace cumplir.
+
 ---
 
 ## 🔐 Seguridad
@@ -291,8 +301,12 @@ cd contracts && node tests/escrow.test.js   # contrato real en el sandbox TVM
 La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`,
 `FakeClient` para el indexer, claves Ed25519 sintéticas para `ton_proof` y dobles
 de `Update`/`Message`/`CallbackQuery` (`tests/telegram_fakes.py`) para la capa
-Telegram. Cobertura actual: **84 %** global (umbral 80) y **87 %** en
+Telegram. Cobertura actual: **85 %** global (umbral 83) y **87 %** en
 `bot/handlers/*` + `bot/keyboards.py` (umbral propio 70).
+
+**Activos.** `web/static/icon.png` se regenera con `python scripts/build_icon.py`
+(Pillow solo hace falta para esa tarea puntual; el bot no depende de ella). El
+script escribe el PNG y falla si supera los 80 KB.
 
 **CI** (`.github/workflows/ci.yml`) ejecuta en cada push: lint, tests con umbral de
 cobertura, compilación del contrato con verificación del hash reproducible,
@@ -307,6 +321,9 @@ Tres suites son *guardarraíles* y no pruebas funcionales:
   solo queda `/api/health`, endpoint de sondas).
 - `tests/test_web_assets.py` — la Mini App no lleva manejadores inline y la CSP
   que se publica de verdad los bloquearía.
+- `tests/test_performance.py` y `tests/test_assets_caching.py` — los planes de
+  consulta no hacen `SCAN`, el número de consultas no crece con las filas, la
+  caché/`304`/gzip funcionan y ningún activo se pasa del presupuesto.
 
 ### Modo grupo
 

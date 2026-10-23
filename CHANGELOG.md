@@ -366,3 +366,59 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - `main.py` sigue por debajo del 50 % de cobertura: `post_init`,
   `build_application` y `run` necesitan un `Application` real o un doble más
   profundo; se aborda en la Fase 7 junto con la limpieza de código muerto.
+
+---
+
+## Fase 6 — Rendimiento y activos
+
+**Fecha:** 2026-10-23
+
+### Arreglado
+- **R-01 · N+1 en las listas.** `get_open_predictions()` trae el pozo con un
+  `LEFT JOIN` + `GROUP BY` en vez de una consulta por fila. `list_markets()`
+  pide opciones y pozos de toda la página en dos consultas: la página del
+  listado hace **3 consultas con 1 mercado o con 50** (antes, 1 + 3·N).
+- **R-02 · El perfil agregaba en Python.** `get_user_stats(user_id)` calcula con
+  `SUM`/`COUNT` totales, ganadas, perdidas, reembolsos, pendientes y neto. Se
+  elimina la consulta de 500 filas que solo servía para contar.
+- **R-03 · «Tu posición» mostraba los puntos, no el puesto.** `ranking_position()`
+  cuenta cuántos usuarios están por delante (desempate por `user_id`) y el
+  mensaje dice el puesto real.
+- **R-04 · `SCAN` en `onchain_bets`.** Índice `idx_onchain_bets_bettor(bettor, id DESC)`.
+- **R-05 · Dos `TEMP B-TREE`.** Índices `idx_markets_status_close(status, closes_at,
+  market_id DESC)` e `idx_onchain_bets_mkt_opt(market_id, option)`.
+- **R-06 · Icono de 921 KB.** `web/static/icon.png` pasa a 512×512 con paleta de
+  64 colores: **79 408 B** (−91 %). `scripts/build_icon.py` lo regenera y falla
+  si supera los 80 KB.
+- **R-08 · Sondeo fijo cada 25 s.** Backoff 15/30/60 s que se reinicia con la
+  actividad del usuario o un cambio real; `/api/markets` responde `ETag` y `304`
+  con cuerpo vacío.
+- **R-09 · Sin caché ni compresión.** Los activos salen versionados con
+  `?v=<huella>` y `Cache-Control: public, max-age=31536000, immutable`; JS/CSS
+  se sirven con gzip memoizado por proceso y `ETag` para el resto.
+
+### Añadido
+- `tests/test_performance.py`: planes de consulta (`EXPLAIN QUERY PLAN` sin
+  `SCAN` ni `TEMP B-TREE`), conteo de consultas con `aiosqlite` instrumentado y
+  equivalencia de los agregados del perfil con el cálculo anterior.
+- `tests/test_assets_caching.py`: caché inmutable, gzip, `304`, rechazo de rutas
+  fuera del directorio estático, `ETag` de `/api/markets` y presupuesto de
+  arranque (**93.3 KB** comprimidos frente a 350 KB) como test.
+- `scripts/build_icon.py`: generación reproducible del icono con tope de tamaño.
+- CI: el umbral de cobertura global sube de 80 % a **83 %** (medido: 84.8 %).
+
+### Decidido
+- **El `ETag` va sobre el contenido, no sobre la hora.** Dos peticiones iguales
+  devuelven el mismo `304` incluso en otro proceso; con `Last-Modified` una
+  republicación sin cambios invalidaría la caché de todos.
+- **Gzip en memoria, una vez por proceso.** Comprimir en cada petición gastaría
+  CPU en el host de 512 MB; tres activos caben de sobra en RAM.
+- **El presupuesto de activos es un test, no una convención.** Un PNG de 900 KB
+  vuelve a fallar el CI aunque nadie mire el tamaño.
+- **Sondeo con `setTimeout` encadenado.** `setInterval` encola refrescos si la
+  red va lenta; encadenar garantiza una petición en vuelo como máximo.
+
+### Pendiente
+- Fase 7: mantenibilidad, dependencias y tooling del contrato.
+- R-07 (complejidad de `verify_ton_proof` y `settle_prediction`) sigue abierto:
+  no se tocó en esta fase para no mezclar refactor con rendimiento.

@@ -437,12 +437,17 @@ class TestProfile:
         assert "ranking" in recorder.callbacks()
 
     async def test_ranking_when_user_is_not_in_the_top(self, db):
-        for user_id in (2, 3, 4):
+        # Diez rivales por delante: el usuario queda fuera del Top 10 y el
+        # mensaje muestra su puesto exacto (R-03).
+        for user_id in range(2, 12):
             await db.upsert_user(user_id, f"u{user_id}", f"User {user_id}")
+            await db.adjust_points(user_id, 1000)
         await _user(db, user_id=1)
         update, context, recorder = make_update(user_id=1, text="/ranking")
         await stats_handler.ranking_handler(update, context)
-        assert "Tu posición" in recorder.last["text"] or "Top 10" in recorder.last["text"]
+        text = recorder.last["text"]
+        assert "Tu posición" in text
+        assert "(puesto 11)" in text, text
 
     async def test_ranking_empty(self, db):
         update, context, recorder = make_update(user_id=1, text="/ranking")
