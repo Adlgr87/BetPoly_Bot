@@ -65,6 +65,7 @@ def _new_backstops(
 _MARKET_ERROR_STATUS = {
     "forbidden": 403,
     "wallet_not_admin": 403,
+    "market_not_found": 404,
     "chain_unavailable": 503,
 }
 
@@ -216,9 +217,14 @@ def public_config() -> Dict[str, Any]:
         "app_title": settings.app_title,
         "ton_proof_domain": settings.proof_domain,
         "support_url": settings.support_url,
-        "bet_gas_ton": ton(markets.BET_GAS_NANO),
-        "create_gas_ton": ton(markets.CREATE_GAS_NANO),
-        "claim_gas_ton": ton(markets.CLAIM_GAS_NANO),
+        "bet_gas_ton": ton(settings.bet_gas_nano),
+        "create_gas_ton": ton(settings.create_gas_nano),
+        "claim_gas_ton": ton(settings.claim_gas_nano),
+        "admin_gas_ton": ton(settings.admin_gas_nano),
+        "max_stake_nano": str(settings.max_stake_nano),
+        "max_stake_ton": ton(settings.max_stake_nano),
+        "min_market_duration_min": settings.min_market_duration_min,
+        "max_market_duration_days": settings.max_market_duration_days,
     }
 
 
@@ -526,6 +532,22 @@ async def get_market(request: web.Request) -> web.Response:
     return json_ok(detail)
 
 
+async def quote_market(request: web.Request) -> web.Response:
+    """Pago estimado de una apuesta nueva (la Mini App no calcula economía)."""
+    market_id = _market_id(request)
+    if market_id is None:
+        return json_error("bad_market", "market_id inválido.")
+    try:
+        option = int(request.query.get("option", ""))
+    except (TypeError, ValueError):
+        return json_error("bad_option", "Selecciona una opción válida.")
+    stake = parse_nano(
+        request.query.get("stake_ton") or request.query.get("stake"), field="importe"
+    )
+    quote = await markets.quote_payout(market_id, option, stake)
+    return json_ok(quote)
+
+
 async def prepare_market(request: web.Request) -> web.Response:
     user_id = current_user(request)
     allowed, retry = _prepare_limiter.allow(f"create:{user_id}")
@@ -812,6 +834,7 @@ def create_app(
     app.router.add_get("/api/markets", list_markets)
     app.router.add_get("/api/markets/{market_id}", get_market)
     app.router.add_post("/api/markets/prepare", prepare_market)
+    app.router.add_get("/api/markets/{market_id}/quote", quote_market)
     app.router.add_post("/api/markets/{market_id}/bets/prepare", prepare_bet)
     app.router.add_post("/api/markets/{market_id}/claim/prepare", prepare_claim)
     app.router.add_post("/api/admin/markets/{market_id}/resolve/prepare", prepare_resolve)

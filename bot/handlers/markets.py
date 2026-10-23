@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import config
-from bot import database
+from bot import database, economics
 from bot.formatting import bold, code, esc, fmt_ts, relative, ton
 from bot.handlers.common import edit_or_reply, register_user, safe_answer
 from bot.keyboards import market_detail_keyboard, markets_list_keyboard
@@ -106,9 +106,11 @@ async def market_view_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⏰ Cierra: {esc(fmt_ts(int(market['closes_at'])))}\n",
         "<b>Opciones</b>",
     ]
+    fee_bps = int(market.get("fee_bps") or 0)
     for idx, label in sorted(options.items()):
         pool = pools.get(idx, 0)
-        multiplier = f"x{total / pool:.2f}" if pool else "—"
+        mult = economics.multiplier(total, pool, fee_bps)
+        multiplier = f"x{mult:.2f}" if mult else "—"
         lines.append(f"• {esc(label)} — {bold(ton(pool))} TON ({esc(multiplier)})")
 
     if market["status"] == "resolved" and market.get("winning_option") is not None:

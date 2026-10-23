@@ -56,7 +56,7 @@ def build_how_it_works() -> str:
             "",
             f"Contrato: {code(settings.escrow_address or '—')}",
             f"Apuesta mínima: {bold(ton(settings.min_stake_nano))} TON "
-            f"+ {bold(ton(30_000_000))} TON de gas.",
+            f"+ {bold(ton(settings.bet_gas_nano))} TON de gas.",
             "",
         ]
 

@@ -27,6 +27,7 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence,
 import aiosqlite
 
 import config
+from bot import economics
 from bot.formatting import iso_now, iso_utc
 
 logger = logging.getLogger(__name__)
@@ -635,20 +636,22 @@ async def place_bet(user_id: int, pred_id: int, option_id: int, amount: int) -> 
 
 
 def _split_payouts(
-    winners: List[Dict[str, Any]], distributable: int, winning_pool: int
+    winners: List[Dict[str, Any]], distributable_pool: int, winning_pool: int
 ) -> Dict[int, int]:
-    """Pari-mutuel split with deterministic rounding.
+    """Reparto pari-mutuel con redondeo determinista.
 
-    Every winner receives ``stake * distributable / winning_pool`` rounded down;
-    the remaining wei are handed out one by one to the largest stakes so the
-    sum of payouts is *exactly* ``distributable`` (no points are created).
+    Cada ganador recibe ``payout(stake, distributable, winning_pool)`` (la única
+    fórmula del proyecto, en :mod:`bot.economics`) redondeada hacia abajo; el
+    sobrante se reparte de uno en uno entre las apuestas mayores para que la
+    suma sea *exactamente* el pozo distribuible (no se crean puntos).
     """
-    if winning_pool <= 0 or distributable <= 0:
+    if winning_pool <= 0 or distributable_pool <= 0:
         return {b["id"]: 0 for b in winners}
     payouts = {
-        b["id"]: (int(b["amount"]) * distributable) // winning_pool for b in winners
+        b["id"]: economics.payout(int(b["amount"]), distributable_pool, winning_pool)
+        for b in winners
     }
-    remainder = distributable - sum(payouts.values())
+    remainder = distributable_pool - sum(payouts.values())
     if remainder > 0:
         order = sorted(winners, key=lambda b: (-int(b["amount"]), b["id"]))
         for i in range(remainder):
@@ -703,8 +706,8 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
             # Nobody was right: full refund, no rake.
             payouts = {b["id"]: int(b["amount"]) for b in bets}
         else:
-            rake = (total_pool * settings.house_rake_bps) // 10_000
-            distributable = total_pool - rake
+            distributable = economics.distributable(total_pool, settings.house_rake_bps)
+            rake = total_pool - distributable
             payouts = _split_payouts(winners, distributable, winning_pool)
 
         now = iso_now()

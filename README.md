@@ -142,6 +142,15 @@ TON_PROOF_DOMAIN=tu-dominio
 SECRET_KEY=<32+ bytes aleatorios>
 TON_NETWORK=mainnet
 TON_API_KEY=…
+# Importes y ventanas (opcionales; estos son los valores por defecto)
+MAX_STAKE_NANO=5000000000000
+BET_GAS_NANO=30000000
+CREATE_GAS_NANO=50000000
+ADMIN_GAS_NANO=50000000
+CLAIM_GAS_NANO=20000000
+MIN_MARKET_DURATION_MIN=15
+MAX_MARKET_DURATION_DAYS=365
+TX_TTL_SECONDS=300
 # Solo tras un proxy inverso: sin TRUST_PROXY la cabecera X-Forwarded-For se ignora
 TRUST_PROXY=false
 TRUSTED_PROXIES=127.0.0.1/32
@@ -168,7 +177,8 @@ Todas las rutas devuelven `{"ok": true, "data": …}` o `{"ok": false, "error": 
 | DELETE | `/api/wallet` | Desvincula la wallet |
 | GET | `/api/me` | Perfil, puntos, wallet |
 | GET | `/api/markets` | Mercados del espejo on-chain |
-| GET | `/api/markets/{id}` | Detalle + tu apuesta + multiplicadores |
+| GET | `/api/markets/{id}` | Detalle + tu apuesta + multiplicadores **netos** de comisión |
+| GET | `/api/markets/{id}/quote?option=&stake_ton=` | Pago estimado de una apuesta (`bot/economics.py`) |
 | POST | `/api/markets/prepare` | Transacción **sin firmar** para crear mercado |
 | POST | `/api/markets/{id}/bets/prepare` | Transacción sin firmar para apostar |
 | POST | `/api/markets/{id}/claim/prepare` | Transacción sin firmar para cobrar |
@@ -218,6 +228,13 @@ distributable = total_pool − floor(total_pool · fee_bps / 10000)
 payout        = floor(stake · distributable / winning_pool)
 ```
 
+Esa fórmula existe **una sola vez** fuera del contrato: `bot/economics.py`
+(`distributable`, `fee_of`, `payout`, `multiplier`, `preview_payout`). La usan la
+liquidación de puntos, los multiplicadores que muestran el bot y la API, y el
+*quote* de la hoja de apuesta de la Mini App, que ya no calcula nada por su
+cuenta. `contracts/vectors/economics.json` fija vectores compartidos: si el
+contrato y Python se separan, fallan las dos suites.
+
 Si nadie apostó a la opción ganadora, `resolve_market` falla con `412` y el admin debe `cancel_market`: entonces todos cobran su stake completo.
 
 | Opcode | Operación | Quién |
@@ -252,7 +269,12 @@ Si nadie apostó a la opción ganadora, `resolve_market` falla con `412` y el ad
 | `416` | Comisión por encima del 10 % |
 | `417` | `withdraw_fees` tocaría fondos bloqueados |
 
-Límites: `min_stake` configurable (0.1 TON por defecto), `max_options = 8`, cierre entre 5 min y 365 días, reserva de 0.01 TON para almacenamiento.
+Límites configurables: `MIN_STAKE_NANO` (0.1 TON), `MAX_STAKE_NANO` (5000 TON),
+`MAX_OPTIONS = 8`, cierre entre `MIN_MARKET_DURATION_MIN` (15 min) y
+`MAX_MARKET_DURATION_DAYS` (365), gas por operación
+(`BET_GAS_NANO`/`CREATE_GAS_NANO`/`ADMIN_GAS_NANO`/`CLAIM_GAS_NANO`) y
+`TX_TTL_SECONDS` (300). `/api/config` publica los mismos valores (en TON) para
+que la Mini App no repita ni un literal.
 
 Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con un único ref; `bot/chain/bodies.py` la desenvuelve.
 

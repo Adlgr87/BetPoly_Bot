@@ -78,6 +78,20 @@ class TestPublic:
         assert "secret" not in str(data).lower()
         assert "test-secret" not in str(data)
 
+    async def test_config_publishes_the_money_limits(self, client):
+        """Fase 4.3: la UI no repite importes, los lee de aquí."""
+        response = await client.get("/api/config")
+        data = (await response.json())["data"]
+        settings = config.get_settings()
+        assert data["max_stake_ton"] == api.ton(settings.max_stake_nano)
+        assert data["max_stake_nano"] == str(settings.max_stake_nano)
+        assert data["bet_gas_ton"] == api.ton(settings.bet_gas_nano)
+        assert data["create_gas_ton"] == api.ton(settings.create_gas_nano)
+        assert data["admin_gas_ton"] == api.ton(settings.admin_gas_nano)
+        assert data["claim_gas_ton"] == api.ton(settings.claim_gas_nano)
+        assert data["min_market_duration_min"] == settings.min_market_duration_min
+        assert data["max_market_duration_days"] == settings.max_market_duration_days
+
     async def test_manifest(self, client):
         response = await client.get("/tonconnect-manifest.json")
         data = await response.json()
@@ -280,8 +294,37 @@ class TestMarketsApi:
         tx = (await response.json())["data"]
         parsed = bodies.parse_message_body(tx["payload"])
         assert parsed.op == bodies.OP_CREATE_MARKET
-        assert tx["amount"] == str(api.markets.CREATE_GAS_NANO)
+        assert tx["amount"] == str(config.get_settings().create_gas_nano)
         assert tx["to"].startswith("EQ")
+
+    async def test_quote_endpoint_returns_the_backend_formula(self, client, db):
+        await self._ready_market(db)
+        response = await client.get(
+            "/api/markets/1/quote", params={"option": 0, "stake_ton": "1.5"}
+        )
+        assert response.status == 200, await response.text()
+        data = (await response.json())["data"]
+        expected = api.markets.economics.preview_payout(1_500_000_000, 0, 0, 200)
+        assert data["payout"] == str(expected)
+        assert data["payout_ton"] == api.markets.ton(expected)
+        assert data["option"] == 0
+
+    async def test_quote_endpoint_rejects_bad_input(self, client, db):
+        await self._ready_market(db)
+        assert (await client.get("/api/markets/1/quote", params={"stake_ton": "1"})).status == 400
+        bad_option = await client.get(
+            "/api/markets/1/quote", params={"option": 9, "stake_ton": "1"}
+        )
+        assert bad_option.status == 400
+        assert (await bad_option.json())["error"]["code"] == "bad_option"
+        bad_stake = await client.get(
+            "/api/markets/1/quote", params={"option": 0, "stake_ton": "nada"}
+        )
+        assert bad_stake.status == 400
+        missing = await client.get(
+            "/api/markets/99/quote", params={"option": 0, "stake_ton": "1"}
+        )
+        assert missing.status == 404
 
     async def test_prepare_bet(self, client, db):
         _, headers = await session_for(client, USER, wallet=True)
@@ -295,7 +338,7 @@ class TestMarketsApi:
         tx = (await response.json())["data"]
         parsed = bodies.parse_message_body(tx["payload"])
         assert parsed.stake == 2_500_000_000
-        assert tx["amount"] == str(2_500_000_000 + api.markets.BET_GAS_NANO)
+        assert tx["amount"] == str(2_500_000_000 + config.get_settings().bet_gas_nano)
 
     async def test_prepare_bet_rejects_bad_amounts(self, client, db):
         _, headers = await session_for(client, USER, wallet=True)

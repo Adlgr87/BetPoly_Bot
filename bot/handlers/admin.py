@@ -25,7 +25,7 @@ from telegram.ext import (
 )
 
 import config
-from bot import database, markets
+from bot import database, economics, markets
 from bot.chain.addresses import same_address, to_friendly
 from bot.formatting import bold, code, esc, fmt_ts, ton
 from bot.formatting import points as fmt_points
@@ -192,14 +192,19 @@ async def admin_winner_callback(update: Update, context: ContextTypes.DEFAULT_TY
     total = pools.pop(-1, 0)
     winning_pool = pools.get(opt_id, 0)
     settings = config.get_settings()
-    distributable = total - (total * settings.house_rake_bps) // 10_000
-    multiplier = f"x{distributable / winning_pool:.2f}" if winning_pool else "sin ganadores (reembolso)"
+    distributable = economics.distributable(total, settings.house_rake_bps)
+    if winning_pool:
+        # Puntos, no TON: «por punto apostado» se expresa con puntos, no con «x».
+        per_point = distributable / winning_pool
+        payout_hint = f"{per_point:.2f} puntos por punto apostado"
+    else:
+        payout_hint = "sin ganadores (se reembolsa todo)"
 
     await edit_or_reply(
         update,
         f"⚠️ ¿Confirmas que la opción ganadora es <b>{esc(label)}</b>?\n\n"
         f"🪙 Pozo: {bold(fmt_points(total))} · en esa opción: {bold(fmt_points(winning_pool))}\n"
-        f"📈 Pago por punto apostado: {bold(esc(multiplier))}\n\n"
+        f"📈 Pago: {bold(esc(payout_hint))}\n\n"
         "<i>Esta acción es irreversible y reparte los puntos una sola vez.</i>",
         reply_markup=confirm_resolve_keyboard(pred_id, opt_id),
     )

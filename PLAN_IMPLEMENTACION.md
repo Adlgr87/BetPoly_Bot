@@ -125,7 +125,7 @@ Cada decisión incluye la alternativa descartada y **por qué es subóptima para
 | ✅ | **1** | Integridad del dinero on-chain | **S-01, S-02, S-07**, F-05, F-06 | 4 | 0 |
 | ✅ | **2** | Administración del contrato | **S-03**, D-03 | 3-4 | 0, 1 |
 | ✅ | **3** | Endurecimiento de la API | **S-04, S-05**, D-01 (api), D-02 | 2 | 0 |
-| ⬜ | **4** | Economía única y coherencia mostrada | F-03, H-*, U-05 | 2-3 | 1 |
+| ✅ | **4** | Economía única y coherencia mostrada | F-03, H-*, U-05 | 2-3 | 1 |
 | ⬜ | **5** | Capa Telegram: navegación, entrada, notificaciones | F-01, F-14, F-02, F-04, **S-06**, U-01…U-04, U-06 | 4 | 1, 4 |
 | ⬜ | **6** | Rendimiento y activos | R-01…R-09 | 2-3 | 1, 5 |
 | ⬜ | **7** | Mantenibilidad, dependencias, contrato-tooling | 5.1, D-04, D-05, D-06, F-07, F-08, F-09, F-12, F-13, T-02 | 3 | 3, 4 |
@@ -332,6 +332,15 @@ Helpers `_user_payload(user, user_id)`, `_require_admin(request)`, `_parse_marke
 ---
 
 ## 7. Fase 4 — Economía única y coherencia de lo mostrado
+
+> **Estado: ✅ implementada.** `bot/economics.py` es la única copia de la
+> fórmula; la API publica `multiplier` neto y `GET /api/markets/{id}/quote`; los
+> importes son configuración (`Settings` + `/api/config`) y
+> `contracts/vectors/economics.json` mantiene la paridad con `escrow.fc`.
+> Detalle en `CHANGELOG.md`. Desviación consciente respecto de 4.2: la Mini App
+> **no** conserva la fórmula con `fee_bps` como respaldo; si el *quote* falla
+> muestra «—», porque `tests/test_architecture.py` prohíbe `fee_bps` en
+> `app.js` y una sola copia es el objetivo de la fase.
 
 ### 4.1 · `bot/economics.py`
 

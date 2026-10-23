@@ -63,6 +63,46 @@ class TestTrustProxy:
         settings.validate()  # no lanza
 
 
+class TestMoneySettings:
+    """Fase 4.3 (H-*): gas, tope de apuesta y ventanas son configuración."""
+
+    def test_defaults_match_the_documented_values(self):
+        settings = config.get_settings()
+        assert settings.max_stake_nano == 5_000_000_000_000
+        assert settings.bet_gas_nano == 30_000_000
+        assert settings.create_gas_nano == 50_000_000
+        assert settings.admin_gas_nano == 50_000_000
+        assert settings.claim_gas_nano == 20_000_000
+        assert settings.min_market_duration_min == 15
+        assert settings.max_market_duration_days == 365
+        assert settings.tx_ttl_seconds == 300
+
+    def test_env_overrides_them(self, monkeypatch):
+        settings = _settings(
+            monkeypatch,
+            MAX_STAKE_NANO="1000000000",
+            BET_GAS_NANO="40000000",
+            MIN_MARKET_DURATION_MIN="5",
+            TX_TTL_SECONDS="600",
+        )
+        assert settings.max_stake_nano == 1_000_000_000
+        assert settings.bet_gas_nano == 40_000_000
+        assert settings.min_market_duration_min == 5
+        assert settings.tx_ttl_seconds == 600
+
+    def test_max_stake_cannot_be_below_the_minimum(self, monkeypatch):
+        settings = _settings(monkeypatch, MAX_STAKE_NANO="1")
+        with pytest.raises(config.ConfigError):
+            settings.validate()
+
+    def test_durations_must_be_coherent(self, monkeypatch):
+        settings = _settings(
+            monkeypatch, MIN_MARKET_DURATION_MIN="1441", MAX_MARKET_DURATION_DAYS="1"
+        )
+        with pytest.raises(config.ConfigError):
+            settings.validate()
+
+
 class TestValidation:
     """Los errores de configuración fallan al arrancar, no en producción."""
 

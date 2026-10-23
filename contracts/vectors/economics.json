@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Vectores compartidos de la economía pari-mutuel.",
+    "Los consumen tests/test_economics.py (Python) y contracts/tests/escrow.test.js",
+    " (JavaScript, con la misma aritmética entera que contracts/escrow.fc:",
+    " distributable = total - muldiv(total, fee_bps, 10000),",
+    " payout = muldiv(stake, distributable, winning_pool)).",
+    "Importes en la unidad mínima (nanoTON o puntos). Si alguien cambia la",
+    "fórmula en un lado, el otro falla."
+  ],
+  "payouts": [
+    {"total": 0, "fee_bps": 200, "stake": 0, "winning_pool": 0,
+     "distributable": 0, "payout": 0},
+    {"total": 1000000000, "fee_bps": 0, "stake": 500000000, "winning_pool": 500000000,
+     "distributable": 1000000000, "payout": 1000000000},
+    {"total": 4000000000, "fee_bps": 200, "stake": 1000000000, "winning_pool": 1000000000,
+     "distributable": 3920000000, "payout": 3920000000},
+    {"total": 1000000003, "fee_bps": 333, "stake": 333333333, "winning_pool": 1000000003,
+     "distributable": 966700003, "payout": 322233333},
+    {"total": 999, "fee_bps": 1000, "stake": 500, "winning_pool": 999,
+     "distributable": 900, "payout": 450},
+    {"total": 7, "fee_bps": 250, "stake": 3, "winning_pool": 7,
+     "distributable": 7, "payout": 3}
+  ],
+  "previews": [
+    {"stake": 1000000000, "option_pool": 0, "total": 0, "fee_bps": 200,
+     "payout": 980000000},
+    {"stake": 2000000000, "option_pool": 1000000000, "total": 4000000000, "fee_bps": 200,
+     "payout": 3920000000},
+    {"stake": 100000000, "option_pool": 0, "total": 0, "fee_bps": 1000,
+     "payout": 90000000},
+    {"stake": 5000000000000, "option_pool": 0, "total": 0, "fee_bps": 0,
+     "payout": 5000000000000}
+  ]
+}

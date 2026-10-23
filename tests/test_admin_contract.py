@@ -263,7 +263,7 @@ class TestPrepareWithdraw:
         assert parsed.op == bodies.OP_WITHDRAW_FEES
         assert parsed.amount == 1_000_000_000
         assert tx.kind == "withdraw_fees"
-        assert tx.amount == markets.ADMIN_OP_GAS_NANO
+        assert tx.amount == config.get_settings().admin_gas_nano
         assert tx.details["available_ton"] == "2.5"
         assert tx.to.startswith("EQ")
 

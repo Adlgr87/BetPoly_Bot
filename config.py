@@ -138,7 +138,17 @@ class Settings:
     ton_proof_domain: Optional[str]
     ton_proof_max_age: int
     min_stake_nano: int
+    max_stake_nano: int
     max_options: int
+
+    # --- dinero on-chain: gas y ventanas (una sola fuente) ----------------
+    bet_gas_nano: int
+    create_gas_nano: int
+    admin_gas_nano: int
+    claim_gas_nano: int
+    min_market_duration_min: int
+    max_market_duration_days: int
+    tx_ttl_seconds: int
 
     # --- indexer ----------------------------------------------------------
     indexer_enabled: bool
@@ -219,6 +229,15 @@ class Settings:
             )
         if self.is_production and self.secret_key.startswith("dev-"):
             raise ConfigError("SECRET_KEY must be set to a strong random value in production.")
+        if self.max_stake_nano < self.min_stake_nano:
+            raise ConfigError(
+                "MAX_STAKE_NANO must be >= MIN_STAKE_NANO "
+                f"(got {self.max_stake_nano} < {self.min_stake_nano})."
+            )
+        if self.min_market_duration_min * 60 >= self.max_market_duration_days * 86_400:
+            raise ConfigError(
+                "MIN_MARKET_DURATION_MIN must be shorter than MAX_MARKET_DURATION_DAYS."
+            )
         if self.trust_proxy and not self.trusted_proxies:
             raise ConfigError(
                 "TRUST_PROXY=true requires TRUSTED_PROXIES (e.g. 127.0.0.1/32): "
@@ -267,7 +286,15 @@ def _build_settings() -> Settings:
         ton_proof_domain=_opt_str("TON_PROOF_DOMAIN"),
         ton_proof_max_age=_int("TON_PROOF_MAX_AGE", 600, minimum=60, maximum=3600),
         min_stake_nano=_int("MIN_STAKE_NANO", 100_000_000, minimum=1),
+        max_stake_nano=_int("MAX_STAKE_NANO", 5_000_000_000_000, minimum=1),
         max_options=_int("MAX_OPTIONS", 8, minimum=2, maximum=20),
+        bet_gas_nano=_int("BET_GAS_NANO", 30_000_000, minimum=0),
+        create_gas_nano=_int("CREATE_GAS_NANO", 50_000_000, minimum=0),
+        admin_gas_nano=_int("ADMIN_GAS_NANO", 50_000_000, minimum=0),
+        claim_gas_nano=_int("CLAIM_GAS_NANO", 20_000_000, minimum=0),
+        min_market_duration_min=_int("MIN_MARKET_DURATION_MIN", 15, minimum=1),
+        max_market_duration_days=_int("MAX_MARKET_DURATION_DAYS", 365, minimum=1),
+        tx_ttl_seconds=_int("TX_TTL_SECONDS", 300, minimum=30, maximum=3600),
         indexer_enabled=_bool("INDEXER_ENABLED", True),
         indexer_poll_interval=_int("INDEXER_POLL_INTERVAL", 20, minimum=5, maximum=3600),
         indexer_batch=_int("INDEXER_BATCH", 50, minimum=1, maximum=200),

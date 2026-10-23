@@ -75,3 +75,21 @@ class TestCspHeader:
         response = await web_client.get("/static/app.js")
         assert response.status == 200
         assert "data-reload" in await response.text()
+
+
+class TestNoLocalEconomics:
+    """F-03: la economía la calcula el backend; el frontend solo formatea."""
+
+    FORBIDDEN = ("winning_pool", "distributable", "house_rake", "fee_bps")
+
+    def test_app_js_does_not_reimplement_the_formula(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        found = [token for token in self.FORBIDDEN if token in source]
+        assert not found, f"app.js calcularía economía propia: {found}"
+        assert not re.search(r"total\s*\+\s*amount", source)
+
+    def test_the_bet_sheet_asks_the_backend_for_the_quote(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        assert "/quote?option=" in source
+        assert "state.quote" in source
+        assert "payout_ton" in source

@@ -220,3 +220,72 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - Fase 4: economía única y coherencia de lo mostrado (F-03, H-*, U-05).
 - El backstop es en memoria y por proceso: con varias réplicas cada una lleva su
   propia cuenta (aceptable en el host único de 512 MB; ver ADR-05).
+
+---
+
+## Fase 4 — Economía única y coherencia de lo mostrado (F-03, H-*, U-05)
+
+**Fecha:** 2026-10-23
+
+### Arreglado
+- **F-03 · Lo que se muestra y lo que se paga salían de fórmulas distintas.** La
+  fórmula pari-mutuel vive ahora **solo** en `bot/economics.py`
+  (`distributable`, `fee_of`, `payout`, `multiplier`, `preview_payout`). La
+  consumen `bot/database.py` (liquidación de puntos), `bot/markets.py`
+  (`estimate_payout`, `market_view.multiplier`, `quote_payout`) y
+  `bot/handlers/markets.py`. Con un pozo de 4 TON repartido 3:1 y 2 % de comisión
+  el bot ya muestra `3.92x` / `1.307x` en vez de `4.00x` / `1.333x`.
+- **F-03 · La Mini App calculaba el «Pago potencial» por su cuenta.** Ahora pide
+  `GET /api/markets/{id}/quote?option=N&stake_ton=X` (con *debounce* de 250 ms y
+  guarda de secuencia para descartar respuestas viejas) y pinta el
+  `payout_ton` del servidor; mientras responde, «Calculando…», y si falla, «—».
+  El frontend no calcula ningún importe. `market_detail` publica además `fee_bps`
+  y `fee_percent` por mercado.
+- **U-05 · «Pago por punto apostado».** La confirmación de una apuesta de puntos
+  ya no mezcla puntos con formato de multiplicador: dice «N puntos por punto
+  apostado» y, cuando nadie acertó, «sin ganadores (se reembolsa todo)».
+
+### Añadido
+- **H-* · Los importes son configuración, no literales.** `Settings` gana
+  `MAX_STAKE_NANO` (5000 TON), `BET_GAS_NANO`, `CREATE_GAS_NANO`,
+  `ADMIN_GAS_NANO`, `CLAIM_GAS_NANO`, `MIN_MARKET_DURATION_MIN` (15),
+  `MAX_MARKET_DURATION_DAYS` (365) y `TX_TTL_SECONDS` (300), con dos
+  validaciones de arranque (tope ≥ mínimo, duración mínima < máxima).
+  `.env.example` y `README.md` los documentan.
+- **`/api/config` es la única copia para la UI:** publica `max_stake_ton`,
+  `min_market_duration_min`, `max_market_duration_days`, `bet_gas_ton`,
+  `create_gas_ton`, `admin_gas_ton` y `claim_gas_ton`. `help.py`, el formulario de
+  creación y la hoja de apuesta leen de ahí; `web/index.html` deja de traer
+  `0.05` y `app.js` deja de exigir `+900 s`.
+- **`contracts/vectors/economics.json`:** vectores compartidos que ejecutan
+  `tests/test_economics.py` y `contracts/tests/escrow.test.js` (25 comprobaciones
+  en el sandbox TVM). Si Python o el contrato se desvían, falla el otro.
+- **Guardarraíl contra la reincidencia:** `tests/test_economics.py::TestNoMoneyLiterals`
+  falla si `30_000_000`, `50_000_000`, `20_000_000`, `5_000 * NANO` o `0.05`
+  reaparecen en `bot/`, `web/`, `scripts/` o `main.py`, y
+  `tests/test_web_assets.py::TestNoLocalEconomics` falla si `app.js` vuelve a
+  mencionar la fórmula o deja de pedir el *quote*.
+- Pruebas nuevas: `tests/test_economics.py` (aritmética, truncado, pozo vacío,
+  vectores compartidos, literales), `/quote` en `tests/test_api.py` y
+  `tests/test_markets_service.py`, límites publicados y valores por defecto en
+  `tests/test_config.py`.
+
+### Decidido
+- **El backend es el único que calcula; si no hay *quote*, no hay promesa.** El
+  plan permitía un respaldo en JS con `fee_bps`; se descarta porque duplicaría la
+  fórmula (P6) y porque `tests/test_architecture.py` prohíbe `fee_bps` en
+  `app.js`. Un «—» honesto es mejor que un número inventado.
+- **Los vectores son el contrato ejecutable.** Mantener la fórmula en dos
+  lenguajes es inevitable (FunC y Python); lo que se elimina es el tercer y
+  cuarto sitio, y un JSON compartido detecta la deriva en lugar de confiar en la
+  revisión manual.
+- **El redondeo sigue siendo `floor` + resto al mayor apostador.** Los pagos suman
+  exactamente el pozo distribuible; el test lo verifica fila a fila.
+- **Se mantiene `RESOLVE_WINDOW_SECONDS` (15 min) como constante de dominio**, no
+  de configuración: es una regla del producto (no se apuesta en el último cuarto
+  de hora), no un parámetro de despliegue.
+
+### Pendiente
+- Fase 5: capa Telegram (F-01, F-14, F-02, F-04, S-06, U-01…U-04, U-06).
+- F-04 (notificaciones), F-05 (`prepare_cancel` en mercado abierto) y F-06
+  (bloqueo optimista de resolución) siguen abiertos, como marca el plan.

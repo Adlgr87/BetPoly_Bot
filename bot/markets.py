@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 import config
-from bot import database
+from bot import database, economics
 from bot.chain.addresses import AddressError, normalize_address, to_friendly
 from bot.chain.bodies import (
     build_cancel_market,
@@ -43,23 +43,39 @@ logger = logging.getLogger(__name__)
 
 NANO = 1_000_000_000
 
-#: Gas the contract needs on top of the stake (forward fees + storage).
-BET_GAS_NANO = 30_000_000          # 0.03 TON
-CREATE_GAS_NANO = 50_000_000       # 0.05 TON
-ADMIN_GAS_NANO = 50_000_000        # 0.05 TON (funds the lifecycle event)
-CLAIM_GAS_NANO = 20_000_000        # 0.02 TON
-
-MIN_MARKET_DURATION = 15 * 60      # 15 minutes
-MAX_MARKET_DURATION = 365 * 24 * 3600
-TX_TTL = 300                       # 5 minutes to sign
-# While a resolution is prepared and pending on-chain, new bets are refused:
-# they would be rejected by the contract and the user would pay gas for nothing.
+#: Ventana durante la que se rechazan apuestas mientras hay una resolución
+#: preparada: el contrato las rechazaría y el usuario pagaría gas para nada.
 RESOLVE_WINDOW_SECONDS = 15 * 60
 
 #: The contract caps the fee at 10 %; mirrored here to fail before signing.
 MAX_FEE_BPS = 1000
-#: Gas every admin operation must attach (it funds the event message).
-ADMIN_OP_GAS_NANO = ADMIN_GAS_NANO
+
+
+# -- dinero configurable ----------------------------------------------------
+# Los importes viven en ``config.Settings`` (una sola fuente, H-*); estas
+# funciones existen para que nadie tenga que recordar el nombre del campo y para
+# que el gas se lea siempre en el momento de preparar la transacción.
+
+def bet_gas_nano() -> int:
+    """Gas que acompaña a una apuesta, además del importe."""
+    return config.get_settings().bet_gas_nano
+
+
+def create_gas_nano() -> int:
+    return config.get_settings().create_gas_nano
+
+
+def admin_gas_nano() -> int:
+    """Gas de cualquier operación de administración (funde el evento)."""
+    return config.get_settings().admin_gas_nano
+
+
+def claim_gas_nano() -> int:
+    return config.get_settings().claim_gas_nano
+
+
+def tx_ttl_seconds() -> int:
+    return config.get_settings().tx_ttl_seconds
 
 _escrow_state_cache = EscrowStateCache()
 
@@ -133,7 +149,7 @@ def _prepared(
     body_cell, *, amount: int, kind: str, summary: str, details: Dict[str, Any]
 ) -> PreparedTx:
     escrow = escrow_address()
-    valid_until = int(time.time()) + TX_TTL
+    valid_until = int(time.time()) + tx_ttl_seconds()
     return PreparedTx(
         to=to_friendly(escrow),
         amount=int(amount),
@@ -196,18 +212,22 @@ async def prepare_create_market(
         raise MarketError("bad_options", "Cada opción puede tener hasta 60 caracteres.")
 
     now = int(time.time())
-    if closes_at < now + MIN_MARKET_DURATION:
+    min_minutes = settings.min_market_duration_min
+    max_days = settings.max_market_duration_days
+    if closes_at < now + min_minutes * 60:
         raise MarketError(
             "bad_close_date",
-            f"El cierre debe ser al menos {MIN_MARKET_DURATION // 60} minutos en el futuro.",
+            f"El cierre debe ser al menos {min_minutes} minutos en el futuro.",
         )
-    if closes_at > now + MAX_MARKET_DURATION:
-        raise MarketError("bad_close_date", "El cierre no puede estar a más de un año.")
+    if closes_at > now + max_days * 86_400:
+        raise MarketError(
+            "bad_close_date", f"El cierre no puede estar a más de {max_days} días."
+        )
 
     title_hash = title_to_hash(title)
     tx = _prepared(
         build_create_market(title_hash, closes_at, len(cleaned)),
-        amount=CREATE_GAS_NANO,
+        amount=create_gas_nano(),
         kind="create_market",
         summary=f"Crear mercado: {title[:60]}",
         details={
@@ -252,8 +272,11 @@ async def prepare_bet(user_id: int, market_id: int, option: int, stake: int) -> 
             "stake_too_low",
             f"La apuesta mínima es de {ton(settings.min_stake_nano)} TON.",
         )
-    if int(stake) > 5_000 * NANO:
-        raise MarketError("stake_too_high", "La apuesta máxima es de 5000 TON.")
+    max_stake = settings.max_stake_nano
+    if int(stake) > max_stake:
+        raise MarketError(
+            "stake_too_high", f"La apuesta máxima es de {ton(max_stake)} TON."
+        )
 
     existing = await database.get_onchain_bet(int(market_id), normalize_address(wallet["address"]))
     if existing:
@@ -263,7 +286,8 @@ async def prepare_bet(user_id: int, market_id: int, option: int, stake: int) -> 
 
     options = {int(o["idx"]): o["label"] for o in market.get("options", [])}
     label = options.get(int(option), f"Opción {int(option) + 1}")
-    attached = int(stake) + BET_GAS_NANO
+    gas = bet_gas_nano()
+    attached = int(stake) + gas
     tx = _prepared(
         build_place_bet(int(market_id), int(option), int(stake)),
         amount=attached,
@@ -275,7 +299,7 @@ async def prepare_bet(user_id: int, market_id: int, option: int, stake: int) -> 
             "option_label": label,
             "stake": str(int(stake)),
             "stake_ton": ton(int(stake)),
-            "gas": str(BET_GAS_NANO),
+            "gas": str(gas),
             "market_title": market["title"],
         },
     )
@@ -310,7 +334,7 @@ async def prepare_claim(user_id: int, market_id: int) -> PreparedTx:
     estimate = estimate_payout(bet, market)
     tx = _prepared(
         build_claim_payout(int(market_id)),
-        amount=CLAIM_GAS_NANO,
+        amount=claim_gas_nano(),
         kind="claim_payout",
         summary=f"Reclamar pago del mercado #{int(market_id)}",
         details={
@@ -339,8 +363,52 @@ def estimate_payout(bet: Dict[str, Any], market: Dict[str, Any]) -> int:
     if int(bet_option) != int(winning_option):
         return 0
     fee_bps = int(market.get("fee_bps") or 0)
-    distributable = total - (total * fee_bps) // 10_000
-    return (stake * distributable) // winning_pool
+    return economics.payout(stake, economics.distributable(total, fee_bps), winning_pool)
+
+
+async def quote_payout(market_id: int, option: int, stake: int) -> Dict[str, Any]:
+    """Pago estimado de una apuesta nueva, calculado **solo** aquí (F-03).
+
+    La Mini App no reimplementa la fórmula pari-mutuel: pide este *quote* y se
+    limita a formatear lo que devuelve el backend, que es la misma función que
+    usa la liquidación de puntos y que el contrato.
+    """
+    settings = config.get_settings()
+    stake = int(stake)
+    if stake <= 0:
+        raise MarketError("bad_amount", "Escribe un importe mayor que cero.")
+    if stake < settings.min_stake_nano:
+        raise MarketError(
+            "stake_too_low", f"La apuesta mínima es de {ton(settings.min_stake_nano)} TON."
+        )
+    if stake > settings.max_stake_nano:
+        raise MarketError(
+            "stake_too_high", f"La apuesta máxima es de {ton(settings.max_stake_nano)} TON."
+        )
+    detail = await market_detail(int(market_id))
+    if not detail.get("is_open"):
+        raise MarketError("market_closed", "Este mercado ya no acepta apuestas.")
+    if detail.get("resolving"):
+        raise MarketError(
+            "market_resolving", "Hay una resolución en curso: espera unos minutos."
+        )
+    pools = {int(item["index"]): int(item["pool"]) for item in detail["options"]}
+    if int(option) not in pools:
+        raise MarketError("bad_option", "Esa opción no existe en este mercado.")
+    total = int(detail["pool"])
+    estimated = economics.preview_payout(
+        stake, pools[int(option)], total, int(detail.get("fee_bps") or 0)
+    )
+    return {
+        "market_id": int(market_id),
+        "option": int(option),
+        "stake": str(stake),
+        "stake_ton": ton(stake),
+        "payout": str(estimated),
+        "payout_ton": ton(estimated),
+        "multiplier": economics.multiplier(total + stake, pools[int(option)] + stake,
+                                           int(detail.get("fee_bps") or 0)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +440,7 @@ async def prepare_resolve(
     await database.set_market_pending_resolve(int(market_id), now)
     return _prepared(
         build_resolve_market(int(market_id), int(winning_option)),
-        amount=ADMIN_GAS_NANO,
+        amount=admin_gas_nano(),
         kind="resolve_market",
         summary=f"Resolver #{int(market_id)} → «{label}»",
         details={
@@ -412,7 +480,7 @@ async def prepare_cancel(
     await database.set_market_pending_resolve(int(market_id), now)
     return _prepared(
         build_cancel_market(int(market_id)),
-        amount=ADMIN_GAS_NANO,
+        amount=admin_gas_nano(),
         kind="cancel_market",
         summary=f"Cancelar mercado #{int(market_id)} y habilitar reembolsos",
         details={"market_id": int(market_id), "market_title": market["title"]},
@@ -518,7 +586,7 @@ async def prepare_withdraw_fees(
         )
     return _prepared(
         build_withdraw_fees(amount),
-        amount=ADMIN_OP_GAS_NANO,
+        amount=admin_gas_nano(),
         kind="withdraw_fees",
         summary=f"Retirar {ton(amount)} TON de comisiones",
         details={
@@ -540,7 +608,7 @@ async def prepare_set_fee(user_id: int, fee_bps: int) -> PreparedTx:
         )
     return _prepared(
         build_set_fee(bps),
-        amount=ADMIN_OP_GAS_NANO,
+        amount=admin_gas_nano(),
         kind="set_fee",
         summary=f"Cambiar la comisión a {bps / 100:.2f} %",
         details={"fee_bps": bps, "fee_percent": round(bps / 100, 2)},
@@ -553,7 +621,7 @@ async def prepare_set_paused(user_id: int, paused: bool) -> PreparedTx:
     flag = bool(paused)
     return _prepared(
         build_set_paused(flag),
-        amount=ADMIN_OP_GAS_NANO,
+        amount=admin_gas_nano(),
         kind="set_paused",
         summary="Pausar el contrato" if flag else "Reanudar el contrato",
         details={"paused": flag},
@@ -580,7 +648,7 @@ async def prepare_change_admin(user_id: int, new_address: str) -> PreparedTx:
         raise MarketError("same_admin", "Esa ya es la dirección administradora.")
     return _prepared(
         build_change_admin(target),
-        amount=ADMIN_OP_GAS_NANO,
+        amount=admin_gas_nano(),
         kind="change_admin",
         summary=f"Transferir la administración a {to_friendly(target)}",
         details={"new_admin": to_friendly(target), "new_admin_raw": target},
@@ -603,10 +671,11 @@ def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
     total_pool = int(market.get("pool") or market.get("total_pool") or 0)
     pools = market.get("option_pools") or {}
     options_out: List[Dict[str, Any]] = []
+    fee_bps = int(market.get("fee_bps") or 0)
     for option in market.get("options", []):
         idx = int(option["idx"])
         pool = int(pools.get(str(idx), 0))
-        multiplier = round(total_pool / pool, 4) if pool > 0 and total_pool > 0 else None
+        multiplier = economics.multiplier(total_pool, pool, fee_bps)
         options_out.append(
             {
                 "index": idx,
@@ -628,7 +697,8 @@ def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
         "pool": str(total_pool),
         "pool_ton": ton(total_pool),
         "bets": int(market.get("bets") or 0),
-        "fee_bps": int(market.get("fee_bps") or 0),
+        "fee_bps": fee_bps,
+        "fee_percent": f"{fee_bps / 100:.2f}",
         "options": options_out,
         "seconds_left": max(0, closes_at - now) if closes_at else None,
         "is_open": market.get("status") == "open"

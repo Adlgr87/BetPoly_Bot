@@ -22,6 +22,9 @@
     sheetMode: 'bet',
     verifying: false,
     pollTimer: null,
+    quote: null,
+    quoteSeq: 0,
+    quoteTimer: null,
   };
 
   let tonConnectUI = null;
@@ -192,7 +195,7 @@
       ? 'Mercados no-custodiales en TON'
       : 'Modo puntos (sin dinero real)';
     const gas = $('#create-gas');
-    if (gas) gas.textContent = cfg.create_gas_ton || '0.05';
+    if (gas) gas.textContent = cfg.create_gas_ton || '—';
     $('#escrow-label').textContent = cfg.escrow_address
       ? `Escrow: ${short(cfg.escrow_address, 6)}`
       : 'Escrow: no configurado';
@@ -606,6 +609,7 @@
         <label>Importe a apostar (TON)
           <div class="amount-row">
             <input id="bet-amount" type="number" inputmode="decimal" min="0" step="0.1"
+                   max="${esc(state.config.max_stake_ton || '')}"
                    placeholder="${esc(state.config.min_stake_ton)}" />
           </div>
         </label>
@@ -664,23 +668,53 @@
     }
     const option = state.selection.option;
     const amount = Number(state.selection.amount || 0);
-    const optionData = market.options.find((o) => o.index === option);
-    const total = Number(market.pool_ton || 0);
-    const pool = optionData ? Number(optionData.pool_ton || 0) : 0;
-    const potential = option != null && amount > 0 && total + amount > 0
-      ? (amount * (total + amount)) / (pool + amount)
-      : 0;
     if (option == null) {
       summary.textContent = 'Elige una opción.';
       confirm.disabled = true;
     } else if (!(amount >= Number(state.config.min_stake_ton))) {
       summary.textContent = `Escribe al menos ${state.config.min_stake_ton} TON.`;
       confirm.disabled = true;
+    } else if (!state.quote) {
+      // La economía la calcula el backend (/quote): aquí solo se formatea.
+      summary.textContent = 'Calculando el pago potencial…';
+      confirm.disabled = false;
     } else {
-      summary.innerHTML = `Pago potencial ≈ <b>${fmtTon(potential)} TON</b> · `
+      summary.innerHTML = `Pago potencial ≈ <b>${fmtTon(state.quote.payout_ton)} TON</b> · `
         + `se enviarán <b>${fmtTon(amount + Number(state.config.bet_gas_ton))} TON</b> (incluye gas).`;
       confirm.disabled = false;
     }
+  }
+
+  function scheduleQuote() {
+    clearTimeout(state.quoteTimer);
+    state.quote = null;
+    state.quoteTimer = setTimeout(requestQuote, 250);
+  }
+
+  async function requestQuote() {
+    const market = state.market;
+    const option = state.selection.option;
+    const amount = Number(state.selection.amount || 0);
+    if (!market || option == null || !(amount > 0)) {
+      state.quote = null;
+      updateSheetSummary();
+      return;
+    }
+    const seq = state.quoteSeq + 1;
+    state.quoteSeq = seq;
+    const stake = encodeURIComponent(state.selection.amount);
+    try {
+      const quote = await api(
+        `/api/markets/${market.market_id}/quote?option=${option}&stake_ton=${stake}`,
+        { auth: false },
+      );
+      if (seq !== state.quoteSeq) return;
+      state.quote = quote;
+    } catch (error) {
+      if (seq !== state.quoteSeq) return;
+      state.quote = null;
+    }
+    updateSheetSummary();
   }
 
   /* -------------------------------------------------------------- flows */
@@ -775,8 +809,9 @@
       return;
     }
     const closesAt = Math.floor(new Date(closeValue).getTime() / 1000);
-    if (!isFinite(closesAt) || closesAt < Math.floor(Date.now() / 1000) + 900) {
-      toast('El cierre debe ser al menos 15 minutos en el futuro.', 'error');
+    const minMinutes = Number(state.config.min_market_duration_min || 15);
+    if (!isFinite(closesAt) || closesAt < Math.floor(Date.now() / 1000) + minMinutes * 60) {
+      toast(`El cierre debe ser al menos ${minMinutes} minutos en el futuro.`, 'error');
       return;
     }
     busy(true);
@@ -1108,6 +1143,7 @@
         document.querySelectorAll('[data-pick-option]').forEach((el) => {
           el.classList.toggle('selected', el === pick);
         });
+        scheduleQuote();
         updateSheetSummary();
         return;
       }
@@ -1125,6 +1161,7 @@
         const input = $('#bet-amount');
         if (input) input.value = quick.dataset.quick;
         state.selection.amount = quick.dataset.quick;
+        scheduleQuote();
         updateSheetSummary();
         return;
       }
@@ -1139,6 +1176,7 @@
     document.addEventListener('input', (event) => {
       if (event.target && event.target.id === 'bet-amount') {
         state.selection.amount = event.target.value;
+        scheduleQuote();
         updateSheetSummary();
       }
     });

@@ -153,10 +153,11 @@ otro usuario NO puede vincularla ❌ -> "Esta wallet ya está vinculada a otra c
 `README.md:281` marca **F010 Modo grupo ✅**. Las predicciones sí se guardan por `chat_id` (`bot/database.py:169`, `predictions.py:71`), pero el paso del importe es un `MessageHandler` global restringido a privado: `main.py:324` (`filters.ChatType.PRIVATE`). La conversación además se declara `per_user=True, per_chat=False` (`predictions.py:534`).
 **Impacto:** en un grupo el flujo muere justo antes de apostar, y el estado de la conversación puede cruzarse entre chats del mismo usuario.
 
-### F-03 — 🟠 Los multiplicadores que ve el usuario no descuentan la comisión
+### F-03 — ✅ Los multiplicadores que ve el usuario no descuentan la comisión
 `bot/handlers/markets.py:111` usa `total / pool`; `bot/markets.py:397` publica `multiplier` igual; `web/static/app.js:660-661` calcula el «Pago potencial» sin fee.
 En cambio `estimate_payout` sí aplica `fee_bps` (`bot/markets.py:322`) y el contrato también.
 **Impacto:** la UI promete ~2 % más de lo que el contrato pagará (con `FEE_BPS=200`). Cuatro implementaciones distintas de la misma fórmula pari-mutuel en cuatro lenguajes.
+**Resuelto (Fase 4):** la fórmula vive solo en `bot/economics.py`; `bot/database.py`, `bot/markets.py` y `bot/handlers/markets.py` la importan, la Mini App pide `GET /api/markets/{id}/quote` y `contracts/vectors/economics.json` fija vectores compartidos con `contracts/tests/escrow.test.js`.
 
 ### F-04 — 🟠 No existe notificación de resolución a los apostadores
 `README.md:278` marca **F007 «Recordatorios de cierre y notificación de resolución» ✅**. Hay recordatorio de cierre (`main.py:331`, `job_reminders`), pero al liquidar una predicción **nadie avisa a los usuarios**: `settle_prediction` (`bot/database.py:606`) no envía mensajes y el resumen solo lo ve el administrador (`bot/handlers/admin.py:233`).
@@ -256,6 +257,14 @@ Es el módulo con más condicionales de presentación y el menos probado; `back_
 
 ## 6. Valores hardcodeados (H)
 
+**Estado: H-\* cerrado en la Fase 4.** El gas por operación, el tope de apuesta,
+las ventanas de creación y el TTL de firma son ahora campos de `Settings`
+(`BET_GAS_NANO`, `CREATE_GAS_NANO`, `ADMIN_GAS_NANO`, `CLAIM_GAS_NANO`,
+`MAX_STAKE_NANO`, `MIN_MARKET_DURATION_MIN`, `MAX_MARKET_DURATION_DAYS`,
+`TX_TTL_SECONDS`) y `/api/config` los publica en TON para la Mini App. Un test
+(`tests/test_economics.py::TestNoMoneyLiterals`) falla si los literales vuelven al
+código. La tabla siguiente conserva el diagnóstico original.
+
 No se encontraron secretos, mnemónicos ni direcciones hardcodeadas. Lo que sí está incrustado:
 
 | Constante | Ubicación | Comentario |
@@ -347,7 +356,7 @@ Es exactamente donde están F-01, F-02, F-04 y S-06: los defectos se concentran 
 | U-02 | El ejemplo de fecha de cierre es `25/12/2025`, ya pasada, y el validador la rechazaría | `bot/handlers/predictions.py:400, 413` |
 | U-03 | El estado vacío invita a «consultar los resueltos con /mercados», el mismo comando que se acaba de usar (y no existe filtro de resueltos) | `bot/handlers/markets.py:49` |
 | U-04 | El panel admin lista `predictions[:8]` pero el teclado renderiza todas | `bot/handlers/admin.py:75` vs `bot/keyboards.py:201-212` |
-| U-05 | «Pago por punto apostado» mezcla puntos con formato de multiplicador `x…` en el mismo bloque | `bot/handlers/admin.py:175-181` |
+| ~~U-05~~ | ✅ «Pago por punto apostado» mezcla puntos con formato de multiplicador `x…` en el mismo bloque. Resuelto en Fase 4: la confirmación habla de «puntos por punto apostado» y del reintegro cuando no hay ganadores | `bot/handlers/admin.py` |
 | U-06 | `help.py` promete `/admin` y `/ranking` a todos, aunque el panel esté restringido | `bot/handlers/help.py:32-34` |
 
 ---
