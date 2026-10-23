@@ -136,7 +136,7 @@ El *admin on-chain* debe ser una wallet que controles a mano: es la única que p
 ```dotenv
 BET_MODE=hybrid
 ESCROW_ADDRESS=EQ…        # dirección impresa por deploy.js
-ESCROW_ADMIN_ADDRESS=EQ…  # informativo
+ESCROW_ADMIN_ADDRESS=EQ…  # admin on-chain: se usa para avisar si tu wallet no es la correcta
 PUBLIC_BASE_URL=https://tu-dominio   # https obligatorio (Telegram + TON Connect)
 TON_PROOF_DOMAIN=tu-dominio
 SECRET_KEY=<32+ bytes aleatorios>
@@ -171,6 +171,11 @@ Todas las rutas devuelven `{"ok": true, "data": …}` o `{"ok": false, "error": 
 | POST | `/api/markets/{id}/claim/prepare` | Transacción sin firmar para cobrar |
 | POST | `/api/admin/markets/{id}/resolve/prepare` | Resolución (solo admin) |
 | POST | `/api/admin/markets/{id}/cancel/prepare` | Cancelación (solo admin) |
+| GET | `/api/admin/contract` | Estado on-chain del escrow (solo admin, caché 30 s) |
+| POST | `/api/admin/contract/withdraw/prepare` | Retirar comisiones acumuladas (solo admin) |
+| POST | `/api/admin/contract/set-fee/prepare` | Cambiar la comisión, `fee_bps`/`percent` (solo admin) |
+| POST | `/api/admin/contract/set-paused/prepare` | Pausar o reanudar (solo admin) |
+| POST | `/api/admin/contract/change-admin/prepare` | Transferir la administración (solo admin) |
 | GET | `/api/indexer` | Cursor, últimas transacciones y estado del índice |
 
 Las sesiones viajan en la cabecera `X-Session`. El backend **nunca** devuelve una transacción firmada.
@@ -260,6 +265,45 @@ Dos suites son *guardarraíles* y no pruebas funcionales:
   handler, builders on-chain inalcanzables y comandos prometidos en `/help`.
   Los huérfanos conocidos viven en un baseline que solo puede encogerse.
 
+### Administración del contrato (Fase 2)
+
+El contrato expone siete *getters* (`get_fee_bps`, `get_paused`, `get_fees`,
+`get_total_locked`, `get_market_count`, `get_min_stake`, `get_market_data`).
+`bot/chain/escrow_state.py` los lee con `runGetMethod` y los sirve como una sola
+foto (`EscrowState`) cacheada **30 s**, con *stale-while-error*: si la cadena no
+responde se sigue mostrando la última lectura buena marcada como `stale`.
+
+Las cuatro operaciones de administración (`withdraw_fees`, `set_fee`,
+`set_paused`, `change_admin`) se preparan **sin firmar** en `bot/markets.py`,
+con validaciones previas al envío:
+
+- `withdraw_fees`: `0 < importe ≤ fees` (el contrato solo deja salir comisiones;
+  los fondos de usuarios están bloqueados on-chain).
+- `set_fee`: `0 ≤ fee_bps ≤ 1000` (0–10 %).
+- `change_admin`: dirección válida, distinta de la actual y no cero.
+- Si `ESCROW_ADMIN_ADDRESS` está definida, se avisa y se rechaza la preparación
+  cuando la wallet vinculada del administrador no coincide con ella: es mejor
+  fallar antes de firmar que gastar gas en una transacción condenada a `401`.
+
+Cada acción se confirma dos veces: en el bot (botón “Confirmar” con el valor en
+el estado de la conversación) o en la Mini App (`confirm()` nativo) y después en
+la wallet del administrador. `ESCROW_ADMIN_ADDRESS` no concede permisos: el
+contrato decide, la configuración solo sirve para avisar.
+
+### Runbook de operación (testnet primero)
+
+1. Despliega con `scripts/deploy.js` y anota `codeHash` y la dirección del
+   escrow; pon esa dirección en `ESCROW_ADDRESS` y la wallet que controlarás en
+   `ESCROW_ADMIN_ADDRESS`.
+2. Abre `/admin` → **⚙️ Contrato escrow** y comprueba el estado: si dice
+   «tu wallet no es la administradora», no sigas: la firma sería rechazada.
+3. Prueba con importes pequeños: `set_fee` → `set_paused`/reanudar → un mercado
+   de prueba → `withdraw_fees` por el importe exacto de las comisiones.
+4. Verifica cada transacción en el explorador (`to` = escrow, `op` = `0x1A0A…`)
+   antes de repetir en mainnet.
+
+`withdraw_fees` mueve TON real: empieza siempre en testnet.
+
 ### Resiliencia del indexador
 
 Si una transacción falla al aplicarse, el cursor **no avanza** sobre ella: se
@@ -281,7 +325,7 @@ envenenada no detenga el resto del flujo. El estado se ve en `/api/indexer`
 | `/crear` | Crear una predicción de puntos (3 pasos) |
 | `/misbets` | Perfil, apuestas y rendimiento |
 | `/ranking` | Top 10 por puntos |
-| `/admin` | Panel de administrador (resolver, cancelar, on-chain) |
+| `/admin` | Panel de administrador (resolver, cancelar, estado y operaciones del contrato) |
 | `/help` | Ayuda |
 | `/cancelar` | Cancelar la operación en curso |
 

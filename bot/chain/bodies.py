@@ -95,6 +95,16 @@ class MessageBody:
     def name(self) -> str:
         return OP_NAMES.get(self.op, f"0x{self.op:08x}")
 
+    @property
+    def admin_fee_bps(self) -> Optional[int]:
+        """``set_fee`` payload: the contract stores the fee as ``uint16`` bps."""
+        return self.amount if self.op == OP_SET_FEE else None
+
+    @property
+    def paused_flag(self) -> Optional[bool]:
+        """``set_paused`` payload: ``uint8`` 1/0."""
+        return None if self.flag is None else bool(self.flag)
+
 
 def title_to_hash(title: str) -> str:
     """Deterministic 256-bit commitment of a market title."""

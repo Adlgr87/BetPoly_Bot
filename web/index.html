@@ -101,6 +101,54 @@
           (la del administrador) la firma.
         </p>
         <div id="admin-markets" class="list"></div>
+
+        <div class="card">
+          <div class="row-between">
+            <h3>Contrato escrow</h3>
+            <button id="contract-refresh" class="icon-btn" type="button" title="Actualizar">⟳</button>
+          </div>
+          <div id="contract-state" class="muted small">Cargando estado…</div>
+
+          <form id="contract-withdraw-form" class="form">
+            <label>
+              Retirar comisiones (TON)
+              <input id="contract-withdraw-amount" type="number" min="0" step="0.01" required />
+            </label>
+            <button class="primary" type="submit">Retirar comisiones</button>
+            <p class="hint muted small">
+              Solo se pueden retirar las comisiones acumuladas. El contrato nunca
+              permite sacar los fondos de los usuarios.
+            </p>
+          </form>
+
+          <form id="contract-fee-form" class="form">
+            <label>
+              Comisión de la plataforma (%)
+              <input id="contract-fee-percent" type="number" min="0" max="10" step="0.01" required />
+            </label>
+            <button class="ghost" type="submit">Cambiar comisión</button>
+            <p class="hint muted small">Aplica solo a los mercados creados a partir de ahora.</p>
+          </form>
+
+          <form id="contract-admin-form" class="form">
+            <label>
+              Nueva dirección administradora
+              <input id="contract-admin-address" type="text" placeholder="EQ… o 0:hex" required />
+            </label>
+            <button class="ghost" type="submit">Transferir administración</button>
+            <p class="hint muted small">
+              ⚠️ Irreversible: si pierdes esa wallet, pierdes el control del contrato.
+            </p>
+          </form>
+
+          <button id="contract-pause" class="ghost" type="button">Pausar contrato</button>
+          <p class="muted small">
+            Pausado: nadie puede crear mercados ni apostar. Resolver, cancelar y
+            reclamar pagos siguen funcionando. Cada acción se firma en tu wallet:
+            el backend nunca tiene llaves.
+          </p>
+        </div>
+
         <div class="card">
           <h3>Estado del indexador</h3>
           <pre id="indexer-status" class="mono small">—</pre>

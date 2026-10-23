@@ -20,6 +20,7 @@ const OP = {
   claimPayout: 0x1a0a0005,
   setPaused: 0x1a0a0101,
   setFee: 0x1a0a0102,
+  changeAdmin: 0x1a0a0103,
   withdrawFees: 0x1a0a0104,
 };
 
@@ -76,6 +77,8 @@ const body = {
     beginCell().storeUint(OP.claimPayout, 32).storeUint(marketId, 32).endCell(),
   setPaused: (value) => beginCell().storeUint(OP.setPaused, 32).storeUint(value, 8).endCell(),
   setFee: (bps) => beginCell().storeUint(OP.setFee, 32).storeUint(bps, 16).endCell(),
+  changeAdmin: (address) =>
+    beginCell().storeUint(OP.changeAdmin, 32).storeAddress(address).endCell(),
   withdrawFees: (amount) =>
     beginCell().storeUint(OP.withdrawFees, 32).storeCoins(amount).endCell(),
 };
@@ -462,6 +465,29 @@ async function main() {
     'balance must always cover accrued fees',
   );
   step('accounting invariant holds (locked = 0, balance ≥ fees)');
+
+  // -------------------------------------------------------- change admin
+  // El contrato no expone get_admin: la prueba observable es que el admin
+  // anterior deja de poder operar y el nuevo sí puede.
+  const nextAdmin = await blockchain.treasury('admin2');
+  okExit(
+    await admin.send({
+      to: address,
+      value: toNano('0.01'),
+      body: body.changeAdmin(nextAdmin.address),
+    }),
+  );
+  step('admin can transfer administration');
+
+  failedWith(
+    await admin.send({ to: address, value: toNano('0.01'), body: body.setFee(150) }),
+    401,
+  );
+  okExit(
+    await nextAdmin.send({ to: address, value: toNano('0.01'), body: body.setFee(150) }),
+  );
+  assert.strictEqual(await getNumber(blockchain, address, 'get_fee_bps'), 150);
+  step('former admin loses control and the new one takes over');
 
   console.log(`\n${passed} checks passed ✅\n`);
 }

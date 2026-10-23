@@ -24,14 +24,19 @@ from bot import database
 from bot.chain.addresses import AddressError, normalize_address, to_friendly
 from bot.chain.bodies import (
     build_cancel_market,
+    build_change_admin,
     build_claim_payout,
     build_create_market,
     build_place_bet,
     build_resolve_market,
+    build_set_fee,
+    build_set_paused,
+    build_withdraw_fees,
     payload_b64,
     payload_b64url,
     title_to_hash,
 )
+from bot.chain.escrow_state import EscrowState, EscrowStateCache
 from bot.formatting import ton
 
 logger = logging.getLogger(__name__)
@@ -50,6 +55,13 @@ TX_TTL = 300                       # 5 minutes to sign
 # While a resolution is prepared and pending on-chain, new bets are refused:
 # they would be rejected by the contract and the user would pay gas for nothing.
 RESOLVE_WINDOW_SECONDS = 15 * 60
+
+#: The contract caps the fee at 10 %; mirrored here to fail before signing.
+MAX_FEE_BPS = 1000
+#: Gas every admin operation must attach (it funds the event message).
+ADMIN_OP_GAS_NANO = ADMIN_GAS_NANO
+
+_escrow_state_cache = EscrowStateCache()
 
 
 class MarketError(ValueError):
@@ -404,6 +416,174 @@ async def prepare_cancel(
         kind="cancel_market",
         summary=f"Cancelar mercado #{int(market_id)} y habilitar reembolsos",
         details={"market_id": int(market_id), "market_title": market["title"]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# escrow administration (the backend never signs: it only prepares)
+# ---------------------------------------------------------------------------
+
+def _require_admin(user_id: int) -> None:
+    if int(user_id) not in config.get_settings().admin_ids:
+        raise MarketError("forbidden", "Solo un administrador puede operar el contrato.")
+
+
+def _configured_admin() -> Optional[str]:
+    """Admin advertised by configuration (the contract has no getter for it)."""
+    return config.get_settings().escrow_admin_address or None
+
+
+def _assert_signing_wallet_is_admin(wallet: Optional[Dict[str, Any]]) -> None:
+    """Fail *before* signing when the operator's wallet is not the contract admin.
+
+    Only enforced when ``ESCROW_ADMIN_ADDRESS`` is configured: without it there
+    is nothing to compare against, and guessing would block legitimate operators.
+    """
+    expected = _configured_admin()
+    if not expected or not wallet:
+        return
+    if normalize_address(wallet["address"]) != normalize_address(expected):
+        raise MarketError(
+            "wallet_not_admin",
+            "Tu wallet vinculada no es la administradora del contrato. "
+            "Firmar esta transacción fallaría en la cadena.",
+        )
+
+
+async def _admin_wallet(user_id: int) -> Dict[str, Any]:
+    _require_admin(user_id)
+    wallet = await require_linked_wallet(user_id)
+    _assert_signing_wallet_is_admin(wallet)
+    return wallet
+
+
+def escrow_state_cache() -> EscrowStateCache:
+    """Exposed so tests and the bot can force a refresh."""
+    return _escrow_state_cache
+
+
+async def escrow_state(
+    client: Optional[Any] = None, *, force: bool = False
+) -> EscrowState:
+    """Current contract state, served from a 30 s cache (see escrow_state.py)."""
+    if not config.get_settings().escrow_enabled:
+        raise MarketError(
+            "escrow_disabled",
+            "El contrato escrow no está habilitado en esta instancia.",
+        )
+    from bot.chain.toncenter import TonCenterClient  # flat import graph
+
+    address = escrow_address()
+    admin = _configured_admin()
+    if client is not None:
+        return await _read_state(client, address, admin, force)
+    owned = TonCenterClient()
+    try:
+        return await _read_state(owned, address, admin, force)
+    finally:
+        await owned.close()
+
+
+async def _read_state(
+    client: Any, address: str, admin: Optional[str], force: bool
+) -> EscrowState:
+    """Translate chain failures into one domain error (handlers never see the chain)."""
+    from bot.chain.toncenter import TonApiError
+
+    try:
+        return await _escrow_state_cache.get(
+            client, address, admin=admin, force=force
+        )
+    except TonApiError as exc:
+        raise MarketError(
+            "chain_unavailable",
+            "La cadena no respondió. Inténtalo de nuevo en unos segundos.",
+        ) from exc
+
+
+async def prepare_withdraw_fees(
+    user_id: int, amount_nano: int, *, state: Optional[EscrowState] = None
+) -> PreparedTx:
+    """Withdraw accrued fees. Never touches user funds: the contract enforces it."""
+    wallet = await _admin_wallet(user_id)
+    state = state or await escrow_state()
+    amount = int(amount_nano)
+    if amount <= 0:
+        raise MarketError("bad_amount", "El importe debe ser mayor que cero.")
+    available = state.max_withdrawable_nano
+    if amount > available:
+        raise MarketError(
+            "amount_too_high",
+            f"Solo hay {ton(available)} TON de comisiones acumuladas.",
+        )
+    return _prepared(
+        build_withdraw_fees(amount),
+        amount=ADMIN_OP_GAS_NANO,
+        kind="withdraw_fees",
+        summary=f"Retirar {ton(amount)} TON de comisiones",
+        details={
+            "amount": str(amount),
+            "amount_ton": ton(amount),
+            "available_ton": ton(available),
+            "admin_wallet": wallet["address"],
+        },
+    )
+
+
+async def prepare_set_fee(user_id: int, fee_bps: int) -> PreparedTx:
+    """Change the platform fee. Applies to markets created afterwards."""
+    await _admin_wallet(user_id)
+    bps = int(fee_bps)
+    if not 0 <= bps <= MAX_FEE_BPS:
+        raise MarketError(
+            "bad_fee", f"La comisión debe estar entre 0 y {MAX_FEE_BPS} puntos base (0–10 %)."
+        )
+    return _prepared(
+        build_set_fee(bps),
+        amount=ADMIN_OP_GAS_NANO,
+        kind="set_fee",
+        summary=f"Cambiar la comisión a {bps / 100:.2f} %",
+        details={"fee_bps": bps, "fee_percent": round(bps / 100, 2)},
+    )
+
+
+async def prepare_set_paused(user_id: int, paused: bool) -> PreparedTx:
+    """Pause/unpause the contract. Resolutions and claims keep working when paused."""
+    await _admin_wallet(user_id)
+    flag = bool(paused)
+    return _prepared(
+        build_set_paused(flag),
+        amount=ADMIN_OP_GAS_NANO,
+        kind="set_paused",
+        summary="Pausar el contrato" if flag else "Reanudar el contrato",
+        details={"paused": flag},
+    )
+
+
+def normalize_admin_address(value: str) -> str:
+    """Validate a TON address for ``change_admin`` and return it raw (``0:hex``)."""
+    try:
+        target = normalize_address(str(value or "").strip())
+    except (AddressError, ValueError) as exc:
+        raise MarketError("bad_address", "La dirección no es válida.") from exc
+    if int(target.split(":")[1], 16) == 0:
+        raise MarketError("bad_address", "No se puede usar la dirección cero.")
+    return target
+
+
+async def prepare_change_admin(user_id: int, new_address: str) -> PreparedTx:
+    """Transfer contract administration. Irreversible: double-check the address."""
+    await _admin_wallet(user_id)
+    target = normalize_admin_address(new_address)
+    current = _configured_admin()
+    if current and target == normalize_address(current):
+        raise MarketError("same_admin", "Esa ya es la dirección administradora.")
+    return _prepared(
+        build_change_admin(target),
+        amount=ADMIN_OP_GAS_NANO,
+        kind="change_admin",
+        summary=f"Transferir la administración a {to_friendly(target)}",
+        details={"new_admin": to_friendly(target), "new_admin_raw": target},
     )
 
 

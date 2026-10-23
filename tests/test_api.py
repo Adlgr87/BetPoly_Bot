@@ -348,6 +348,219 @@ class TestMarketsApi:
         assert "indexer" in data
 
 
+class TestAdminContract:
+    """Fase 2: endpoints del contrato (el backend prepara, la wallet firma)."""
+
+    @staticmethod
+    def _tx(kind="set_fee"):
+        from bot.markets import PreparedTx
+
+        return PreparedTx(
+            to="EQ" + "A" * 46,
+            amount=50_000_000,
+            payload="te6ccgEBAQEAAgAAAA==",
+            kind=kind,
+            valid_until=int(time.time()) + 300,
+            summary="Resumen",
+            deeplink="https://app.tonkeeper.com/transfer/EQ",
+            details={"ok": True},
+        )
+
+    @staticmethod
+    def _state():
+        from bot.chain.escrow_state import EscrowState
+
+        return EscrowState(
+            address="0:" + "ab" * 32,
+            fee_bps=250,
+            min_stake_nano=100_000_000,
+            paused=False,
+            total_locked_nano=1000,
+            fees_nano=400,
+            market_count=3,
+            balance_nano=1400,
+            admin="0:" + "cd" * 32,
+        )
+
+    async def test_state_is_admin_only(self, client, db, monkeypatch):
+        monkeypatch.setattr(api.markets, "escrow_state", lambda **kw: _async(self._state()))
+        _, headers = await session_for(client, USER)
+        response = await client.get("/api/admin/contract", headers=headers)
+        assert response.status == 403
+
+    async def test_state_returns_the_snapshot(self, client, db, monkeypatch):
+        monkeypatch.setattr(api.markets, "escrow_state", lambda **kw: _async(self._state()))
+        _, headers = await session_for(client, ADMIN)
+        response = await client.get("/api/admin/contract", headers=headers)
+        assert response.status == 200, await response.text()
+        data = (await response.json())["data"]
+        assert data["fee_bps"] == 250
+        assert data["fee_percent"] == "2.50"
+        assert data["max_withdrawable_nano"] == "400"
+        assert data["is_paused"] is False
+        assert data["admin_matches_wallet"] is None  # admin sin wallet vinculada
+
+    async def test_withdraw_prepares_the_amount(self, client, db, monkeypatch):
+        captured = {}
+
+        async def fake(user_id, amount):
+            captured.update({"user_id": user_id, "amount": amount})
+            return self._tx("withdraw_fees")
+
+        monkeypatch.setattr(api.markets, "prepare_withdraw_fees", fake)
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/withdraw/prepare", headers=headers, json={"amount": "1.5"}
+        )
+        assert response.status == 200, await response.text()
+        assert captured == {"user_id": ADMIN["id"], "amount": 1_500_000_000}
+        assert (await response.json())["data"]["kind"] == "withdraw_fees"
+
+    async def test_withdraw_rejects_a_bad_amount(self, client, db):
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/withdraw/prepare", headers=headers, json={"amount": "nada"}
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "bad_amount"
+
+    async def test_withdraw_is_admin_only(self, client, db):
+        _, headers = await session_for(client, USER)
+        response = await client.post(
+            "/api/admin/contract/withdraw/prepare", headers=headers, json={"amount": "1"}
+        )
+        assert response.status == 403
+
+    async def test_set_fee_accepts_percent(self, client, db, monkeypatch):
+        captured = {}
+
+        async def fake(user_id, fee_bps):
+            captured["fee_bps"] = fee_bps
+            return self._tx("set_fee")
+
+        monkeypatch.setattr(api.markets, "prepare_set_fee", fake)
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/set-fee/prepare", headers=headers, json={"percent": "2,5"}
+        )
+        assert response.status == 200, await response.text()
+        assert captured["fee_bps"] == 250
+
+        response = await client.post(
+            "/api/admin/contract/set-fee/prepare", headers=headers, json={"fee_bps": 400}
+        )
+        assert response.status == 200
+        assert captured["fee_bps"] == 400
+
+    async def test_set_fee_rejects_an_invalid_percent(self, client, db):
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/set-fee/prepare", headers=headers, json={"percent": "25"}
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "bad_fee"
+
+    async def test_set_paused_requires_a_boolean(self, client, db):
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/set-paused/prepare", headers=headers, json={"paused": "sí"}
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "bad_flag"
+
+    async def test_set_paused_prepares_the_flag(self, client, db, monkeypatch):
+        captured = {}
+
+        async def fake(user_id, paused):
+            captured["paused"] = paused
+            return self._tx("set_paused")
+
+        monkeypatch.setattr(api.markets, "prepare_set_paused", fake)
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/set-paused/prepare", headers=headers, json={"paused": True}
+        )
+        assert response.status == 200, await response.text()
+        assert captured["paused"] is True
+
+    async def test_change_admin_passes_the_address(self, client, db, monkeypatch):
+        captured = {}
+
+        async def fake(user_id, address):
+            captured["address"] = address
+            return self._tx("change_admin")
+
+        monkeypatch.setattr(api.markets, "prepare_change_admin", fake)
+        _, headers = await session_for(client, ADMIN)
+        address = "0:" + "ee" * 32
+        response = await client.post(
+            "/api/admin/contract/change-admin/prepare", headers=headers, json={"address": address}
+        )
+        assert response.status == 200, await response.text()
+        assert captured["address"] == address
+
+    async def test_domain_errors_map_to_400_and_403(self, client, db, monkeypatch):
+        from bot.markets import MarketError
+
+        async def forbidden(user_id, paused):
+            raise MarketError("forbidden", "Solo un administrador.")
+
+        async def invalid(user_id, amount):
+            raise MarketError("amount_too_high", "Solo hay 1 TON.")
+
+        monkeypatch.setattr(api.markets, "prepare_set_paused", forbidden)
+        monkeypatch.setattr(api.markets, "prepare_withdraw_fees", invalid)
+        _, headers = await session_for(client, ADMIN)
+
+        response = await client.post(
+            "/api/admin/contract/set-paused/prepare", headers=headers, json={"paused": True}
+        )
+        assert response.status == 403
+
+        response = await client.post(
+            "/api/admin/contract/withdraw/prepare", headers=headers, json={"amount": "5"}
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "amount_too_high"
+
+    async def test_no_endpoint_returns_a_signed_transaction(self, client, db, monkeypatch):
+        """El backend prepara; firmar es siempre de la wallet (invariante P1)."""
+
+        async def fake(user_id, amount):
+            return self._tx("withdraw_fees")
+
+        monkeypatch.setattr(api.markets, "prepare_withdraw_fees", fake)
+        _, headers = await session_for(client, ADMIN)
+        response = await client.post(
+            "/api/admin/contract/withdraw/prepare", headers=headers, json={"amount": "1"}
+        )
+        assert response.status == 200
+        data = (await response.json())["data"]
+        assert set(data) == {
+            "to", "amount", "amount_ton", "payload", "kind", "valid_until",
+            "summary", "deeplink", "details",
+        }
+        serialized = str(data).lower()
+        for forbidden in ("private_key", "secret", "seed", "signed_boc", "signature"):
+            assert forbidden not in serialized
+
+    async def test_chain_failure_is_reported_as_unavailable(self, client, db, monkeypatch):
+        from bot.markets import MarketError
+
+        async def down(**kwargs):
+            raise MarketError("chain_unavailable", "La cadena no respondió.")
+
+        monkeypatch.setattr(api.markets, "escrow_state", down)
+        _, headers = await session_for(client, ADMIN)
+        response = await client.get("/api/admin/contract", headers=headers)
+        assert response.status == 503
+        assert (await response.json())["error"]["code"] == "chain_unavailable"
+
+
+async def _async(value):
+    return value
+
+
 class TestHardening:
     async def test_invalid_json(self, client):
         response = await client.post(

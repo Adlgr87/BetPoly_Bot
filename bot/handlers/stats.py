@@ -20,15 +20,15 @@ MEDALS = {0: "🥇", 1: "🥈", 2: "🥉"}
 
 async def ranking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update)
-    await _send_ranking(update, context, edit=False)
+    await _send_ranking(update, context)
 
 
 async def ranking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_answer(update.callback_query)
-    await _send_ranking(update, context, edit=True)
+    await _send_ranking(update, context)
 
 
-async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     leaderboard = await database.get_leaderboard(10)
     user_id = update.effective_user.id if update.effective_user else 0
 
@@ -59,16 +59,16 @@ async def _send_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
 
 async def misbets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update)
-    await _send_profile(update, context, update.effective_user.id, edit=False)
+    await _send_profile(update, context, update.effective_user.id)
 
 
 async def my_bets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_answer(update.callback_query)
-    await _send_profile(update, context, update.callback_query.from_user.id, edit=True)
+    await _send_profile(update, context, update.callback_query.from_user.id)
 
 
 async def _send_profile(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, edit: bool
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> None:
     settings = config.get_settings()
     user_data = await database.get_user(user_id)

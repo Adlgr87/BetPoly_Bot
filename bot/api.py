@@ -13,7 +13,6 @@ The API never returns, stores or requests private keys or seed phrases.
 from __future__ import annotations
 
 import logging
-import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -27,6 +26,7 @@ from bot.chain.bodies import BodyError
 from bot.chain.ton_proof import ProofError, verify_ton_proof
 from bot.chain.toncenter import TonApiError
 from bot.formatting import ton
+from bot.parsing import parse_fee_bps, parse_nano
 
 logger = logging.getLogger(__name__)
 
@@ -94,22 +94,6 @@ def current_user(request: web.Request) -> int:
 
 def _admin(user_id: int) -> bool:
     return user_id in _settings().admin_ids
-
-
-TN_RE = re.compile(r"^(?:\d+)(?:[.,]\d{1,9})?$")
-
-
-def parse_nano(value: Any) -> int:
-    """Parse ``"1.5"`` TON (or ``1500000000`` nanoTON) into nanoTON."""
-    if isinstance(value, bool) or value is None:
-        raise markets.MarketError("bad_amount", "Importe inválido.")
-    if isinstance(value, int):
-        return value
-    raw = str(value).strip().replace(",", ".")
-    if not TN_RE.match(raw):
-        raise markets.MarketError("bad_amount", "Escribe un importe válido, por ejemplo 1.5")
-    whole, _, frac = raw.partition(".")
-    return int(whole) * 1_000_000_000 + int(frac.ljust(9, "0") or 0)
 
 
 def _wallet_view(wallet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -561,6 +545,110 @@ async def prepare_cancel(request: web.Request) -> web.Response:
     return json_ok(tx.as_dict())
 
 
+# ---------------------------------------------------------------------------
+# escrow administration (payload builders only: the wallet signs)
+# ---------------------------------------------------------------------------
+
+#: Errores del dominio que significan "no eres el administrador".
+_ADMIN_FORBIDDEN = ("forbidden", "wallet_not_admin")
+#: Errores de infraestructura (la cadena o el RPC no respondieron).
+_UNAVAILABLE = ("chain_unavailable",)
+
+
+def _escrow_admin_error(exc: Exception) -> web.Response:
+    """Map domain errors to HTTP without leaking chain details."""
+    if isinstance(exc, markets.MarketError):
+        if exc.code in _ADMIN_FORBIDDEN:
+            status = 403
+        elif exc.code in _UNAVAILABLE:
+            status = 503
+        else:
+            status = 400
+        return json_error(exc.code, str(exc), status)
+    raise exc
+
+
+def _require_web_admin(request: web.Request) -> int:
+    user_id = current_user(request)
+    if not _admin(user_id):
+        raise markets.MarketError("forbidden", "Solo un administrador puede operar el contrato.")
+    return user_id
+
+
+async def admin_contract_state(request: web.Request) -> web.Response:
+    try:
+        user_id = _require_web_admin(request)
+        force = request.query.get("refresh") in ("1", "true", "yes")
+        state = await markets.escrow_state(force=force)
+    except Exception as exc:  # noqa: BLE001 - mapped below
+        return _escrow_admin_error(exc)
+    payload = state.as_dict()
+    payload["admin_matches_wallet"] = await _admin_matches_wallet(user_id, state)
+    return json_ok(payload)
+
+
+async def _admin_matches_wallet(user_id: int, state: Any) -> Optional[bool]:
+    """Whether the linked wallet can actually sign these ops (informational)."""
+    if not state.admin:
+        return None
+    wallet = await database.get_wallet(user_id)
+    if not wallet:
+        return None
+    try:
+        return normalize_address(wallet["address"]) == normalize_address(state.admin)
+    except (AddressError, ValueError):
+        return None
+
+
+async def admin_contract_withdraw(request: web.Request) -> web.Response:
+    try:
+        user_id = _require_web_admin(request)
+        data = await read_json(request)
+        amount = parse_nano(data.get("amount"), field="importe")
+        tx = await markets.prepare_withdraw_fees(user_id, amount)
+    except Exception as exc:  # noqa: BLE001 - mapped below
+        return _escrow_admin_error(exc)
+    return json_ok(tx.as_dict())
+
+
+async def admin_contract_set_fee(request: web.Request) -> web.Response:
+    try:
+        user_id = _require_web_admin(request)
+        data = await read_json(request)
+        if data.get("fee_bps") is not None:
+            fee_bps = int(data["fee_bps"])
+        else:
+            fee_bps = parse_fee_bps(data.get("percent"))
+        tx = await markets.prepare_set_fee(user_id, fee_bps)
+    except (TypeError, ValueError):
+        return json_error("bad_fee", "fee_bps debe ser un entero.", 400)
+    except Exception as exc:  # noqa: BLE001 - mapped below
+        return _escrow_admin_error(exc)
+    return json_ok(tx.as_dict())
+
+
+async def admin_contract_set_paused(request: web.Request) -> web.Response:
+    try:
+        user_id = _require_web_admin(request)
+        data = await read_json(request)
+        if not isinstance(data.get("paused"), bool):
+            return json_error("bad_flag", "paused debe ser true o false.", 400)
+        tx = await markets.prepare_set_paused(user_id, data["paused"])
+    except Exception as exc:  # noqa: BLE001 - mapped below
+        return _escrow_admin_error(exc)
+    return json_ok(tx.as_dict())
+
+
+async def admin_contract_change_admin(request: web.Request) -> web.Response:
+    try:
+        user_id = _require_web_admin(request)
+        data = await read_json(request)
+        tx = await markets.prepare_change_admin(user_id, str(data.get("address") or ""))
+    except Exception as exc:  # noqa: BLE001 - mapped below
+        return _escrow_admin_error(exc)
+    return json_ok(tx.as_dict())
+
+
 async def indexer_status(request: web.Request) -> web.Response:
     user_id = current_user(request)
     status = await database.get_indexer_status()
@@ -661,6 +749,11 @@ def create_app(ton_client: Any = None) -> web.Application:
     app.router.add_post("/api/markets/{market_id}/claim/prepare", prepare_claim)
     app.router.add_post("/api/admin/markets/{market_id}/resolve/prepare", prepare_resolve)
     app.router.add_post("/api/admin/markets/{market_id}/cancel/prepare", prepare_cancel)
+    app.router.add_get("/api/admin/contract", admin_contract_state)
+    app.router.add_post("/api/admin/contract/withdraw/prepare", admin_contract_withdraw)
+    app.router.add_post("/api/admin/contract/set-fee/prepare", admin_contract_set_fee)
+    app.router.add_post("/api/admin/contract/set-paused/prepare", admin_contract_set_paused)
+    app.router.add_post("/api/admin/contract/change-admin/prepare", admin_contract_change_admin)
     app.router.add_get("/api/indexer", indexer_status)
 
     if WEB_DIR.exists():

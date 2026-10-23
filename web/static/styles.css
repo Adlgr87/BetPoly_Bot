@@ -351,3 +351,9 @@ textarea { resize: vertical; min-height: 84px; }
   .sheet { align-items: center; justify-items: center; }
   .sheet-panel { width: min(94vw, 480px); border-radius: 22px; }
 }
+
+/* ------------------------------------------------- contrato escrow (admin) */
+.contract-rows { display: grid; gap: 6px; margin: 10px 0; }
+.contract-rows > div { display: flex; justify-content: space-between; gap: 10px; }
+.contract-rows dt { color: var(--muted); font-size: 12.5px; margin: 0; }
+.contract-rows dd { margin: 0; font-size: 12.5px; font-weight: 650; text-align: right; }

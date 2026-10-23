@@ -43,10 +43,14 @@ from bot.handlers.admin import (
     admin_chain_options_callback,
     admin_chain_win_callback,
     admin_confirm_callback,
+    admin_contract_callback,
+    admin_contract_ok_callback,
+    admin_contract_pause_callback,
     admin_handler,
     admin_panel_callback,
     admin_resolve_callback,
     admin_winner_callback,
+    build_admin_contract_conversation,
 )
 from bot.handlers.common import safe_answer
 from bot.handlers.help import help_callback, help_handler, how_it_works_callback
@@ -276,6 +280,7 @@ def build_application() -> Application:
 
     # --- Conversations first: they must win over the generic text handler.
     application.add_handler(build_crear_conversation())
+    application.add_handler(build_admin_contract_conversation())
 
     # --- Commands --------------------------------------------------------
     application.add_handler(CommandHandler("start", start_handler))
@@ -316,6 +321,9 @@ def build_application() -> Application:
         (r"^admin_chain_win:\d+:\d+$", admin_chain_win_callback),
         (r"^admin_chain_cancel:\d+$", admin_chain_cancel_callback),
         (r"^admin_chain_cancel_force:\d+$", admin_chain_cancel_force_callback),
+        ("^admin_contract$", admin_contract_callback),
+        (r"^admin_contract_pause:\d+$", admin_contract_pause_callback),
+        (r"^admin_contract_ok:[a-z0-9_]+$", admin_contract_ok_callback),
     ]
     for pattern, handler in callbacks:
         application.add_handler(CallbackQueryHandler(handler, pattern=pattern))

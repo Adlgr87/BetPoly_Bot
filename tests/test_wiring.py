@@ -30,13 +30,9 @@ KNOWN_API_ORPHANS: Dict[str, str] = {
     "/api/admin/markets/{x}/cancel/prepare": "Solo alcanzable desde el bot; se cablea en la Fase 3.",
 }
 
-# Builders de cuerpo sin consumidor -> motivo y fase.
-KNOWN_BUILDER_ORPHANS: Dict[str, str] = {
-    "build_withdraw_fees": "Fase 2: panel de administración del contrato.",
-    "build_set_paused": "Fase 2: panel de administración del contrato.",
-    "build_set_fee": "Fase 2: panel de administración del contrato.",
-    "build_change_admin": "Fase 2: panel de administración del contrato.",
-}
+# Builders de cuerpo sin consumidor -> motivo y fase. Vacío desde la Fase 2:
+# el panel de administración del contrato ya usa los cuatro.
+KNOWN_BUILDER_ORPHANS: Dict[str, str] = {}
 
 
 def _normalise(path: str) -> str:

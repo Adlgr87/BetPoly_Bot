@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   lint:
-    name: Lint (ruff)
+    name: Lint (ruff + vulture)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,8 @@ jobs:
           cache: pip
       - run: pip install -r requirements-dev.txt
       - run: ruff check .
+      - name: Código muerto (vulture)
+        run: vulture bot config.py main.py scripts --min-confidence 80
 
   test:
     name: Tests (pytest + cobertura)
@@ -42,7 +44,7 @@ jobs:
           pytest \
             --cov=bot --cov=config --cov=main --cov=scripts \
             --cov-report=term-missing:skip-covered \
-            --cov-fail-under=58
+            --cov-fail-under=59
 
   contract:
     name: Contrato (build + sandbox + audit)

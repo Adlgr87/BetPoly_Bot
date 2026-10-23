@@ -95,6 +95,26 @@ def parse_transaction(raw: Dict[str, Any]) -> ChainTransaction:
     )
 
 
+def _parse_stack_entry(item: Any) -> Any:
+    """Normalise one ``runGetMethod`` stack entry.
+
+    ``["num", "0x2a"]`` -> ``42``; cells/slices stay as ``{"type", "value"}`` so a
+    caller that needs them can still use them.
+    """
+    if not isinstance(item, (list, tuple)) or not item:
+        return item
+    kind = item[0]
+    value = item[1] if len(item) > 1 else None
+    if kind == "num" and isinstance(value, str):
+        try:
+            return int(value, 16) if value.lower().startswith("0x") else int(value)
+        except ValueError:
+            return value
+    if kind == "num":
+        return value
+    return {"type": kind, "value": value}
+
+
 class TonCenterClient:
     """Thin async wrapper around toncenter v2 (and optional tonapi)."""
 
@@ -201,6 +221,30 @@ class TonCenterClient:
             except TonApiError as exc:
                 logger.debug("public key API failed for %s: %s", address, exc)
         return None
+
+    async def run_get_method(
+        self, address: str, method: str, stack: Optional[List[Any]] = None
+    ) -> List[Any]:
+        """Call a get method and return its stack, numbers as ``int``.
+
+        TON Center v2 returns numbers as hex or decimal strings, so they are
+        normalised here: callers never deal with the wire encoding.
+        """
+        payload = await self._request(
+            "POST",
+            f"{self.base_url}/runGetMethod",
+            json={"address": address, "method": method, "stack": stack or []},
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            raise TonApiError(f"Unexpected /runGetMethod payload for {method}")
+        exit_code = result.get("exit_code")
+        if exit_code not in (0, None):
+            raise TonApiError(f"get method {method} failed with exit code {exit_code}")
+        values: List[Any] = []
+        for item in result.get("stack") or []:
+            values.append(_parse_stack_entry(item))
+        return values
 
     async def get_account_state(self, address: str) -> Dict[str, Any]:
         payload = await self._request(

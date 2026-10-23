@@ -56,7 +56,7 @@ MAX_DURATION = timedelta(days=365)
 
 async def predicciones_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update)
-    await _show_predictions_page(update, context, page=0, edit=False)
+    await _show_predictions_page(update, context, page=0)
 
 
 async def list_predictions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -66,7 +66,7 @@ async def list_predictions_callback(update: Update, context: ContextTypes.DEFAUL
         page = int(query.data.split(":")[1])
     except (IndexError, ValueError):
         page = 0
-    await _show_predictions_page(update, context, page=page, edit=True)
+    await _show_predictions_page(update, context, page=page)
 
 
 def _scope_chat_id(update: Update):
@@ -74,7 +74,7 @@ def _scope_chat_id(update: Update):
 
 
 async def _show_predictions_page(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int, edit: bool
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int
 ) -> None:
     settings = config.get_settings()
     if not settings.points_enabled:

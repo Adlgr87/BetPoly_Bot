@@ -848,6 +848,126 @@
     }
   }
 
+  /* --------------------------------------------------- contrato escrow */
+
+  const contract = { data: null };
+
+  function renderContract() {
+    const box = $('#contract-state');
+    if (!box || !contract.data) return;
+    const data = contract.data;
+    const paused = !!data.is_paused;
+    const tons = (nano) => `${fmtTon(Number(nano || 0) / 1e9)} TON`;
+    const rows = [
+      ['Estado', paused ? '⏸ pausado' : '▶️ activo'],
+      ['Comisión actual', `${data.fee_percent || '0.00'} %`],
+      ['Apuesta mínima', tons(data.min_stake_nano)],
+      ['Comisiones acumuladas', tons(data.fees_nano)],
+      ['Fondos de usuarios bloqueados', tons(data.total_locked_nano)],
+      ['Mercados creados', String(data.market_count == null ? '—' : data.market_count)],
+    ];
+    if (data.balance_nano != null) rows.push(['Balance del contrato', tons(data.balance_nano)]);
+    if (data.admin) rows.push(['Admin configurado', short(data.admin, 6)]);
+    const warnings = [];
+    if (data.stale) warnings.push('⚠️ Estado sin actualizar: la cadena no respondió.');
+    if (data.admin_matches_wallet === false) {
+      warnings.push('⚠️ Tu wallet vinculada no es la administradora: el contrato rechazaría la firma.');
+    }
+    if (data.admin_matches_wallet === null && data.admin) {
+      warnings.push('ℹ️ Vincula tu wallet en el bot para comprobar quién es el administrador.');
+    }
+    box.innerHTML = `
+      <dl class="contract-rows">
+        ${rows.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('')}
+      </dl>
+      ${warnings.map((text) => `<p class="muted small">${esc(text)}</p>`).join('')}`;
+
+    const pause = $('#contract-pause');
+    if (pause) pause.textContent = paused ? 'Reanudar contrato' : 'Pausar contrato';
+    const amount = $('#contract-withdraw-amount');
+    if (amount) {
+      const availableTon = Number(data.max_withdrawable_nano || data.fees_nano || 0) / 1e9;
+      amount.max = String(availableTon);
+    }
+  }
+
+  async function loadContract(force = false) {
+    const box = $('#contract-state');
+    if (!box) return;
+    if (!state.config || !state.config.escrow_enabled) {
+      box.textContent = 'Esta instancia no tiene contrato escrow configurado.';
+      return;
+    }
+    try {
+      const data = force
+        ? await api('/api/admin/contract?refresh=1')
+        : await api('/api/admin/contract');
+      contract.data = data;
+      renderContract();
+    } catch (error) {
+      contract.data = null;
+      box.textContent = friendlyError(error);
+    }
+  }
+
+  async function signContract(prepare, message) {
+    busy(true);
+    try {
+      const tx = await prepare();
+      busy(false);
+      await signTransaction(tx);
+      toast(message, 'ok');
+      loadContract(true);
+    } catch (error) {
+      busy(false);
+      toast(friendlyError(error), 'error');
+    }
+  }
+
+  async function contractWithdraw(event) {
+    event.preventDefault();
+    const amount = $('#contract-withdraw-amount').value.trim();
+    if (!amount) return;
+    if (!window.confirm(`¿Retirar ${amount} TON de comisiones? La firma la hace tu wallet.`)) return;
+    await signContract(
+      () => api('/api/admin/contract/withdraw/prepare', { method: 'POST', body: { amount } }),
+      'Retiro enviado. El indexador lo confirmará en unos segundos.');
+  }
+
+  async function contractSetFee(event) {
+    event.preventDefault();
+    const percent = $('#contract-fee-percent').value.trim();
+    if (!percent) return;
+    if (!window.confirm(`¿Cambiar la comisión al ${percent} %? Solo afecta a mercados nuevos.`)) return;
+    await signContract(
+      () => api('/api/admin/contract/set-fee/prepare', { method: 'POST', body: { percent } }),
+      'Comisión enviada. Se aplicará a los mercados creados desde ahora.');
+  }
+
+  async function contractSetPaused() {
+    if (!contract.data) return;
+    const paused = !contract.data.is_paused;
+    const question = paused
+      ? '¿Pausar el contrato? Nadie podrá crear mercados ni apostar.'
+      : '¿Reanudar el contrato? Se volverán a aceptar mercados y apuestas.';
+    if (!window.confirm(question)) return;
+    await signContract(
+      () => api('/api/admin/contract/set-paused/prepare', { method: 'POST', body: { paused } }),
+      paused ? 'Contrato pausado.' : 'Contrato reanudado.');
+  }
+
+  async function contractChangeAdmin(event) {
+    event.preventDefault();
+    const address = $('#contract-admin-address').value.trim();
+    if (!address) return;
+    const sure = window.confirm(
+      `Vas a transferir la administración a:\n${address}\n\nEs irreversible. ¿Continuar?`);
+    if (!sure) return;
+    await signContract(
+      () => api('/api/admin/contract/change-admin/prepare', { method: 'POST', body: { address } }),
+      'Cambio de administrador enviado. Verifícalo on-chain antes de cerrar.');
+  }
+
   async function loadAdminStatus() {
     try {
       const status = await api('/api/indexer');
@@ -868,7 +988,10 @@
       const section = document.getElementById(`view-${name}`);
       if (section) section.classList.toggle('hidden', name !== view);
     });
-    if (view === 'admin') loadAdminStatus();
+    if (view === 'admin') {
+      loadAdminStatus();
+      loadContract();
+    }
     if (view === 'mine') loadMine();
     if (view === 'markets') loadMarkets(true);
   }
@@ -883,6 +1006,17 @@
     $('#wallet-chip').addEventListener('click', connectWallet);
     $('#reconnect').addEventListener('click', reconnectWallet);
     $('#refresh-markets').addEventListener('click', () => loadMarkets());
+    const contractBindings = [
+      ['#contract-refresh', 'click', () => loadContract(true)],
+      ['#contract-withdraw-form', 'submit', contractWithdraw],
+      ['#contract-fee-form', 'submit', contractSetFee],
+      ['#contract-admin-form', 'submit', contractChangeAdmin],
+      ['#contract-pause', 'click', contractSetPaused],
+    ];
+    contractBindings.forEach(([selector, event, handler]) => {
+      const el = $(selector);
+      if (el) el.addEventListener(event, handler);
+    });
     $('#create-form').addEventListener('submit', createMarket);
     $('#sheet-confirm').addEventListener('click', () => {
       if (state.sheetMode === 'resolve') confirmResolve();

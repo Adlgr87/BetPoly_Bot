@@ -98,3 +98,63 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - Reconciliación manual desde el panel de admin (hoy es automática por backoff).
 - Fase 2: operaciones de administración del contrato (`withdraw_fees`,
   `set_paused`, `set_fee`, `change_admin`), que siguen sin interfaz.
+
+---
+
+## Fase 2 — Administración del contrato (S-03, D-03)
+
+**Fecha:** 2026-10-23
+
+### Arreglado
+- **S-03 · Cuatro operaciones de administración sin interfaz.**
+  `withdraw_fees`, `set_fee`, `set_paused` y `change_admin` existían en el
+  contrato y en `bot/chain/bodies.py`, pero ningún flujo dejaba firmarlas.
+  Ahora se preparan sin firmar en `bot/markets.py`
+  (`prepare_withdraw_fees`, `prepare_set_fee`, `prepare_set_paused`,
+  `prepare_change_admin`) y se firman siempre en la wallet del administrador,
+  desde el bot o desde la Mini App.
+- **D-03 · Estado del contrato invisible.** `bot/chain/toncenter.py` gana
+  `run_get_method` (con normalización del stack: hex/decimal → `int`) y
+  `bot/chain/escrow_state.py` compone los seis getters en un `EscrowState`.
+- **`ESCROW_ADMIN_ADDRESS` no se usaba.** Ahora se compara con la wallet
+  vinculada del operador y se rechaza la preparación (`wallet_not_admin`) antes
+  de firmar cuando no coincide. Sigue siendo informativo: los permisos los
+  decide el contrato, no la configuración.
+
+### Añadido
+- `EscrowStateCache`: TTL de 30 s con *stale-while-error*; si la cadena falla se
+  sirve la última lectura buena marcada como `stale` en lugar de ocultar el
+  estado. `reset()` y `force=True` para pruebas y botón «Actualizar».
+- Panel **⚙️ Contrato escrow** en `/admin` con el estado on-chain, aviso si la
+  wallet no es la administradora y confirmación explícita antes de pausar o
+  cambiar de administrador (el valor vive en el estado de la conversación, no
+  en `callback_data`, que tiene un límite de 64 bytes).
+- Endpoints `GET /api/admin/contract` y
+  `POST /api/admin/contract/{withdraw,set-fee,set-paused,change-admin}/prepare`,
+  más la tarjeta equivalente en la pestaña *Admin* de la Mini App.
+- `bot/parsing.py`: `parse_nano` y `parse_fee_bps` como única fuente de parseo
+  monetario (la API los reutiliza en lugar de su copia local) y
+  `markets.normalize_admin_address` para validar `change_admin`.
+- `MessageBody.admin_fee_bps` y `MessageBody.paused_flag` para que las pruebas
+  lean los payloads de administración sin reinterpretar `amount`/`flag`.
+- 67 pruebas nuevas (308 → 375): `runGetMethod`, snapshot y caché, los cuatro
+  preparadores con sus validaciones previas a la firma, los endpoints HTTP y un
+  caso de extremo a extremo en el sandbox TVM que transfiere la administración
+  y comprueba que el admin anterior pierde el control (22 → 24 checks).
+
+### Decidido
+- **El bonus de "doble confirmación" se resuelve con dos barreras:** el botón
+  «Confirmar» en el bot o `confirm()` en la Mini App, y después la firma en la
+  wallet. El backend nunca difunde nada por su cuenta.
+- **`withdraw_fees` se valida contra `fees` leídas on-chain** (`0 < importe ≤
+  fees`), no contra saldos del espejo: los fondos de los usuarios no son
+  retirables ni siquiera si el operador se equivoca.
+- **El flag de pausa se lee siempre de la cadena** antes de invertirlo, para que
+  dos operadores no se pisen con acciones contrarias.
+- **Vulture entra en CI** (`--min-confidence 80`) después de retirar cuatro
+  parámetros `edit` muertos en los handlers; el umbral de cobertura sube a 59 %.
+
+### Pendiente
+- Fase 3 (seguridad y aislamiento de la API) antes de la Fase 4.
+- El panel del contrato no muestra aún el historial de transacciones de
+  administración; hoy se consulta en el explorador con la dirección del escrow.

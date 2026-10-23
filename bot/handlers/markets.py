@@ -15,7 +15,7 @@ PAGE_SIZE = 4
 
 async def mercados_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update)
-    await _show_markets(update, context, page=0, edit=False)
+    await _show_markets(update, context, page=0)
 
 
 async def list_markets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -25,11 +25,11 @@ async def list_markets_callback(update: Update, context: ContextTypes.DEFAULT_TY
         page = int(data.split(":")[1])
     except (IndexError, ValueError):
         page = 0
-    await _show_markets(update, context, page=page, edit=True)
+    await _show_markets(update, context, page=page)
 
 
 async def _show_markets(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int, edit: bool
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int
 ) -> None:
     settings = config.get_settings()
     if not settings.escrow_enabled:

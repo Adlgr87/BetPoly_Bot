@@ -12,12 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, Dict, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 import config
 from bot import database, markets
+from bot.chain.addresses import same_address, to_friendly
 from bot.formatting import bold, code, esc, fmt_ts, ton
 from bot.formatting import points as fmt_points
 from bot.handlers.common import edit_or_reply, is_admin, safe_answer
@@ -25,11 +34,14 @@ from bot.keyboards import (
     admin_chain_market_keyboard,
     admin_chain_markets_keyboard,
     admin_chain_options_keyboard,
+    admin_contract_keyboard,
     admin_options_keyboard,
     admin_predictions_keyboard,
     back_to_menu_keyboard,
+    confirm_contract_action_keyboard,
     confirm_resolve_keyboard,
 )
+from bot.parsing import parse_fee_bps, parse_nano
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +119,9 @@ async def _show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ]
         keyboard_rows.append(
             [InlineKeyboardButton("🔒 Mercados on-chain", callback_data="admin_chain:0")]
+        )
+        keyboard_rows.append(
+            [InlineKeyboardButton("⚙️ Contrato escrow", callback_data="admin_contract")]
         )
         keyboard_rows.append([InlineKeyboardButton("🔙 Salir", callback_data="main_menu")])
     else:
@@ -516,4 +531,355 @@ async def admin_chain_cancel_force_callback(
                 ],
             ]
         ),
+    )
+
+
+# ===========================================================================
+# Escrow contract administration (S-03)
+#
+# The contract has four admin operations that no interface exposed before.
+# They keep the project's invariant: the backend *prepares* an unsigned
+# transaction and the human signs it in their own wallet.
+# ===========================================================================
+
+CONTRACT_WITHDRAW, CONTRACT_FEE, CONTRACT_ADMIN = range(3)
+
+_PENDING_KEY = "contract_pending"
+
+
+def _pending(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    return context.user_data.setdefault(_PENDING_KEY, {})
+
+
+def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(_PENDING_KEY, None)
+
+
+async def _contract_state_text(user_id: int) -> Tuple[str, Any]:
+    """Render the on-chain state plus how it relates to the operator's wallet."""
+    state = await markets.escrow_state()
+    wallet = await database.get_wallet(user_id)
+    lines = [
+        "⚙️ <b>Contrato escrow</b>",
+        "",
+        f"📍 Dirección: {code(markets.friendly_escrow())}",
+        f"🔌 Estado: {bold('⏸ pausado' if state.is_paused else '▶️ activo')}",
+        f"⚖️ Comisión actual: {bold(f'{state.fee_bps / 100:.2f} %')}",
+        f"🪙 Apuesta mínima: {bold(ton(state.min_stake_nano))} TON",
+        f"💸 Comisiones acumuladas: {bold(ton(state.fees_nano))} TON",
+        f"🔒 Fondos de usuarios bloqueados: {bold(ton(state.total_locked_nano))} TON",
+        f"🏷 Mercados creados: {bold(str(state.market_count))}",
+    ]
+    if state.balance_nano is not None:
+        lines.append(f"🏦 Balance del contrato: {bold(ton(state.balance_nano))} TON")
+
+    lines.append("")
+    if state.admin:
+        lines.append(f"👤 Admin configurado: {code(state.admin)}")
+        if wallet and same_address(wallet["address"], state.admin):
+            lines.append("✅ Tu wallet vinculada es la administradora.")
+        elif wallet:
+            lines.append(
+                f"⚠️ Tu wallet ({code(to_friendly(wallet['address']))}) no es la "
+                "administradora: la firma sería rechazada por el contrato."
+            )
+        else:
+            lines.append("ℹ️ No tienes wallet vinculada en el bot.")
+    else:
+        lines.append(
+            "ℹ️ <code>ESCROW_ADMIN_ADDRESS</code> no está configurada: no puedo "
+            "comprobar que tu wallet sea la administradora."
+        )
+    lines += [
+        "",
+        "<i>Las comisiones son lo único que el contrato permite retirar; los "
+        "fondos de los usuarios nunca salen por esta vía. El backend no tiene "
+        "llaves: cada acción se firma en tu wallet.</i>",
+    ]
+    if state.stale:
+        lines.append(f"⚠️ Estado sin actualizar: {esc(state.error or 'sin conexión')}")
+    return "\n".join(lines), state
+
+
+async def admin_contract_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_answer(update.callback_query)
+    if await _deny(update):
+        return
+    await _show_contract_panel(update, context)
+
+
+async def _show_contract_panel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, error: Optional[str] = None
+) -> None:
+    if not config.get_settings().escrow_enabled:
+        await edit_or_reply(
+            update,
+            "ℹ️ Esta instancia no tiene contrato escrow configurado.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+    try:
+        text, state = await _contract_state_text(update.effective_user.id)
+    except markets.MarketError as exc:
+        await edit_or_reply(
+            update,
+            f"⚠️ No pude leer el contrato: {esc(str(exc))}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Reintentar", callback_data="admin_contract")],
+                    [InlineKeyboardButton("🔙 Volver", callback_data="admin_panel")],
+                ]
+            ),
+        )
+        return
+    if error:
+        text = f"❌ {esc(error)}\n\n{text}"
+    await edit_or_reply(update, text, reply_markup=admin_contract_keyboard(state))
+
+
+async def _show_prepared(update: Update, tx: markets.PreparedTx) -> None:
+    """Render an unsigned transaction with the wallet deeplink."""
+    await edit_or_reply(
+        update,
+        f"🧾 <b>{esc(tx.summary)}</b> (sin firmar)\n\n"
+        f"Contrato: {code(tx.to)}\n"
+        f"Gas adjunto: {bold(ton(tx.amount))} TON\n\n"
+        "Abre el botón y firma en tu wallet de administrador. El backend no "
+        "tiene llaves y no puede firmar por ti.\n\n"
+        f"{code(tx.deeplink)}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔐 Firmar en la wallet", url=tx.deeplink)],
+                [InlineKeyboardButton("⚙️ Volver al contrato", callback_data="admin_contract")],
+            ]
+        ),
+    )
+
+
+# -- pause ------------------------------------------------------------------
+
+async def admin_contract_pause_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await safe_answer(query)
+    if await _deny(update):
+        return
+    try:
+        flag = bool(int((query.data or "").split(":")[1]))
+    except (IndexError, ValueError):
+        return
+    _pending(context)["action"] = "pause"
+    _pending(context)["value"] = flag
+    await edit_or_reply(
+        update,
+        (
+            "⏸ <b>¿Pausar el contrato?</b>\n\n"
+            "Mientras esté pausado, nadie podrá crear mercados ni apostar. "
+            "Resolver, cancelar y reclamar pagos siguen funcionando."
+            if flag
+            else "▶️ <b>¿Reanudar el contrato?</b>\n\nSe volverán a aceptar "
+            "mercados y apuestas."
+        ),
+        reply_markup=confirm_contract_action_keyboard("pause"),
+    )
+
+
+# -- confirmación -----------------------------------------------------------
+
+async def admin_contract_ok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await safe_answer(query)
+    if await _deny(update):
+        return
+    action = (query.data or "").split(":")[1] if ":" in (query.data or "") else ""
+    pending = dict(_pending(context))
+    _clear_pending(context)
+    try:
+        if action == "pause" and "value" in pending:
+            tx = await markets.prepare_set_paused(query.from_user.id, bool(pending["value"]))
+        elif action == "admin" and pending.get("address"):
+            tx = await markets.prepare_change_admin(query.from_user.id, pending["address"])
+        else:
+            await _show_contract_panel(update, context, error="La acción expiró, inténtalo de nuevo.")
+            return
+    except markets.MarketError as exc:
+        await _show_contract_panel(update, context, error=str(exc))
+        return
+    await _show_prepared(update, tx)
+
+
+# -- conversación de entrada de datos ---------------------------------------
+
+async def _contract_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, action: str, prompt: str
+) -> int:
+    await safe_answer(update.callback_query)
+    if await _deny(update):
+        return ConversationHandler.END
+    _clear_pending(context)
+    _pending(context)["action"] = action
+    await edit_or_reply(
+        update,
+        prompt,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Cancelar", callback_data="admin_contract")]]
+        ),
+    )
+    return {
+        "withdraw": CONTRACT_WITHDRAW,
+        "fee": CONTRACT_FEE,
+        "admin": CONTRACT_ADMIN,
+    }[action]
+
+
+async def contract_withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        state = await markets.escrow_state()
+        available = ton(state.max_withdrawable_nano)
+        detail = f"Disponible: <b>{available} TON</b>."
+    except markets.MarketError:
+        detail = "No pude consultar el saldo de comisiones."
+    return await _contract_entry(
+        update,
+        context,
+        action="withdraw",
+        prompt=(
+            "💸 <b>Retirar comisiones</b>\n\n"
+            f"{detail}\n\n"
+            "Escribe el importe en TON (por ejemplo <code>1.5</code>). "
+            "Solo se pueden retirar comisiones, nunca los fondos de los usuarios."
+        ),
+    )
+
+
+async def contract_fee_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _contract_entry(
+        update,
+        context,
+        action="fee",
+        prompt=(
+            "⚖️ <b>Cambiar la comisión</b>\n\n"
+            "Escribe el porcentaje que se queda la plataforma (0–10), "
+            "por ejemplo <code>2</code> o <code>2.5</code>.\n"
+            "Solo afecta a los mercados creados a partir de ahora."
+        ),
+    )
+
+
+async def contract_admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _contract_entry(
+        update,
+        context,
+        action="admin",
+        prompt=(
+            "👤 <b>Cambiar administrador</b>\n\n"
+            "Escribe la dirección TON que pasará a controlar el contrato "
+            "(<code>EQ…</code> o <code>0:hex</code>).\n\n"
+            "⚠️ Es <b>irreversible</b>: si pierdes esa wallet, pierdes el control."
+        ),
+    )
+
+
+async def contract_withdraw_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _deny(update):
+        return ConversationHandler.END
+    try:
+        amount = parse_nano(update.effective_message.text or "", field="importe")
+        tx = await markets.prepare_withdraw_fees(update.effective_user.id, amount)
+    except (ValueError, markets.MarketError) as exc:
+        await update.effective_message.reply_text(f"❌ {esc(str(exc))}")
+        return CONTRACT_WITHDRAW
+    _clear_pending(context)
+    await _show_prepared(update, tx)
+    return ConversationHandler.END
+
+
+async def contract_fee_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _deny(update):
+        return ConversationHandler.END
+    try:
+        bps = parse_fee_bps(update.effective_message.text or "")
+        tx = await markets.prepare_set_fee(update.effective_user.id, bps)
+    except (ValueError, markets.MarketError) as exc:
+        await update.effective_message.reply_text(f"❌ {esc(str(exc))}")
+        return CONTRACT_FEE
+    _clear_pending(context)
+    await _show_prepared(update, tx)
+    return ConversationHandler.END
+
+
+async def contract_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _deny(update):
+        return ConversationHandler.END
+    raw = (update.effective_message.text or "").strip()
+    try:
+        target = markets.normalize_admin_address(raw)
+    except (ValueError, markets.MarketError) as exc:
+        await update.effective_message.reply_text(f"❌ {esc(str(exc))}")
+        return CONTRACT_ADMIN
+    _pending(context)["address"] = target
+    await update.effective_message.reply_text(
+        "⚠️ <b>Confirma el cambio de administrador</b>\n\n"
+        f"Nueva dirección: {code(to_friendly(target))}\n\n"
+        "A partir de ese momento solo esa wallet podrá resolver mercados, "
+        "cambiar la comisión o retirar comisiones. <b>No se puede deshacer.</b>",
+        parse_mode="HTML",
+        reply_markup=confirm_contract_action_keyboard("admin"),
+    )
+    return ConversationHandler.END
+
+
+async def contract_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _clear_pending(context)
+    if update.callback_query is not None:
+        await safe_answer(update.callback_query)
+        await _show_contract_panel(update, context)
+    elif update.effective_message is not None:
+        await update.effective_message.reply_text(
+            "❌ Operación cancelada.", reply_markup=back_to_menu_keyboard()
+        )
+    return ConversationHandler.END
+
+
+async def contract_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _clear_pending(context)
+    if update.effective_message is not None:
+        await update.effective_message.reply_text(
+            "⌛ La operación expiró por inactividad. Vuelve a abrir /admin → ⚙️ Contrato escrow."
+        )
+    return ConversationHandler.END
+
+
+def build_admin_contract_conversation() -> ConversationHandler:
+    """Text input flow for withdraw / fee / change-admin."""
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(contract_withdraw_entry, pattern=r"^admin_contract_withdraw$"),
+            CallbackQueryHandler(contract_fee_entry, pattern=r"^admin_contract_setfee$"),
+            CallbackQueryHandler(contract_admin_entry, pattern=r"^admin_contract_changeadmin$"),
+        ],
+        states={
+            CONTRACT_WITHDRAW: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contract_withdraw_input)
+            ],
+            CONTRACT_FEE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contract_fee_input)
+            ],
+            CONTRACT_ADMIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contract_admin_input)
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, contract_timeout),
+                CallbackQueryHandler(contract_timeout),
+            ],
+        },
+        fallbacks=[
+            CommandHandler(["cancelar", "cancel"], contract_cancel),
+            CallbackQueryHandler(contract_cancel, pattern=r"^admin_contract$"),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
+        per_user=True,
+        per_chat=False,
     )

@@ -295,6 +295,48 @@ def admin_chain_market_keyboard(market_id: int, status: str) -> InlineKeyboardMa
     return InlineKeyboardMarkup(rows)
 
 
+def admin_contract_keyboard(state: Any) -> InlineKeyboardMarkup:
+    """Actions for the escrow contract itself (fees, pause, admin)."""
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                "💸 Retirar comisiones", callback_data="admin_contract_withdraw"
+            )
+        ],
+        [
+            InlineKeyboardButton("⚖️ Cambiar comisión", callback_data="admin_contract_setfee"),
+        ],
+        [
+            InlineKeyboardButton(
+                "▶️ Reanudar contrato" if state.is_paused else "⏸ Pausar contrato",
+                callback_data=f"admin_contract_pause:{0 if state.is_paused else 1}",
+            )
+        ],
+        [InlineKeyboardButton("👤 Cambiar administrador", callback_data="admin_contract_changeadmin")],
+        [InlineKeyboardButton("🔄 Actualizar estado", callback_data="admin_contract")],
+        [InlineKeyboardButton("🔙 Volver", callback_data="admin_panel")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def confirm_contract_action_keyboard(action: str) -> InlineKeyboardMarkup:
+    """Explicit confirmation for irreversible contract actions.
+
+    ``callback_data`` only carries the action: a TON address would blow past the
+    64-byte limit, so the value waits in the conversation state.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Confirmar", callback_data=f"admin_contract_ok:{action}"
+                )
+            ],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="admin_contract")],
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
