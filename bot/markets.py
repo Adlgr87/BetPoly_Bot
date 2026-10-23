@@ -47,6 +47,9 @@ CLAIM_GAS_NANO = 20_000_000        # 0.02 TON
 MIN_MARKET_DURATION = 15 * 60      # 15 minutes
 MAX_MARKET_DURATION = 365 * 24 * 3600
 TX_TTL = 300                       # 5 minutes to sign
+# While a resolution is prepared and pending on-chain, new bets are refused:
+# they would be rejected by the contract and the user would pay gas for nothing.
+RESOLVE_WINDOW_SECONDS = 15 * 60
 
 
 class MarketError(ValueError):
@@ -145,6 +148,12 @@ def _assert_open(market: Dict[str, Any], now: Optional[int] = None) -> None:
     now = int(now if now is not None else time.time())
     if market["status"] != "open":
         raise MarketError("market_closed", "Este mercado ya no acepta apuestas.")
+    pending_at = int(market.get("pending_resolve_at") or 0)
+    if pending_at and pending_at + RESOLVE_WINDOW_SECONDS > now:
+        raise MarketError(
+            "market_resolving",
+            "El administrador está resolviendo este mercado. Espera unos minutos.",
+        )
     closes_at = int(market.get("closes_at") or 0)
     if closes_at and closes_at <= now:
         raise MarketError("market_expired", "El mercado ya cerró.")
@@ -348,6 +357,7 @@ async def prepare_resolve(
 
     options = {int(o["idx"]): o["label"] for o in market.get("options", [])}
     label = options.get(int(winning_option), f"Opción {int(winning_option) + 1}")
+    await database.set_market_pending_resolve(int(market_id), now)
     return _prepared(
         build_resolve_market(int(market_id), int(winning_option)),
         amount=ADMIN_GAS_NANO,
@@ -362,7 +372,15 @@ async def prepare_resolve(
     )
 
 
-async def prepare_cancel(user_id: int, market_id: int) -> PreparedTx:
+async def prepare_cancel(
+    user_id: int, market_id: int, *, force: bool = False, now: Optional[int] = None
+) -> PreparedTx:
+    """Cancel a market and enable refunds.
+
+    Cancelling while the market is still open **and** already holds bets needs an
+    explicit ``force``: the Telegram panel asks for confirmation, the HTTP API
+    never sends it.  Otherwise a single misclick would refund a live market.
+    """
     settings = config.get_settings()
     if user_id not in settings.admin_ids:
         raise MarketError("forbidden", "Solo un administrador puede cancelar mercados.")
@@ -371,6 +389,15 @@ async def prepare_cancel(user_id: int, market_id: int) -> PreparedTx:
         raise MarketError("market_not_found", "Ese mercado no existe.")
     if market["status"] != "open":
         raise MarketError("market_closed", "El mercado ya no está abierto.")
+    now = int(now if now is not None else time.time())
+    closes_at = int(market.get("closes_at") or 0)
+    has_bets = await database.market_pool(int(market_id)) > 0
+    if not force and closes_at > now and has_bets:
+        raise MarketError(
+            "cancel_needs_force",
+            "El mercado sigue abierto y ya tiene apuestas. Cancela solo si es una emergencia.",
+        )
+    await database.set_market_pending_resolve(int(market_id), now)
     return _prepared(
         build_cancel_market(int(market_id)),
         amount=ADMIN_GAS_NANO,
@@ -383,6 +410,11 @@ async def prepare_cancel(user_id: int, market_id: int) -> PreparedTx:
 # ---------------------------------------------------------------------------
 # read helpers for the API
 # ---------------------------------------------------------------------------
+
+def _is_resolving(market: Dict[str, Any], now: int) -> bool:
+    pending_at = int(market.get("pending_resolve_at") or 0)
+    return bool(pending_at) and pending_at + RESOLVE_WINDOW_SECONDS > now
+
 
 def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
                 user_id: Optional[int] = None) -> Dict[str, Any]:
@@ -419,7 +451,10 @@ def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
         "fee_bps": int(market.get("fee_bps") or 0),
         "options": options_out,
         "seconds_left": max(0, closes_at - now) if closes_at else None,
-        "is_open": market.get("status") == "open" and (not closes_at or closes_at > now),
+        "is_open": market.get("status") == "open"
+        and (not closes_at or closes_at > now)
+        and not _is_resolving(market, now),
+        "resolving": _is_resolving(market, now),
         "creator": market.get("creator_address"),
     }
     if wallet:

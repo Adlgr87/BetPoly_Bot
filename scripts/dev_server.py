@@ -13,6 +13,7 @@ Never point this at a production database.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 import time
@@ -71,7 +72,7 @@ async def seed() -> None:
         existing = await database.get_market(spec["market_id"])
         if existing:
             continue
-        await database.upsert_market(
+        await database.enrich_market_from_event(
             spec["market_id"],
             creator,
             spec["title"],
@@ -107,7 +108,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass

@@ -153,7 +153,7 @@ class TonCenterClient:
                     if isinstance(payload, dict) and payload.get("ok") is False:
                         raise TonApiError(str(payload.get("error") or "TON API returned ok=false"))
                     return payload
-            except (aiohttp.ClientError, asyncio.TimeoutError, TonApiError) as exc:
+            except (TimeoutError, aiohttp.ClientError, TonApiError) as exc:
                 last_error = exc
                 if attempt == self.retries - 1:
                     break

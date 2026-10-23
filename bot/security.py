@@ -19,13 +19,12 @@ import hashlib
 import hmac
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Deque, Optional, Tuple
+from typing import Deque, Dict, Optional, Tuple
 from urllib.parse import parse_qsl
 
 import config
-
-from collections import deque
 
 SESSION_TTL = 60 * 60  # 1 hour
 MAX_INIT_DATA_AGE = 24 * 60 * 60

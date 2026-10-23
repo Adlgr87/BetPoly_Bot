@@ -6,7 +6,8 @@ from telegram.ext import ContextTypes
 
 import config
 from bot import database
-from bot.formatting import bold, code, esc, points as fmt_points, ton
+from bot.formatting import bold, code, esc, ton
+from bot.formatting import points as fmt_points
 from bot.handlers.common import edit_or_reply, register_user, safe_answer
 from bot.keyboards import back_to_menu_keyboard, refresh_ranking_keyboard
 

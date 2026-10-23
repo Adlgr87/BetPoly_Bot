@@ -433,10 +433,7 @@ async def list_markets(request: web.Request) -> web.Response:
         offset = int(request.query.get("offset", "0"))
     except ValueError:
         return json_error("bad_query", "limit/offset deben ser enteros.")
-    if status == "all":
-        status_value = None
-    else:
-        status_value = status
+    status_value = None if status == "all" else status
     markets_list = await database.list_markets(status=status_value, limit=limit, offset=offset)
     return json_ok(
         {
@@ -576,6 +573,7 @@ async def indexer_status(request: web.Request) -> web.Response:
         "is_admin": _admin(user_id),
     }
     if _admin(user_id):
+        payload["failures"] = await database.list_chain_tx_failures(limit=10)
         async with database.connection() as db:
             async with db.execute(
                 "SELECT COUNT(*) AS n FROM markets WHERE status = 'open'"

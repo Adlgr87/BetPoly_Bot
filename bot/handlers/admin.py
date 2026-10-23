@@ -18,7 +18,8 @@ from telegram.ext import ContextTypes
 
 import config
 from bot import database, markets
-from bot.formatting import bold, code, esc, fmt_ts, points as fmt_points, ton
+from bot.formatting import bold, code, esc, fmt_ts, ton
+from bot.formatting import points as fmt_points
 from bot.handlers.common import edit_or_reply, is_admin, safe_answer
 from bot.keyboards import (
     admin_chain_market_keyboard,
@@ -91,6 +92,11 @@ async def _show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"👁 Indexer: último bloque leído "
             f"{esc(str(status.get('last_lt') or '—'))}"
             + (f" · ⚠️ {esc(status['last_error'][:60])}" if status.get("last_error") else ""),
+            *(
+                [f"🚨 <b>{status['failures']}</b> transacción(es) en la cola de reintentos"]
+                if int(status.get("failures") or 0)
+                else []
+            ),
             "",
             "<i>Al resolver, el bot genera una transacción sin firmar: tú la firmas "
             "desde tu propia wallet. El backend no tiene llaves.</i>",
@@ -431,6 +437,33 @@ async def admin_chain_cancel_callback(update: Update, context: ContextTypes.DEFA
     try:
         tx = await markets.prepare_cancel(query.from_user.id, market_id)
     except markets.MarketError as exc:
+        if getattr(exc, "code", "") == "cancel_needs_force":
+            # Emergency cancellation of a live market that already holds bets.
+            await edit_or_reply(
+                update,
+                "⚠️ <b>Cancelación de emergencia</b>\n\n"
+                f"Mercado: <b>#{market_id}</b>\n\n"
+                "El mercado <b>sigue abierto y ya tiene apuestas</b>. Si lo cancelas, "
+                "todos los apostadores recuperan su importe y nadie gana.\n\n"
+                "<i>Esta acción no se puede deshacer.</i>",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⚠️ Confirmar cancelación",
+                                callback_data=f"admin_chain_cancel_force:{market_id}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🔙 Volver",
+                                callback_data=f"admin_chain_market:{market_id}",
+                            )
+                        ],
+                    ]
+                ),
+            )
+            return
         await edit_or_reply(update, f"❌ {esc(exc)}")
         return
 
@@ -444,6 +477,43 @@ async def admin_chain_cancel_callback(update: Update, context: ContextTypes.DEFA
             [
                 [InlineKeyboardButton("🔐 Firmar en la wallet", url=tx.deeplink)],
                 [InlineKeyboardButton("🔙 Volver", callback_data=f"admin_chain_market:{market_id}")],
+            ]
+        ),
+    )
+
+
+async def admin_chain_cancel_force_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Second step of the emergency cancellation (explicit confirmation)."""
+    query = update.callback_query
+    await safe_answer(query)
+    if await _deny(update):
+        return
+    try:
+        market_id = int((query.data or "").split(":")[1])
+    except (IndexError, ValueError):
+        return
+    try:
+        tx = await markets.prepare_cancel(query.from_user.id, market_id, force=True)
+    except markets.MarketError as exc:
+        await edit_or_reply(update, f"❌ {esc(exc)}")
+        return
+
+    await edit_or_reply(
+        update,
+        "🧾 <b>Cancelación de emergencia preparada (sin firmar)</b>\n\n"
+        f"Mercado: <b>#{market_id} {esc(tx.details.get('market_title', ''))}</b>\n\n"
+        "Al firmarla, todas las wallets podrán reclamar su reembolso completo.\n\n"
+        f"{code(tx.deeplink)}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔐 Firmar en la wallet", url=tx.deeplink)],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Volver", callback_data=f"admin_chain_market:{market_id}"
+                    )
+                ],
             ]
         ),
     )

@@ -276,7 +276,7 @@ def admin_chain_options_keyboard(market_id: int, options: List[Dict[str, Any]]) 
         for opt in options
     ]
     rows.append(
-        [InlineKeyboardButton("🔙 Volver", callback_data="admin_chain_market:%d" % market_id)]
+        [InlineKeyboardButton("🔙 Volver", callback_data=f"admin_chain_market:{market_id}")]
     )
     return InlineKeyboardMarkup(rows)
 

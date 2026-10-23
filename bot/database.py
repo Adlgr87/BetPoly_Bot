@@ -44,7 +44,8 @@ __all__ = [
     "claim_reminders", "get_reminder_targets",
     "link_wallet", "get_wallet", "get_wallet_owner", "unlink_wallet",
     "create_nonce", "consume_nonce", "purge_nonces",
-    "upsert_market", "update_market_settled", "update_market_cancelled",
+    "insert_market_placeholder", "enrich_market_from_event",
+    "update_market_settled", "update_market_cancelled",
     "get_market", "list_markets", "set_market_options",
     "record_onchain_bet", "mark_onchain_bet_claimed", "list_onchain_bets",
     "get_onchain_bet", "get_cursor", "set_cursor", "mark_tx_processed",
@@ -153,6 +154,28 @@ async def transaction() -> AsyncIterator[aiosqlite.Connection]:
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+# ``wallet_links`` needs a surrogate key: a Telegram account can unlink and
+# later re-link, and the address must become available to other accounts once it
+# is inactive.  A global UNIQUE(address) made that impossible (S-07), so the
+# table is rebuilt with partial unique indexes instead.
+_WALLET_LINKS_DDL = """
+CREATE TABLE IF NOT EXISTS wallet_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    address     TEXT NOT NULL,
+    network     TEXT NOT NULL DEFAULT 'ton',
+    public_key  TEXT,
+    verified_at TEXT NOT NULL,
+    is_active   INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_active_addr
+    ON wallet_links(address) WHERE is_active = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_active_user
+    ON wallet_links(user_id) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_wallet_history ON wallet_links(user_id, verified_at DESC);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id     INTEGER PRIMARY KEY,
@@ -207,15 +230,6 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 
 -- ---------------------------------------------------------------- on-chain
-CREATE TABLE IF NOT EXISTS wallet_links (
-    user_id     INTEGER PRIMARY KEY,
-    address     TEXT NOT NULL UNIQUE,
-    network     TEXT NOT NULL DEFAULT 'ton',
-    public_key  TEXT,
-    verified_at TEXT NOT NULL,
-    is_active   INTEGER NOT NULL DEFAULT 1
-);
-
 CREATE TABLE IF NOT EXISTS auth_nonces (
     nonce      TEXT PRIMARY KEY,
     user_id    INTEGER NOT NULL,
@@ -232,12 +246,14 @@ CREATE TABLE IF NOT EXISTS markets (
     option_count   INTEGER NOT NULL,
     closes_at      INTEGER NOT NULL,
     status         TEXT NOT NULL DEFAULT 'open',
+    pending_resolve_at INTEGER,
     winning_option INTEGER,
     total_pool     INTEGER NOT NULL DEFAULT 0,
     winning_pool   INTEGER NOT NULL DEFAULT 0,
     fee_bps        INTEGER,
     created_lt     INTEGER,
     created_tx     TEXT,
+    metadata_source TEXT NOT NULL DEFAULT 'event',
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -289,6 +305,18 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     consumed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS chain_tx_failures (
+    tx_hash       TEXT NOT NULL,
+    lt            INTEGER NOT NULL,
+    op            INTEGER,
+    error         TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    first_seen    TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen     TEXT NOT NULL DEFAULT (datetime('now')),
+    next_retry_at TEXT,
+    PRIMARY KEY (tx_hash, lt)
+);
+
 CREATE TABLE IF NOT EXISTS indexer_status (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     last_run        TEXT,
@@ -307,6 +335,7 @@ CREATE INDEX IF NOT EXISTS idx_markets_status     ON markets(status, closes_at);
 CREATE INDEX IF NOT EXISTS idx_onchain_bets_mkt   ON onchain_bets(market_id, bettor);
 CREATE INDEX IF NOT EXISTS idx_pending_match      ON pending_actions(kind, match_a, match_b, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_nonces_user        ON auth_nonces(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tx_failures_retry  ON chain_tx_failures(next_retry_at);
 """
 
 # Columns added after the first public release.  ``init_db`` adds them only
@@ -315,6 +344,8 @@ _LEGACY_COLUMNS: Sequence[Tuple[str, str, str]] = (
     ("users", "updated_at", "TEXT NOT NULL DEFAULT ''"),
     ("predictions", "mode", "TEXT NOT NULL DEFAULT 'points'"),
     ("bets", "payout", "INTEGER NOT NULL DEFAULT 0"),
+    ("markets", "metadata_source", "TEXT NOT NULL DEFAULT 'event'"),
+    ("markets", "pending_resolve_at", "INTEGER"),
 )
 
 
@@ -326,11 +357,33 @@ async def _table_columns(conn: aiosqlite.Connection, table: str) -> List[str]:
         return []
 
 
+async def _migrate_wallet_links(db: aiosqlite.Connection) -> None:
+    """Rebuild the legacy ``wallet_links`` table (user_id PK, address UNIQUE)."""
+    columns = await _table_columns(db, "wallet_links")
+    if not columns:
+        await db.executescript(_WALLET_LINKS_DDL)
+        return
+    if "id" in columns:
+        return
+    logger.info("Migrating wallet_links: removing global UNIQUE(address)")
+    await db.execute("ALTER TABLE wallet_links RENAME TO wallet_links_legacy")
+    await db.executescript(_WALLET_LINKS_DDL)
+    await db.execute(
+        """
+        INSERT INTO wallet_links (user_id, address, network, public_key, verified_at, is_active)
+        SELECT user_id, address, network, public_key, verified_at, is_active
+        FROM wallet_links_legacy
+        """
+    )
+    await db.execute("DROP TABLE wallet_links_legacy")
+
+
 async def init_db() -> None:
     """Create/upgrade the schema. Safe to call repeatedly."""
     settings = config.get_settings()
     async with transaction() as db:
         await db.executescript(_SCHEMA)
+        await _migrate_wallet_links(db)
         for table, column, ddl in _LEGACY_COLUMNS:
             columns = await _table_columns(db, table)
             if columns and column not in columns:
@@ -833,24 +886,30 @@ async def link_wallet(
         raise WalletConflict("Dirección vacía.")
     async with transaction() as db:
         async with db.execute(
-            "SELECT user_id FROM wallet_links WHERE address = ?", (address,)
+            "SELECT user_id FROM wallet_links WHERE address = ? AND is_active = 1", (address,)
         ) as cur:
             owner = await cur.fetchone()
         if owner and int(owner["user_id"]) != int(user_id):
             raise WalletConflict("Esta wallet ya está vinculada a otra cuenta de Telegram.")
+        # One active wallet per account: deactivate the previous one first so the
+        # partial unique index stays satisfied and the history is preserved.
         await db.execute(
-            """
-            INSERT INTO wallet_links (user_id, address, network, public_key, verified_at, is_active)
-            VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(user_id) DO UPDATE SET
-                address = excluded.address,
-                network = excluded.network,
-                public_key = excluded.public_key,
-                verified_at = excluded.verified_at,
-                is_active = 1
-            """,
-            (user_id, address, network, public_key, iso_now()),
+            "UPDATE wallet_links SET is_active = 0 WHERE user_id = ? AND is_active = 1",
+            (int(user_id),),
         )
+        try:
+            await db.execute(
+                """
+                INSERT INTO wallet_links (user_id, address, network, public_key, verified_at, is_active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (int(user_id), address, network, public_key, iso_now()),
+            )
+        except aiosqlite.IntegrityError as exc:
+            # Two concurrent verifications of the same address: exactly one wins.
+            raise WalletConflict(
+                "Esta wallet ya está vinculada a otra cuenta de Telegram."
+            ) from exc
 
 
 async def get_wallet(user_id: int) -> Optional[Dict[str, Any]]:
@@ -925,7 +984,40 @@ async def purge_nonces(older_than_seconds: int = 86_400) -> None:
 # On-chain mirror: markets
 # ---------------------------------------------------------------------------
 
-async def upsert_market(
+async def insert_market_placeholder(
+    market_id: int,
+    creator_address: Optional[str],
+    option_count: int,
+    created_lt: Optional[int] = None,
+    created_tx: Optional[str] = None,
+) -> bool:
+    """Create a minimal row for a market we only know through a bet.
+
+    The row is explicitly marked ``metadata_source='placeholder'`` so the real
+    metadata can replace it later without ever trusting a placeholder over an
+    on-chain event (S-02).
+    """
+    async with transaction() as db:
+        cur = await db.execute(
+            """
+            INSERT OR IGNORE INTO markets
+                (market_id, creator_address, title, option_count, closes_at,
+                 created_lt, created_tx, metadata_source, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?, 'placeholder', ?)
+            """,
+            (
+                int(market_id), creator_address, f"Mercado #{int(market_id)}",
+                int(option_count), created_lt, created_tx, iso_now(),
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def _is_placeholder_title(title: Optional[str], market_id: int) -> bool:
+    return not title or title.strip() == f"Mercado #{int(market_id)}"
+
+
+async def enrich_market_from_event(
     market_id: int,
     creator_address: Optional[str],
     title: str,
@@ -935,23 +1027,72 @@ async def upsert_market(
     created_lt: Optional[int] = None,
     created_tx: Optional[str] = None,
     fee_bps: Optional[int] = None,
-) -> bool:
-    """Insert a market discovered on-chain. Returns True when it was new."""
+) -> Tuple[bool, bool]:
+    """Apply the authoritative metadata of a ``market_created`` event.
+
+    Returns ``(created, enriched)``. Only empty or placeholder fields are
+    filled: a market that already carries real metadata is never overwritten.
+    """
     async with transaction() as db:
-        cur = await db.execute(
-            """
-            INSERT OR IGNORE INTO markets
-                (market_id, creator_address, title, title_hash, option_count, closes_at,
-                 created_lt, created_tx, fee_bps, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(market_id), creator_address, title[:200], title_hash,
-                int(option_count), int(closes_at), created_lt, created_tx,
-                int(fee_bps) if fee_bps is not None else None, iso_now(),
-            ),
+        async with db.execute(
+            "SELECT * FROM markets WHERE market_id = ?", (int(market_id),)
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row is None:
+            await db.execute(
+                """
+                INSERT INTO markets
+                    (market_id, creator_address, title, title_hash, option_count, closes_at,
+                     created_lt, created_tx, fee_bps, metadata_source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'event', ?)
+                """,
+                (
+                    int(market_id), creator_address, title[:200], title_hash,
+                    int(option_count), int(closes_at), created_lt, created_tx,
+                    int(fee_bps) if fee_bps is not None else None, iso_now(),
+                ),
+            )
+            return True, False
+
+        current = dict(row)
+        if current.get("metadata_source") == "event":
+            return False, False
+
+        updates: Dict[str, Any] = {}
+        if title and _is_placeholder_title(current.get("title"), market_id):
+            updates["title"] = title[:200]
+        if int(current.get("closes_at") or 0) == 0 and int(closes_at or 0) > 0:
+            updates["closes_at"] = int(closes_at)
+        if int(option_count or 0) > int(current.get("option_count") or 0):
+            updates["option_count"] = int(option_count)
+        for column, value in (
+            ("creator_address", creator_address),
+            ("title_hash", title_hash),
+            ("created_lt", created_lt),
+            ("created_tx", created_tx),
+            ("fee_bps", int(fee_bps) if fee_bps is not None else None),
+        ):
+            if value is not None and current.get(column) in (None, ""):
+                updates[column] = value
+        updates["metadata_source"] = "event"
+        updates["updated_at"] = iso_now()
+
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        await db.execute(
+            f"UPDATE markets SET {assignments} WHERE market_id = ?",  # noqa: S608 - column names are literals
+            (*updates.values(), int(market_id)),
         )
-        return cur.rowcount == 1
+        return False, True
+
+
+async def set_market_pending_resolve(market_id: int, timestamp: int) -> None:
+    """Mark that a resolution/cancellation was prepared (blocks new bets, F-06)."""
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE markets SET pending_resolve_at = ?, updated_at = ? WHERE market_id = ?",
+            (int(timestamp), iso_now(), int(market_id)),
+        )
 
 
 async def update_market_settled(
@@ -961,7 +1102,8 @@ async def update_market_settled(
         await db.execute(
             """
             UPDATE markets
-            SET status = ?, winning_option = ?, total_pool = ?, winning_pool = ?, updated_at = ?
+            SET status = ?, winning_option = ?, total_pool = ?, winning_pool = ?,
+                pending_resolve_at = NULL, updated_at = ?
             WHERE market_id = ?
             """,
             (status, int(winning_option), int(total_pool), int(winning_pool), iso_now(), int(market_id)),
@@ -971,7 +1113,8 @@ async def update_market_settled(
 async def update_market_cancelled(market_id: int) -> None:
     async with transaction() as db:
         await db.execute(
-            "UPDATE markets SET status = 'cancelled', updated_at = ? WHERE market_id = ?",
+            "UPDATE markets SET status = 'cancelled', pending_resolve_at = NULL,"
+            " updated_at = ? WHERE market_id = ?",
             (iso_now(), int(market_id)),
         )
 
@@ -1161,6 +1304,73 @@ async def unmark_tx_processed(tx_hash: str, lt: int) -> None:
         await db.execute("DELETE FROM chain_txs WHERE tx_hash = ? AND lt = ?", (tx_hash, int(lt)))
 
 
+async def register_chain_tx_failure(
+    tx_hash: str, lt: int, op: Optional[int], error: str
+) -> int:
+    """Record a failed transaction and return how many times it has failed.
+
+    The row is the *dead-letter queue* of the indexer: it survives restarts and
+    is retried with backoff after the cursor has moved past it.
+    """
+    message = (error or "")[:500]
+    async with transaction() as db:
+        await db.execute(
+            """
+            INSERT INTO chain_tx_failures (tx_hash, lt, op, error, attempts, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(tx_hash, lt) DO UPDATE SET
+                attempts  = chain_tx_failures.attempts + 1,
+                error     = excluded.error,
+                last_seen = excluded.last_seen
+            """,
+            (tx_hash, int(lt), op, message, iso_now(), iso_now()),
+        )
+        async with db.execute(
+            "SELECT attempts FROM chain_tx_failures WHERE tx_hash = ? AND lt = ?",
+            (tx_hash, int(lt)),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["attempts"]) if row else 1
+
+
+async def schedule_chain_tx_retry(tx_hash: str, lt: int, delay_seconds: int) -> None:
+    """Push the next retry attempt into the future (exponential backoff)."""
+    retry_at = iso_now(offset_seconds=max(0, int(delay_seconds)))
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE chain_tx_failures SET next_retry_at = ? WHERE tx_hash = ? AND lt = ?",
+            (retry_at, tx_hash, int(lt)),
+        )
+
+
+async def list_chain_tx_failures(limit: int = 100, *, due_only: bool = False) -> List[Dict[str, Any]]:
+    """Failed transactions, oldest first. ``due_only`` filters by backoff."""
+    sql = "SELECT * FROM chain_tx_failures"
+    params: List[Any] = []
+    if due_only:
+        sql += " WHERE next_retry_at IS NULL OR next_retry_at <= ?"
+        params.append(iso_now())
+    sql += " ORDER BY lt ASC LIMIT ?"
+    params.append(max(1, min(int(limit), 500)))
+    async with connection() as db:
+        async with db.execute(sql, params) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def count_chain_tx_failures() -> int:
+    async with connection() as db:
+        async with db.execute("SELECT COUNT(*) AS n FROM chain_tx_failures") as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+
+async def clear_chain_tx_failure(tx_hash: str, lt: int) -> None:
+    async with transaction() as db:
+        await db.execute(
+            "DELETE FROM chain_tx_failures WHERE tx_hash = ? AND lt = ?", (tx_hash, int(lt))
+        )
+
+
 async def record_indexer_run(
     last_lt: Optional[int], error: Optional[str], processed: int = 0
 ) -> None:
@@ -1183,9 +1393,15 @@ async def get_indexer_status() -> Dict[str, Any]:
     async with connection() as db:
         async with db.execute("SELECT * FROM indexer_status WHERE id = 1") as cur:
             row = await cur.fetchone()
-        if row is None:
-            return {"last_run": None, "last_error": None, "last_lt": None, "processed_total": 0}
-        return dict(row)
+        status = (
+            {"last_run": None, "last_error": None, "last_lt": None, "processed_total": 0}
+            if row is None
+            else dict(row)
+        )
+        async with db.execute("SELECT COUNT(*) AS n FROM chain_tx_failures") as cur:
+            failures = await cur.fetchone()
+        status["failures"] = int(failures["n"]) if failures else 0
+        return status
 
 
 # ---------------------------------------------------------------------------

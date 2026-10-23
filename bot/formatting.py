@@ -8,7 +8,7 @@ and formatting injection).
 from __future__ import annotations
 
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import config
@@ -102,8 +102,9 @@ def iso_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def iso_now() -> str:
-    return iso_utc(now_utc())
+def iso_now(offset_seconds: int = 0) -> str:
+    """Current UTC timestamp; ``offset_seconds`` moves it into the future."""
+    return iso_utc(now_utc() + timedelta(seconds=int(offset_seconds)))
 
 
 def parse_iso(value: str) -> datetime:

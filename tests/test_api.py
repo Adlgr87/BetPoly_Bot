@@ -5,11 +5,11 @@ import time
 
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
+from test_security import signed_init_data
+from test_ton_proof import make_proof, make_wallet
 
 from bot import api
 from bot.chain import bodies
-from test_security import signed_init_data
-from test_ton_proof import make_proof, make_wallet
 
 USER = {"id": 555001, "first_name": "Ada", "last_name": "Lovelace", "username": "ada"}
 ADMIN = {"id": 1001, "first_name": "Root", "username": "root"}
@@ -232,7 +232,7 @@ class TestWalletVerification:
 
 class TestMarketsApi:
     async def _ready_market(self, db, market_id=1, closes_in=3600):
-        await db.upsert_market(market_id, "0:" + "11" * 32, "¿Gana México?", 2,
+        await db.enrich_market_from_event(market_id, "0:" + "11" * 32, "¿Gana México?", 2,
                                int(time.time()) + closes_in, fee_bps=200)
         await db.set_market_options(market_id, ["Sí", "No"])
 
@@ -303,7 +303,7 @@ class TestMarketsApi:
 
     async def test_claim_flow(self, client, db):
         payload, headers = await session_for(client, USER, wallet=True)
-        await db.upsert_market(2, "0:" + "11" * 32, "M", 2, int(time.time()) - 60, fee_bps=200)
+        await db.enrich_market_from_event(2, "0:" + "11" * 32, "M", 2, int(time.time()) - 60, fee_bps=200)
         await db.set_market_options(2, ["Sí", "No"])
         await db.record_onchain_bet(2, payload["wallet"]["address"], 0, 1_000_000_000, "tx", 1)
         await db.update_market_settled(2, 0, 6_000_000_000, 4_000_000_000)

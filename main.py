@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import sys
 
@@ -37,6 +38,7 @@ from bot.formatting import esc, fmt_ts
 from bot.handlers.admin import (
     admin_chain_callback,
     admin_chain_cancel_callback,
+    admin_chain_cancel_force_callback,
     admin_chain_market_callback,
     admin_chain_options_callback,
     admin_chain_win_callback,
@@ -153,13 +155,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     if isinstance(error, (BadRequest, Forbidden)):
         return
     if isinstance(update, Update) and update.effective_message:
-        try:
+        with contextlib.suppress(Exception):
             await update.effective_message.reply_text(
                 "⚠️ Algo salió mal procesando tu solicitud. Inténtalo de nuevo en unos segundos.",
                 reply_markup=main_menu_keyboard(),
             )
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +315,7 @@ def build_application() -> Application:
         (r"^admin_chain_options:\d+$", admin_chain_options_callback),
         (r"^admin_chain_win:\d+:\d+$", admin_chain_win_callback),
         (r"^admin_chain_cancel:\d+$", admin_chain_cancel_callback),
+        (r"^admin_chain_cancel_force:\d+$", admin_chain_cancel_force_callback),
     ]
     for pattern, handler in callbacks:
         application.add_handler(CallbackQueryHandler(handler, pattern=pattern))

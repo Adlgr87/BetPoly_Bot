@@ -591,6 +591,10 @@
       </div>
       <div class="option-row">${options}</div>`;
 
+    if (market.resolving) {
+      body += `<p class="muted small">🔒 Resolución en curso: no se aceptan apuestas nuevas.</p>`;
+    }
+
     if (isOpen && !myBet) {
       body += `
         <label>Importe a apostar (TON)

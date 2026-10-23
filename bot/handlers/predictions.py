@@ -20,7 +20,8 @@ from telegram.ext import (
 
 import config
 from bot import database
-from bot.formatting import bold, code, esc, fmt_local, parse_local_datetime, points as fmt_points
+from bot.formatting import bold, code, esc, fmt_local, parse_local_datetime
+from bot.formatting import points as fmt_points
 from bot.handlers.common import (
     bet_limiter,
     create_limiter,

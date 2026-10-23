@@ -78,6 +78,8 @@ git clone https://github.com/Adlgr87/BetPoly_Bot.git
 cd BetPoly_Bot
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# para desarrollo y tests:
+pip install -r requirements-dev.txt
 
 cp .env.example .env      # define BOT_TOKEN y ADMIN_IDS
 python main.py --check    # valida configuración sin arrancar nada
@@ -241,10 +243,30 @@ Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con u
 
 ```bash
 .venv/bin/python -m pytest          # suite offline: contrato espejo, puntos, API, seguridad
+.venv/bin/python -m ruff check .    # estilo y errores comunes
 cd contracts && node tests/escrow.test.js   # contrato real en el sandbox TVM
 ```
 
 La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`, `FakeClient` para el indexer y claves Ed25519 sintéticas para `ton_proof`.
+
+**CI** (`.github/workflows/ci.yml`) ejecuta en cada push: lint, tests con umbral de
+cobertura, compilación del contrato con verificación del hash reproducible,
+sandbox TVM, `npm audit` y `pip-audit`.
+
+Dos suites son *guardarraíles* y no pruebas funcionales:
+
+- `tests/test_architecture.py` — dirección de las dependencias entre capas.
+- `tests/test_wiring.py` — conectividad: rutas sin consumidor, botones sin
+  handler, builders on-chain inalcanzables y comandos prometidos en `/help`.
+  Los huérfanos conocidos viven en un baseline que solo puede encogerse.
+
+### Resiliencia del indexador
+
+Si una transacción falla al aplicarse, el cursor **no avanza** sobre ella: se
+reintenta en el acto y, si el fallo persiste, se aparca en `chain_tx_failures`
+con retroceso exponencial (60 s → 5 min → 15 min → 1 h) para que una transacción
+envenenada no detenga el resto del flujo. El estado se ve en `/api/indexer`
+(admin) y en el panel `/admin`.
 
 ---
 
