@@ -407,6 +407,16 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - `scripts/build_icon.py`: generación reproducible del icono con tope de tamaño.
 - CI: el umbral de cobertura global sube de 80 % a **83 %** (medido: 84.8 %).
 
+### Arreglado (CI)
+- **`npm audit` rompía el build por un advisory sin parche.** Un aviso nuevo
+  contra `zod` (<4.6.6), arrastrado por `@ton/ton` (devDependency que solo usa
+  `scripts/deploy.js`), dejó el job del contrato en rojo sin que el código
+  cambiara. En vez de bajar el nivel de exigencia, `contracts/scripts/audit.js`
+  aplica `npm audit` con `contracts/audit-allowlist.json`: una excepción lleva
+  motivo, versión afectada y **caducidad**; una excepción caducada, sin motivo o
+  que ya no aparece falla el build, y cualquier advisory alto/crítico no listado
+  también. `contracts/tests/audit.test.js` (9 checks) fija esas reglas.
+
 ### Decidido
 - **El `ETag` va sobre el contenido, no sobre la hora.** Dos peticiones iguales
   devuelven el mismo `304` incluso en otro proceso; con `Last-Modified` una

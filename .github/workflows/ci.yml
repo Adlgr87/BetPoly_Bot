@@ -82,8 +82,10 @@ jobs:
           "
       - name: Sandbox TVM
         run: node tests/escrow.test.js
+      - name: Excepciones de auditoría (test)
+        run: node tests/audit.test.js
       - name: npm audit
-        run: npm audit --audit-level=high
+        run: node scripts/audit.js
 
   security:
     name: Dependencias (pip-audit)

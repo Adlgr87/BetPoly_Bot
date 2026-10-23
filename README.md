@@ -304,6 +304,12 @@ de `Update`/`Message`/`CallbackQuery` (`tests/telegram_fakes.py`) para la capa
 Telegram. Cobertura actual: **85 %** global (umbral 83) y **87 %** en
 `bot/handlers/*` + `bot/keyboards.py` (umbral propio 70).
 
+**Dependencias del contrato.** `node scripts/audit.js` aplica `npm audit` con
+`contracts/audit-allowlist.json`: un advisory alto/crítico sin excepción falla el
+build; una excepción **caducada**, sin motivo o que ya no corresponde a ningún
+advisory también falla, así que la lista solo puede encogerse. Hoy hay una
+excepción (`zod` vía `@ton/ton`, sin parche publicado) con fecha de caducidad.
+
 **Activos.** `web/static/icon.png` se regenera con `python scripts/build_icon.py`
 (Pillow solo hace falta para esa tarea puntual; el bot no depende de ella). El
 script escribe el PNG y falla si supera los 80 KB.
