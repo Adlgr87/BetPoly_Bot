@@ -133,7 +133,10 @@ def confirm_bet_keyboard(prediction_id: int, option_id: int, amount: int) -> Inl
 
 def cancel_conversation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Cancelar", callback_data="create_cancel")]]
+        [
+            [InlineKeyboardButton("❌ Cancelar", callback_data="create_cancel")],
+            [InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")],
+        ]
     )
 
 
@@ -342,27 +345,39 @@ def confirm_contract_action_keyboard(action: str) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 def back_to_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")]]
-    if config.get_settings().escrow_enabled:
-        rows.insert(0, [_webapp(config.get_settings().webapp_url, "🚀 Mini App")])
+    """Teclado de vuelta al menú, con la fila de administración cuando toca.
+
+    Antes el parámetro ``is_admin`` se aceptaba y se ignoraba, así que el botón
+    «🔧 Admin» desaparecía en cuanto el admin navegaba una pantalla (F-01).
+    """
+    rows: List[List[InlineKeyboardButton]] = []
+    settings = config.get_settings()
+    if settings.escrow_enabled:
+        rows.append([_webapp(settings.webapp_url, "🚀 Mini App")])
+    rows.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")])
+    if is_admin:
+        rows.append([InlineKeyboardButton("🔧 Admin", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 
-def refresh_ranking_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔄 Actualizar", callback_data="ranking")],
-            [InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")],
-        ]
-    )
+def refresh_ranking_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🔄 Actualizar", callback_data="ranking")],
+        [InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton("🔧 Admin", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
 
 
-def help_keyboard() -> InlineKeyboardMarkup:
+def help_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("📖 ¿Cómo funciona?", callback_data="how_it_works")]]
     settings = config.get_settings()
     if settings.escrow_enabled:
         rows.insert(0, [_webapp(settings.webapp_url, "🚀 Abrir Mini App")])
     rows.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")])
+    if is_admin:
+        rows.append([InlineKeyboardButton("🔧 Admin", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 

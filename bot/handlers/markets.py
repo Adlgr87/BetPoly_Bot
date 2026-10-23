@@ -46,7 +46,8 @@ async def _show_markets(
         await edit_or_reply(
             update,
             "📭 Todavía no hay mercados on-chain abiertos.\n\n"
-            "Crea el primero desde la Mini App o consulta los resueltos con /mercados.",
+            "Crea el primero desde la Mini App o prueba las predicciones de puntos "
+            "con /predicciones.",
         )
         return
 

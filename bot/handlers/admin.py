@@ -29,7 +29,7 @@ from bot import database, economics, markets
 from bot.chain.addresses import same_address, to_friendly
 from bot.formatting import bold, code, esc, fmt_ts, ton
 from bot.formatting import points as fmt_points
-from bot.handlers.common import edit_or_reply, is_admin, safe_answer
+from bot.handlers.common import back_keyboard, edit_or_reply, is_admin, safe_answer
 from bot.keyboards import (
     admin_chain_market_keyboard,
     admin_chain_markets_keyboard,
@@ -37,7 +37,6 @@ from bot.keyboards import (
     admin_contract_keyboard,
     admin_options_keyboard,
     admin_predictions_keyboard,
-    back_to_menu_keyboard,
     confirm_contract_action_keyboard,
     confirm_resolve_keyboard,
 )
@@ -85,7 +84,7 @@ async def _show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         lines.append(
             f"🪙 <b>{len(predictions)}</b> predicción(es) de puntos esperando resolución:"
         )
-        for pred in predictions[:8]:
+        for pred in predictions:
             lines.append(f"   • {esc(pred['title'][:48])}")
     else:
         lines.append("🪙 No hay predicciones de puntos pendientes.")
@@ -160,7 +159,7 @@ async def admin_resolve_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     options = await database.get_options(pred_id)
     if not options:
-        await edit_or_reply(update, "⚠️ Predicción sin opciones.", reply_markup=back_to_menu_keyboard())
+        await edit_or_reply(update, "⚠️ Predicción sin opciones.", reply_markup=back_keyboard(update))
         return
     pools = await database.get_prediction_pools(pred_id)
     total = pools.pop(-1, 0)
@@ -225,13 +224,13 @@ async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
         result = await database.settle_prediction(pred_id, opt_id)
     except database.DatabaseError as exc:
         await edit_or_reply(
-            update, f"❌ {esc(exc)}", reply_markup=back_to_menu_keyboard()
+            update, f"❌ {esc(exc)}", reply_markup=back_keyboard(update)
         )
         return
     except Exception:  # noqa: BLE001
         logger.exception("Settlement failed for prediction %s", pred_id)
         await edit_or_reply(
-            update, "❌ Error interno al liquidar la predicción.", reply_markup=back_to_menu_keyboard()
+            update, "❌ Error interno al liquidar la predicción.", reply_markup=back_keyboard(update)
         )
         return
 
@@ -248,7 +247,7 @@ async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
     if result.rake:
         summary += f"\n🏦 Comisión de la casa: {bold(fmt_points(result.rake))} pts"
 
-    await edit_or_reply(update, summary, reply_markup=back_to_menu_keyboard())
+    await edit_or_reply(update, summary, reply_markup=back_keyboard(update))
     await _notify_bettors(context, result)
 
 
@@ -305,14 +304,14 @@ async def _show_chain_markets(
     if not settings.escrow_enabled:
         await edit_or_reply(
             update, "ℹ️ Mercados on-chain deshabilitados en esta instancia.",
-            reply_markup=back_to_menu_keyboard(),
+            reply_markup=back_keyboard(update),
         )
         return
 
     open_markets = await database.list_markets(status="open", limit=100)
     if not open_markets:
         await edit_or_reply(
-            update, "✅ No hay mercados on-chain abiertos.", reply_markup=back_to_menu_keyboard()
+            update, "✅ No hay mercados on-chain abiertos.", reply_markup=back_keyboard(update)
         )
         return
 
@@ -616,7 +615,7 @@ async def _show_contract_panel(
         await edit_or_reply(
             update,
             "ℹ️ Esta instancia no tiene contrato escrow configurado.",
-            reply_markup=back_to_menu_keyboard(),
+            reply_markup=back_keyboard(update),
         )
         return
     try:
@@ -838,7 +837,7 @@ async def contract_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _show_contract_panel(update, context)
     elif update.effective_message is not None:
         await update.effective_message.reply_text(
-            "❌ Operación cancelada.", reply_markup=back_to_menu_keyboard()
+            "❌ Operación cancelada.", reply_markup=back_keyboard(update)
         )
     return ConversationHandler.END
 

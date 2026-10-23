@@ -5,6 +5,7 @@ and the tests cannot disagree (P6 del plan). All money is returned as integers:
 
 * TON amounts -> nanoTON (1 TON = 1e9 nanoTON)
 * percentages -> basis points (1 % = 100 bps)
+* points -> integer points, accepting thousands separators
 
 Errors are always :class:`MarketError` with a user-facing message, because every
 caller shows that text directly.
@@ -12,7 +13,7 @@ caller shows that text directly.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from bot.markets import MarketError
 
@@ -22,6 +23,13 @@ NANO_RE = re.compile(r"^\d+(?:[.,]\d{1,9})?$")
 PERCENT_RE = re.compile(r"^\d+(?:[.,]\d{1,2})?$")
 
 NANO_PER_TON = 1_000_000_000
+
+#: ``1000`` — plain integer.
+POINTS_RE = re.compile(r"^\d+$")
+#: ``1.000`` / ``1,000`` / ``1 000`` / ``1 234 567`` — thousands groups of three.
+THOUSANDS_RE = re.compile(r"^\d{1,3}(?:([ .,])\d{3})(?:\1\d{3})*$")
+#: ``10.5`` / ``1,5`` — a decimal the user probably meant as an integer.
+DECIMAL_RE = re.compile(r"^\d+[.,]\d+$")
 
 
 def parse_nano(value: Any, *, field: str = "importe") -> int:
@@ -37,6 +45,53 @@ def parse_nano(value: Any, *, field: str = "importe") -> int:
         )
     whole, _, frac = raw.partition(".")
     return int(whole) * NANO_PER_TON + int(frac.ljust(9, "0") or 0)
+
+
+def parse_points(value: Any, *, maximum: Optional[int] = None) -> int:
+    """Parse a points stake, refusing silent losses (S-06).
+
+    * ``250`` -> 250
+    * ``1.000`` / ``1,000`` / ``1 000`` -> 1000 (thousands, not decimals)
+    * ``10.5`` / ``1,5`` -> explicit error: points are integers
+    * ``0``, negatives or more than ``maximum`` -> error naming the limit
+
+    The old handler stripped every dot and comma, so ``1.5`` silently became
+    ``15`` — ten times the stake the user wrote. Here an ambiguous number is
+    rejected instead of guessed.
+    """
+    if isinstance(value, bool) or value is None:
+        raise MarketError("bad_amount", "Escribe cuántos puntos quieres apostar.")
+    if isinstance(value, int):
+        amount = value
+    else:
+        raw = " ".join(str(value).replace("\u00a0", " ").split())
+        if not raw:
+            raise MarketError("bad_amount", "Escribe cuántos puntos quieres apostar.")
+        if POINTS_RE.match(raw):
+            amount = int(raw)
+        else:
+            match = THOUSANDS_RE.match(raw)
+            if match:
+                amount = int(raw.replace(match.group(1), ""))
+            elif DECIMAL_RE.match(raw):
+                suggested = raw.replace(",", ".")
+                integer = int(float(suggested))
+                raise MarketError(
+                    "bad_points_decimal",
+                    f"Los puntos son enteros: si querías {integer}, escribe {integer}.",
+                )
+            else:
+                raise MarketError(
+                    "bad_amount", "Escribe un número entero de puntos, por ejemplo 250."
+                )
+    if amount <= 0:
+        raise MarketError("bad_amount", "La apuesta debe ser mayor que cero.")
+    if maximum is not None and amount > int(maximum):
+        raise MarketError(
+            "stake_too_high",
+            f"El máximo es {int(maximum)} puntos: no puedes apostar más que eso.",
+        )
+    return amount
 
 
 def parse_fee_bps(value: Any) -> int:

@@ -74,8 +74,13 @@ class TestSessions:
     def test_tampered_token(self):
         token = security.issue_session(77)
         head, expires, signature = token.split(".")
+        # Cambiamos el primer carácter (6 bits significativos) en lugar de los
+        # dos últimos: los dos finales solo llevan 12 bits y, de vez en cuando,
+        # el reemplazo decodificaba a los mismos bytes y el test pasaba a verde
+        # por accidente.
+        flipped = ("B" if signature[0] != "B" else "C") + signature[1:]
         with pytest.raises(security.AuthError):
-            security.verify_session(f"{head}.{expires}.{signature[:-2]}AA")
+            security.verify_session(f"{head}.{expires}.{flipped}")
 
     def test_cannot_escalate_user_id(self):
         token = security.issue_session(77)

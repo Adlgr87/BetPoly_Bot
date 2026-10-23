@@ -288,7 +288,11 @@ Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con u
 cd contracts && node tests/escrow.test.js   # contrato real en el sandbox TVM
 ```
 
-La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`, `FakeClient` para el indexer y claves Ed25519 sintéticas para `ton_proof`.
+La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`,
+`FakeClient` para el indexer, claves Ed25519 sintéticas para `ton_proof` y dobles
+de `Update`/`Message`/`CallbackQuery` (`tests/telegram_fakes.py`) para la capa
+Telegram. Cobertura actual: **84 %** global (umbral 80) y **87 %** en
+`bot/handlers/*` + `bot/keyboards.py` (umbral propio 70).
 
 **CI** (`.github/workflows/ci.yml`) ejecuta en cada push: lint, tests con umbral de
 cobertura, compilación del contrato con verificación del hash reproducible,
@@ -303,6 +307,27 @@ Tres suites son *guardarraíles* y no pruebas funcionales:
   solo queda `/api/health`, endpoint de sondas).
 - `tests/test_web_assets.py` — la Mini App no lleva manejadores inline y la CSP
   que se publica de verdad los bloquearía.
+
+### Modo grupo
+
+Las predicciones se guardan por `chat_id`, así que cada grupo tiene su propio
+tablero. Para apostar, el importe **debe ser una respuesta al mensaje del bot**
+que lo pide: en un grupo nadie apuesta por accidente al escribir «100» en la
+conversación. En privado sigue bastando con escribir el número.
+
+### Notificaciones
+
+`bot/database.py` guarda cada aviso en una tabla de salida
+(`notifications`) **dentro de la misma transacción** que liquida la predicción o
+aplica el evento on-chain; `bot/notifications.py` decide el texto y
+`main.job_dispatch_notifications` lo envía cada 30 s en lotes de 20, con
+reintentos y backoff exponencial (60 s → 1 h, máximo 5 intentos). La clave única
+`(user_id, kind, ref_id)` impide duplicados si una liquidación se reintenta.
+
+Se avisa de lo accionable: ganaste puntos, se te reembolsó la apuesta, o tienes
+un pago esperando en el contrato. Una apuesta perdida no genera mensaje. Si
+Telegram falla, el aviso queda pendiente para el siguiente ciclo y la cadena
+sigue indexando: el indexador nunca espera a la mensajería.
 
 ### Administración del contrato (Fase 2)
 
@@ -383,7 +408,7 @@ envenenada no detenga el resto del flujo. El estado se ve en `/api/indexer`
 | F007 | Recordatorios de cierre y notificación de resolución | ✅ |
 | F008 | Panel de administrador (puntos y on-chain) | ✅ |
 | F009 | Ayuda contextual (`/help`, botón “Cómo funciona”) | ✅ |
-| F010 | Modo grupo (predicciones por `chat_id`) | ✅ |
+| F010 | Modo grupo (predicciones por `chat_id`) | ✅ ver nota |
 | F011 | Mini App con TON Connect y `ton_proof` | ✅ |
 | F012 | Contrato escrow pari-mutuel + índice on-chain | ✅ |
 | F013 | Resolución oráculo automática (resultados deportivos) | ⬜ pendiente |

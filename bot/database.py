@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,12 @@ from bot import economics
 from bot.formatting import iso_now, iso_utc
 
 logger = logging.getLogger(__name__)
+
+#: Tipos de aviso. El texto vive en :mod:`bot.notifications`; la persistencia,
+#: aquí. Coinciden a propósito (una sola lista de tipos).
+NOTIFICATION_PREDICTION_RESULT = "prediction_result"
+NOTIFICATION_MARKET_CLAIM = "market_claim"
+NOTIFICATION_MARKET_REFUND = "market_refund"
 
 __all__ = [
     "DatabaseError", "DuplicateBet", "InsufficientFunds", "WalletConflict",
@@ -231,6 +238,21 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 
 -- ---------------------------------------------------------------- on-chain
+CREATE TABLE IF NOT EXISTS notifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    ref_id     TEXT NOT NULL,
+    payload    TEXT NOT NULL DEFAULT '{}',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    next_at    INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    sent_at    TEXT,
+    last_error TEXT,
+    UNIQUE (user_id, kind, ref_id)
+);
+
 CREATE TABLE IF NOT EXISTS auth_nonces (
     nonce      TEXT PRIMARY KEY,
     user_id    INTEGER NOT NULL,
@@ -337,6 +359,7 @@ CREATE INDEX IF NOT EXISTS idx_onchain_bets_mkt   ON onchain_bets(market_id, bet
 CREATE INDEX IF NOT EXISTS idx_pending_match      ON pending_actions(kind, match_a, match_b, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_nonces_user        ON auth_nonces(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tx_failures_retry  ON chain_tx_failures(next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_due  ON notifications(status, next_at);
 """
 
 # Columns added after the first public release.  ``init_db`` adds them only
@@ -744,6 +767,27 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
             (winning_label, now, pred_id),
         )
 
+        # F-04: quien ganó o recuperó puntos merece saberlo. Se escribe en la
+        # misma transacción, así que no puede haber liquidación sin aviso ni
+        # aviso de una liquidación que no ocurrió. `queue` deduplica.
+        for settlement in settlements:
+            if settlement.result not in ("win", "refund"):
+                continue
+            await _queue_notification(
+                db,
+                settlement.user_id,
+                NOTIFICATION_PREDICTION_RESULT,
+                pred_id,
+                {
+                    "prediction_id": pred_id,
+                    "title": pred["title"],
+                    "winning_label": winning_label,
+                    "result": settlement.result,
+                    "stake": settlement.stake,
+                    "payout": settlement.payout,
+                },
+            )
+
     return SettlementResult(
         prediction_id=pred_id,
         title=pred["title"],
@@ -876,6 +920,132 @@ async def get_reminder_targets(pred_id: int) -> List[int]:
         ) as cur:
             return [int(r["user_id"]) for r in await cur.fetchall()]
 
+
+# ---------------------------------------------------------------------------
+# Outbox de notificaciones (F-04)
+# ---------------------------------------------------------------------------
+# Los productores (liquidación de puntos e indexador) escriben aquí *dentro* de
+# su propia transacción; el repartidor de `main.py` las envía y reintenta. Así
+# un fallo de Telegram no puede perder el aviso ni bloquear la cadena.
+
+#: Intentos antes de dar el aviso por muerto (usuario que bloqueó el bot, etc.).
+MAX_NOTIFICATION_ATTEMPTS = 5
+#: Backoff exponencial: 60 s, 120 s, 240 s… con techo de una hora.
+NOTIFICATION_MAX_BACKOFF = 3600
+
+
+async def _queue_notification(
+    db: aiosqlite.Connection,
+    user_id: int,
+    kind: str,
+    ref_id: Any,
+    payload: Dict[str, Any],
+    *,
+    now: Optional[int] = None,
+    delay: int = 0,
+) -> None:
+    """Inserta un aviso pendiente; el UNIQUE evita duplicados (dedupe)."""
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO notifications (user_id, kind, ref_id, payload, next_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            kind,
+            str(ref_id),
+            json.dumps(payload, ensure_ascii=False),
+            int(now if now is not None else time.time()) + int(delay),
+        ),
+    )
+
+
+async def queue_notification(
+    user_id: int, kind: str, ref_id: Any, payload: Dict[str, Any], *, delay: int = 0
+) -> bool:
+    """Encola un aviso fuera de una transacción; devuelve si era nuevo."""
+    async with transaction() as db:
+        cur = await db.execute(
+            """
+            INSERT OR IGNORE INTO notifications (user_id, kind, ref_id, payload, next_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id),
+                kind,
+                str(ref_id),
+                json.dumps(payload, ensure_ascii=False),
+                int(time.time()) + int(delay),
+            ),
+        )
+        return bool(cur.rowcount)
+
+
+async def due_notifications(limit: int = 20, *, now: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Avisos pendientes cuya hora de reintento ya pasó."""
+    async with connection() as db:
+        async with db.execute(
+            """
+            SELECT * FROM notifications
+            WHERE status = 'pending' AND next_at <= ?
+            ORDER BY next_at, id
+            LIMIT ?
+            """,
+            (int(now if now is not None else time.time()), max(1, min(int(limit), 200))),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_notification_sent(notification_id: int) -> None:
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE notifications SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?",
+            (iso_now(), int(notification_id)),
+        )
+
+
+async def mark_notification_failed(notification_id: int, error: str = "") -> None:
+    """Suma un intento y programa el siguiente con backoff exponencial."""
+    async with transaction() as db:
+        async with db.execute(
+            "SELECT attempts FROM notifications WHERE id = ?", (int(notification_id),)
+        ) as cur:
+            row = await cur.fetchone()
+        attempts = int(row["attempts"]) + 1 if row else MAX_NOTIFICATION_ATTEMPTS
+        status = "failed" if attempts >= MAX_NOTIFICATION_ATTEMPTS else "pending"
+        delay = min(NOTIFICATION_MAX_BACKOFF, 60 * 2 ** max(0, attempts - 1))
+        await db.execute(
+            "UPDATE notifications SET attempts = ?, status = ?, next_at = ?, last_error = ?"
+            " WHERE id = ?",
+            (
+                attempts,
+                status,
+                int(time.time()) + delay,
+                (error or "")[:300],
+                int(notification_id),
+            ),
+        )
+
+
+async def reschedule_notification(notification_id: int, delay: int) -> None:
+    """Aplaza un aviso sin gastar un intento (p. ej. limitador de tasa)."""
+    async with transaction() as db:
+        await db.execute(
+            "UPDATE notifications SET next_at = ? WHERE id = ?",
+            (int(time.time()) + max(1, int(delay)), int(notification_id)),
+        )
+
+
+async def notifications_for(user_id: int, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Avisos de un usuario; útil para `/misbets` y para los tests."""
+    query = "SELECT * FROM notifications WHERE user_id = ?"
+    params: List[Any] = [int(user_id)]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    async with connection() as db:
+        async with db.execute(query + " ORDER BY id", params) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 # ---------------------------------------------------------------------------
 # Wallet links
@@ -1111,6 +1281,39 @@ async def update_market_settled(
             """,
             (status, int(winning_option), int(total_pool), int(winning_pool), iso_now(), int(market_id)),
         )
+        if status == "resolved":
+            await _queue_market_notifications(db, int(market_id), cancelled=False)
+
+
+async def _queue_market_notifications(
+    db: aiosqlite.Connection, market_id: int, *, cancelled: bool
+) -> None:
+    """Avisa a quien puede reclamar: ganadores y, si se cancela, a todos."""
+    async with db.execute(
+        "SELECT title, winning_option FROM markets WHERE market_id = ?", (int(market_id),)
+    ) as cur:
+        market = await cur.fetchone()
+    if market is None:
+        return
+    query = """
+        SELECT wl.user_id, ob.option
+        FROM onchain_bets ob
+        JOIN wallet_links wl
+          ON wl.address = ob.bettor AND wl.is_active = 1
+        WHERE ob.market_id = ?
+    """
+    async with db.execute(query, (int(market_id),)) as cur:
+        rows = [dict(r) for r in await cur.fetchall()]
+    for row in rows:
+        if not cancelled and int(row["option"]) != int(market["winning_option"] or 0):
+            continue
+        await _queue_notification(
+            db,
+            row["user_id"],
+            NOTIFICATION_MARKET_REFUND if cancelled else NOTIFICATION_MARKET_CLAIM,
+            market_id,
+            {"market_id": market_id, "title": market["title"]},
+        )
 
 
 async def update_market_cancelled(market_id: int) -> None:
@@ -1120,6 +1323,7 @@ async def update_market_cancelled(market_id: int) -> None:
             " updated_at = ? WHERE market_id = ?",
             (iso_now(), int(market_id)),
         )
+        await _queue_market_notifications(db, int(market_id), cancelled=True)
 
 
 async def get_market(market_id: int) -> Optional[Dict[str, Any]]:

@@ -6,11 +6,12 @@ from telegram.ext import ContextTypes
 
 import config
 from bot.formatting import bold, code, ton
-from bot.handlers.common import safe_answer
+from bot.handlers.common import back_keyboard, is_admin, safe_answer
 from bot.keyboards import help_keyboard
 
 
-def build_help_text() -> str:
+def build_help_text(*, is_admin: bool = False) -> str:
+    """Lista de comandos que **este** usuario puede usar (U-06)."""
     settings = config.get_settings()
     lines = [
         "❓ <b>Comandos disponibles</b>",
@@ -30,10 +31,16 @@ def build_help_text() -> str:
     lines += [
         "📊 /misbets — Perfil, apuestas y portfolio",
         "🏆 /ranking — Top 10 por puntos",
-        "🔧 /admin — Panel de administrador",
-        "❓ /help — Este mensaje",
     ]
+    if is_admin:
+        lines.append("🔧 /admin — Panel de administrador")
+    lines.append("❓ /help — Este mensaje")
     return "\n".join(lines)
+
+
+def _is_admin(update: Update) -> bool:
+    user = getattr(update, "effective_user", None)
+    return is_admin(getattr(user, "id", None))
 
 
 def build_how_it_works() -> str:
@@ -87,7 +94,9 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_message is None:
         return
     await update.effective_message.reply_text(
-        build_help_text(), parse_mode="HTML", reply_markup=help_keyboard()
+        build_help_text(is_admin=_is_admin(update)),
+        parse_mode="HTML",
+        reply_markup=help_keyboard(is_admin=_is_admin(update)),
     )
 
 
@@ -96,13 +105,14 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await safe_answer(query)
     from bot.handlers.common import edit_or_reply
 
-    await edit_or_reply(update, build_help_text(), reply_markup=help_keyboard())
+    await edit_or_reply(
+        update, build_help_text(is_admin=_is_admin(update)), reply_markup=help_keyboard(is_admin=_is_admin(update))
+    )
 
 
 async def how_it_works_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await safe_answer(query)
     from bot.handlers.common import edit_or_reply
-    from bot.keyboards import back_to_menu_keyboard
 
-    await edit_or_reply(update, build_how_it_works(), reply_markup=back_to_menu_keyboard())
+    await edit_or_reply(update, build_how_it_works(), reply_markup=back_keyboard(update))

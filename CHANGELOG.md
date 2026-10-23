@@ -289,3 +289,80 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - Fase 5: capa Telegram (F-01, F-14, F-02, F-04, S-06, U-01…U-04, U-06).
 - F-04 (notificaciones), F-05 (`prepare_cancel` en mercado abierto) y F-06
   (bloqueo optimista de resolución) siguen abiertos, como marca el plan.
+
+---
+
+## Fase 5 — Capa Telegram: navegación, entrada y notificaciones
+
+**Fecha:** 2026-10-23
+
+### Arreglado
+- **F-01 · El botón «🔧 Admin» desaparecía al navegar.** Todas las pantallas
+  resuelven el rol con `common.menu_for(update)` / `common.back_keyboard(update)`
+  y `back_to_menu_keyboard(is_admin)` deja de ignorar su parámetro. `/help` y el
+  ranking reciben el mismo tratamiento. Un test recorre 13 pantallas con un
+  admin y con un usuario normal.
+- **F-14 · El menú de bienvenida se construía sin rol.** Mismo helper: el primer
+  `/start` ya muestra u oculta la fila de administración según quién escribe.
+- **S-06 · El importe apostado se corrompía al parsearlo.** `bot/parsing.py`
+  gana `parse_points`: los separadores de miles (`1.000`, `1,000`, `1 000`) son
+  miles, y un decimal (`10.5`) es un **error explícito** («los puntos son
+  enteros: si querías 10, escribe 10») en vez de convertirse en `105` o `15`.
+  Cero, negativos y cantidades por encima del saldo también se rechazan. La
+  confirmación muestra el pago potencial con `economics.preview_payout`, así que
+  el número que se promete es el que liquida el reparto.
+- **F-02 · El modo grupo estaba anunciado pero no funcionaba** (opción A del
+  plan). La conversación de creación pasa a `per_chat=True` y el paso del
+  importe acepta mensajes de grupo **solo** si son respuesta al mensaje del bot
+  (`amount_prompt_id`). Un mensaje suelto en el grupo se ignora en silencio.
+- **F-04 · Nadie avisaba de una resolución.** Tabla de salida `notifications`
+  con `UNIQUE (user_id, kind, ref_id)`, productores transaccionales
+  (`settle_prediction`, `update_market_settled`, `update_market_cancelled`) y
+  repartidor `job_dispatch_notifications` cada 30 s en lotes de 20 con backoff
+  exponencial (60 s → 1 h, 5 intentos). Se avisa de lo accionable: victoria,
+  reembolso o pago pendiente en el contrato; una apuesta perdida no genera ruido.
+- **U-01 · `/start` mostraba la wallet en `0:hex`.** Ahora en formato *friendly*.
+- **U-02 · El ejemplo de fecha de cierre era `25/12/2025`,** una fecha ya pasada
+  que el propio validador rechazaría. El ejemplo es dinámico (`+7 días`).
+- **U-03 · El estado vacío de `/mercados` remitía a `/mercados`.** Ahora invita a
+  la Mini App o a `/predicciones`.
+- **U-04 · El panel de admin listaba `predictions[:8]`** mientras el teclado
+  renderizaba todas: se listan todas las que el panel ofrece.
+- **U-06 · `/help` prometía `/admin` a todo el mundo.** El texto depende del rol.
+
+### Añadido
+- `tests/telegram_fakes.py`: dobles de `Update`/`Message`/`CallbackQuery`/`Bot`
+  que registran texto y teclados. Es lo que permite probar 1 900 líneas de
+  handlers sin red.
+- `tests/test_handlers_navigation.py` (rol en cada pantalla),
+  `tests/test_handlers_flows.py` (apuestas, creación, perfil, wallet, admin,
+  contrato), `tests/test_parsing.py` (tabla S-06) y `tests/test_notifications.py`
+  (dedupe, backoff, «Telegram caído no bloquea la cadena», escape de HTML).
+- CI: nuevo umbral de cobertura **global 80 %** (antes 60) y otro específico de
+  **70 %** para `bot.handlers` + `bot.keyboards`.
+- `example_close()` en `predictions.py`: una única fuente para el ejemplo de
+  fecha del formulario y de los mensajes de error.
+
+### Decidido
+- **Avisar solo de lo accionable.** Notificar cada derrota convertiría el bot en
+  ruido; `/misbets` sigue siendo la fuente de verdad del historial. El outbox
+  guarda el resultado completo por si más adelante se quiere un resumen diario.
+- **El aviso se escribe en la transacción del resultado.** Si la transacción
+  falla, no hay aviso; si se repite, no hay duplicado. Es la única forma de
+  garantizar «ni de más ni de menos» sin un segundo proceso que reconcilie.
+- **El indexador no sabe nada de Telegram.** Escribe filas; el repartidor las
+  envía. Así un `403` de un usuario que bloqueó el bot no puede frenar la
+  indexación (hay un test que lo fija).
+- **En grupo, silencio ante lo ambiguo.** Si el mensaje no responde al prompt, no
+  se responde nada: intentar adivinar cuál de los tres «100» del grupo es una
+  apuesta sería peor que pedir una respuesta explícita.
+- **Se corrigió un test intermitente** (`test_tampered_token`): reemplazaba los
+  dos últimos caracteres de la firma, que solo llevan 12 bits significativos, y
+  de vez en cuando decodificaba a los mismos bytes. Ahora altera el primero.
+
+### Pendiente
+- Fase 6: rendimiento y activos (R-01…R-09), incluido el icono de 921 KB.
+- Fase 7: mantenibilidad, dependencias y tooling del contrato.
+- `main.py` sigue por debajo del 50 % de cobertura: `post_init`,
+  `build_application` y `run` necesitan un `Application` real o un doble más
+  profundo; se aborda en la Fase 7 junto con la limpieza de código muerto.

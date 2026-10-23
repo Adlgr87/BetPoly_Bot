@@ -122,13 +122,14 @@ Los manejadores inline (`onclick`) están bloqueados por esa CSP.
 
 ---
 
-### S-06 — 🔴 El importe de la apuesta se corrompe al escribir decimales: `10.5` se convierte en `105` puntos
+### S-06 — ✅ El importe de la apuesta se corrompe al escribir decimales: `10.5` se convierte en `105` puntos
 **Evidencia:** `bot/handlers/predictions.py:201`
 ```python
 raw = (update.effective_message.text or "").strip().replace(".", "").replace(",", "")
 ```
 Se eliminan los separadores para aceptar `1.000`, pero el efecto colateral es que `10.5` → `105` y `1,5` → `15`: **una apuesta 10× mayor que la tecleada**, sin confirmación adicional del importe.
 **Impacto:** pérdida de puntos por un error de entrada previsible; el mensaje de error solo aparece si el texto no es numérico.
+**Resuelto (Fase 5):** `bot/parsing.py: parse_points()` distingue miles de decimales y rechaza el decimal con un mensaje explícito («los puntos son enteros: si querías 10, escribe 10»); la confirmación muestra el importe final y el pago potencial de `economics.preview_payout`. Tabla de casos en `tests/test_parsing.py`.
 
 ---
 
@@ -145,13 +146,15 @@ otro usuario NO puede vincularla ❌ -> "Esta wallet ya está vinculada a otra c
 
 ## 4. Hallazgos medios — funcionalidad rota o desconectada
 
-### F-01 — 🟠 El botón «🔧 Admin» desaparece del menú tras la primera navegación
+### F-01 — ✅ El botón «🔧 Admin» desaparece del menú tras la primera navegación
 `bot/keyboards.py` define `main_menu_keyboard(*, is_admin=False, wallet=None)`, pero seis llamadas no pasan el flag: `bot/handlers/predictions.py:83, 93, 307, 321, 450, 493` y `main.py:159`. Solo `bot/handlers/start.py:64, 93` lo hacen bien.
 **Impacto:** el administrador pierde el acceso directo en cuanto pulsa cualquier botón; el flag `is_admin` de `back_to_menu_keyboard` además se ignora por completo.
+**Resuelto (Fase 5):** `bot/handlers/common.py: menu_for()/back_keyboard()` resuelven el rol en todas las pantallas y `back_to_menu_keyboard(is_admin=…)` ya no ignora el parámetro. `tests/test_handlers_navigation.py` recorre 13 pantallas con rol y sin rol.
 
-### F-02 — 🟠 El «modo grupo» está anunciado como completo pero la apuesta no funciona en grupos
+### F-02 — ✅ El «modo grupo» está anunciado como completo pero la apuesta no funciona en grupos
 `README.md:281` marca **F010 Modo grupo ✅**. Las predicciones sí se guardan por `chat_id` (`bot/database.py:169`, `predictions.py:71`), pero el paso del importe es un `MessageHandler` global restringido a privado: `main.py:324` (`filters.ChatType.PRIVATE`). La conversación además se declara `per_user=True, per_chat=False` (`predictions.py:534`).
 **Impacto:** en un grupo el flujo muere justo antes de apostar, y el estado de la conversación puede cruzarse entre chats del mismo usuario.
+**Resuelto (Fase 5):** opción A del plan: `per_chat=True` en la conversación de creación y el importe se acepta en grupo solo si responde al mensaje del bot (`amount_prompt_id`); un mensaje suelto se ignora. Cubierto en `tests/test_handlers_flows.py::TestGroupMode`.
 
 ### F-03 — ✅ Los multiplicadores que ve el usuario no descuentan la comisión
 `bot/handlers/markets.py:111` usa `total / pool`; `bot/markets.py:397` publica `multiplier` igual; `web/static/app.js:660-661` calcula el «Pago potencial» sin fee.
@@ -159,9 +162,10 @@ En cambio `estimate_payout` sí aplica `fee_bps` (`bot/markets.py:322`) y el con
 **Impacto:** la UI promete ~2 % más de lo que el contrato pagará (con `FEE_BPS=200`). Cuatro implementaciones distintas de la misma fórmula pari-mutuel en cuatro lenguajes.
 **Resuelto (Fase 4):** la fórmula vive solo en `bot/economics.py`; `bot/database.py`, `bot/markets.py` y `bot/handlers/markets.py` la importan, la Mini App pide `GET /api/markets/{id}/quote` y `contracts/vectors/economics.json` fija vectores compartidos con `contracts/tests/escrow.test.js`.
 
-### F-04 — 🟠 No existe notificación de resolución a los apostadores
+### F-04 — ✅ No existe notificación de resolución a los apostadores
 `README.md:278` marca **F007 «Recordatorios de cierre y notificación de resolución» ✅**. Hay recordatorio de cierre (`main.py:331`, `job_reminders`), pero al liquidar una predicción **nadie avisa a los usuarios**: `settle_prediction` (`bot/database.py:606`) no envía mensajes y el resumen solo lo ve el administrador (`bot/handlers/admin.py:233`).
 **Impacto:** el usuario debe entrar manualmente a `/misbets` para saber si ganó; la fila del README sobreestima la funcionalidad.
+**Resuelto (Fase 5):** tabla de salida `notifications` escrita en la misma transacción que el resultado, con `UNIQUE (user_id, kind, ref_id)`; `bot/notifications.py` redacta y `main.job_dispatch_notifications` envía cada 30 s con backoff. Un fallo de Telegram no bloquea el indexador (test propio).
 
 ### F-05 — 🟠 `prepare_cancel` permite cancelar un mercado todavía abierto
 `bot/markets.py:365-373` solo exige `status == "open"`; `prepare_resolve` sí valida `closes_at` (`bot/markets.py:341`).
@@ -192,8 +196,9 @@ No existe `.github/`, ni `Makefile`, ni `tox.ini`, ni `pre-commit`. La suite es 
 `contracts/scripts/deploy.js`: tras 30 intentos × 4 s sin alcanzar `state === 'active'`, el bucle termina sin error y **se escribe igualmente** `contracts/build/deploy.json` con la dirección esperada, con exit `0`.
 **Impacto:** falso positivo de despliegue; el operador configura `ESCROW_ADDRESS` de un contrato que puede no existir.
 
-### F-14 — 🟠 `main.py` construye el menú sin `is_admin` y el teclado de volver ignora el flag
+### F-14 — ✅ `main.py` construye el menú sin `is_admin` y el teclado de volver ignora el flag
 Complemento de F-01 en el arranque: `main.py:159` arma el teclado del mensaje de bienvenida sin rol, por lo que el primer `/start` de un admin tras reiniciar tampoco muestra la fila.
+**Resuelto (Fase 5):** `main.py` ya no construye teclados; el mensaje de error global usa `menu_for(update)`.
 
 ---
 
@@ -324,9 +329,10 @@ No se encontraron secretos, mnemónicos ni direcciones hardcodeadas. Lo que sí 
 
 ## 8. Testing y dependencias (T)
 
-### T-01 — 🟠 La capa de UX de Telegram no tiene ni un test
+### T-01 — ✅ La capa de UX de Telegram no tiene ni un test
 Cobertura por módulo: **todos** los `bot/handlers/*` al **0 %**, `keyboards.py` 17 %, `formatting.py` 48 %, `toncenter.py` 30 %, `scripts/dev_server.py` 0 %, `main.py` nunca se importa. Total 55 %.
 Es exactamente donde están F-01, F-02, F-04 y S-06: los defectos se concentran en el código sin cobertura.
+**Resuelto (Fase 5):** `tests/telegram_fakes.py` + `tests/test_handlers_navigation.py` + `tests/test_handlers_flows.py` llevan `bot/handlers/*` al **85 %** y `bot/keyboards.py` al **86 %**; CI falla por debajo del 70 % en esa capa. `main.py` (arranque y `build_application`) sigue sin cubrir: se aborda en la Fase 7.
 
 ### T-02 — 🔵 Deriva de dependencias
 | Paquete | Pin | Última | Estado |
@@ -352,12 +358,12 @@ Es exactamente donde están F-01, F-02, F-04 y S-06: los defectos se concentran 
 
 | # | Hallazgo | Ubicación |
 | :--- | :--- | :--- |
-| U-01 | `/start` muestra la dirección en formato raw `0:hex` mientras `/wallet` la muestra en *friendly* | `bot/handlers/start.py:46` vs `bot/handlers/wallet.py:59` |
-| U-02 | El ejemplo de fecha de cierre es `25/12/2025`, ya pasada, y el validador la rechazaría | `bot/handlers/predictions.py:400, 413` |
-| U-03 | El estado vacío invita a «consultar los resueltos con /mercados», el mismo comando que se acaba de usar (y no existe filtro de resueltos) | `bot/handlers/markets.py:49` |
-| U-04 | El panel admin lista `predictions[:8]` pero el teclado renderiza todas | `bot/handlers/admin.py:75` vs `bot/keyboards.py:201-212` |
+| ~~U-01~~ | ✅ `/start` mostraba la dirección en raw `0:hex`. Resuelto en Fase 5: se pinta en *friendly* con `to_friendly` | `bot/handlers/start.py` |
+| ~~U-02~~ | ✅ El ejemplo de fecha era `25/12/2025`. Resuelto en Fase 5: `example_close()` genera la fecha a `+7 días` | `bot/handlers/predictions.py` |
+| ~~U-03~~ | ✅ Estado vacío coherente. Resuelto en Fase 5: remite a la Mini App y a `/predicciones` | `bot/handlers/markets.py` |
+| ~~U-04~~ | ✅ El panel de admin ahora lista exactamente las predicciones de su teclado (test con 10) | `bot/handlers/admin.py` |
 | ~~U-05~~ | ✅ «Pago por punto apostado» mezcla puntos con formato de multiplicador `x…` en el mismo bloque. Resuelto en Fase 4: la confirmación habla de «puntos por punto apostado» y del reintegro cuando no hay ganadores | `bot/handlers/admin.py` |
-| U-06 | `help.py` promete `/admin` y `/ranking` a todos, aunque el panel esté restringido | `bot/handlers/help.py:32-34` |
+| ~~U-06~~ | ✅ `/help` es consciente del rol: `/admin` solo aparece para administradores | `bot/handlers/help.py` |
 
 ---
 
