@@ -90,7 +90,7 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
   limpieza, con índice por `next_retry_at`.
 - Columnas `markets.metadata_source` y `markets.pending_resolve_at` con migración
   para bases existentes.
-- 22 pruebas nuevas: recuperación tras fallo, transacción envenenada, propiedad
+- 45 pruebas nuevas (263 → 308 en total): recuperación tras fallo, transacción envenenada, propiedad
   «con fallos transitorios el espejo acaba igual», marcador vs. evento, migración
   del esquema antiguo de wallets, política de cancelación y ventana de resolución.
 

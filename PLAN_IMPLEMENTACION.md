@@ -144,7 +144,7 @@ Fase 0 ──► Fase 1 ──► Fase 2
 
 ## 3. Fase 0 — Red de seguridad
 
-**Objetivo:** que a partir de aquí todo cambio sea verificable automáticamente. Hoy 119 tests solo corren si alguien se acuerda.
+**Objetivo:** que a partir de aquí todo cambio sea verificable automáticamente. Hoy 263 tests solo corren si alguien se acuerda.
 
 ### Cambios
 

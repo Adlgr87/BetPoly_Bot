@@ -24,7 +24,7 @@
 | Código muerto / duplicado | ⚠️ 19 símbolos sin uso, 3 clones reales, 1 fachada de paquete sin consumidores |
 | Hardcodeo | ⚠️ Sin secretos ni direcciones; sí constantes de dinero/tiempos dispersas |
 | Dependencias | ✅ Fijadas y al día salvo `python-telegram-bot` (una major por detrás) |
-| Automatización | ❌ No existe CI: los 119 tests nunca se ejecutan automáticamente |
+| Automatización | ❌ No existe CI: los 263 tests nunca se ejecutan automáticamente |
 
 **Conteo:** 7 hallazgos críticos/altos · 15 medios · 25 menores, más 19 símbolos de código muerto.
 
@@ -35,7 +35,7 @@
 Herramientas ejecutadas sobre el commit auditado:
 
 - `ruff` (0.17.2), `vulture` (2.16), `bandit` (1.9.4), `radon`, `jscpd` (4.x), `pip-audit` (2.10.1), `npm audit`.
-- `pytest` con `pytest-cov` → **119 tests en verde, cobertura total 55 %**.
+- `pytest` con `pytest-cov` → **263 tests en verde, cobertura total 55 %**.
 - `contracts/`: `node scripts/build.js`, `node tests/escrow.test.js` (22 comprobaciones), `npm audit`, `node scripts/deploy.js` (dry-run real).
 - Arranque real de `scripts/dev_server.py` en el puerto 8080 y sondeo con `curl`.
 - Pruebas de API con `aiohttp.test_utils.TestClient` sobre bases de datos desechables (`/tmp/audit*.db`), incluidos casos de abuso (rotación de `X-Forwarded-For`, montos límite, `limit`/`offset` extremos).
@@ -51,7 +51,7 @@ Para que el listado de problemas no dé una impresión falsa del estado del proy
 
 1. **Contrato:** `node scripts/build.js` reproduce exactamente el hash fijado en `tests/test_contract_sync.py::CODE_HASH` → `a29c5c51fe93597967c6d37c976a27e989d13662117165dec1d899fe3292db9b`. Compilación determinista y verificable.
 2. **Suite del contrato:** 22/22 comprobaciones en `@ton/sandbox` (crear, apostar, resolver, reclamar, cancelar, reembolsos, pausa, fees).
-3. **Suite Python:** 119 tests, 0 fallos, sin red.
+3. **Suite Python:** 263 tests, 0 fallos, sin red.
 4. **Arranque de la Mini App:** `scripts/dev_server.py` responde `200` en `/`, `/api/health` y devuelve mercados sembrados en `/api/markets`.
 5. **`main.py --check`:** valida de verdad y sale con código `2` ante configuración inválida (probado con `BET_MODE=hybrid` sin `ESCROW_ADDRESS` y con `PUBLIC_BASE_URL` en `http://`).
 6. **`deploy.js`:** dry-run correcto, exit `1` con dirección inválida, exit `0` con datos válidos; no envía transacciones en dry-run.
@@ -178,7 +178,7 @@ El texto del panel recorta a `predictions[:8]` (`bot/handlers/admin.py:75`) mien
 ### F-09 — 🟠 `dev_server.py` sirve un manifest `http://` y no pasa por la validación de configuración
 `scripts/dev_server.py:26` fija `PUBLIC_BASE_URL=http://localhost:8080`; TON Connect rechaza orígenes no HTTPS (el propio `config.validate()` lo exige en `bot`/`api`). En el preview local funciona porque la validación no se ejecuta en ese camino, pero el manifest resultante no es usable por wallets reales.
 
-### F-10 — 🟠 No hay CI: 119 tests que nadie ejecuta automáticamente
+### F-10 — 🟠 No hay CI: 263 tests que nadie ejecuta automáticamente
 No existe `.github/`, ni `Makefile`, ni `tox.ini`, ni `pre-commit`. La suite es buena, pero solo se ejecuta si alguien se acuerda.
 
 ### F-11 — 🟠 El flujo de instalación documentado no permite ejecutar los tests
