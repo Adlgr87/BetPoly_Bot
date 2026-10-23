@@ -30,7 +30,7 @@
 
 **Estado tras la Fase 7 (2026-10-23):** los 47 hallazgos están cerrados. La tabla
 de arriba es la foto del commit auditado y se conserva como registro; cada
-hallazgo lleva al final su línea *Resuelto*. Medido hoy: `pytest` **668 tests en
+hallazgo lleva al final su línea *Resuelto*. Medido hoy: `pytest` **670 tests en
 verde**, cobertura **85,8 %**; `ruff check .` y `vulture --min-confidence 80`
 limpios; contrato con el mismo hash reproducible y 25/25 comprobaciones.
 
