@@ -20,6 +20,8 @@ from bot import api
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "web" / "index.html"
 APP_JS = ROOT / "web" / "static" / "app.js"
+README = ROOT / "README.md"
+BRANDING = ROOT / "web" / "branding"
 
 #: ``onclick=``, ``onerror=``… pero no ``data-on...`` ni ``addEventListener``.
 INLINE_HANDLER = re.compile(r"(?<![\w-])on[a-z]+\s*=", re.IGNORECASE)
@@ -97,6 +99,36 @@ class TestCspHeader:
         response = await web_client.get("/static/app.js")
         assert response.status == 200
         assert "data-reload" in await response.text()
+
+
+class TestBranding:
+    """El logo es un activo versionado, no una imagen suelta en un chat."""
+
+    def test_index_declares_the_icon_as_favicon(self):
+        html = INDEX.read_text(encoding="utf-8")
+        assert 'rel="icon"' in html and "/static/icon.png" in html
+        assert 'rel="apple-touch-icon"' in html
+
+    def test_the_header_shows_the_logo(self):
+        html = INDEX.read_text(encoding="utf-8")
+        assert '<img class="brand-mark" src="/static/icon.png"' in html
+        assert 'class="boot-logo"' in html
+
+    def test_readme_images_exist(self):
+        """Un README con imágenes rotas es documentación que miente."""
+        images = re.findall(r'<img[^>]*src="([^"]+)"', README.read_text(encoding="utf-8"))
+        images += re.findall(r"!\[[^\]]*\]\(([^)]+)\)", README.read_text(encoding="utf-8"))
+        assert images, "el README debería mostrar el logo"
+        for src in images:
+            if src.startswith(("http://", "https://")):
+                continue
+            assert (ROOT / src).is_file(), f"imagen inexistente en el README: {src}"
+
+    def test_branding_sheet_and_icon_are_versioned(self):
+        assert (BRANDING / "logo-source.png").is_file()
+        assert (BRANDING / "logo-card.png").is_file()
+        # La lámina no se sirve al cliente: sería peso muerto en el arranque.
+        assert not list((ROOT / "web" / "static").glob("logo*"))
 
 
 class TestNoLocalEconomics:

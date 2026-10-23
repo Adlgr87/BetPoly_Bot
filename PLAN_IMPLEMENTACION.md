@@ -440,14 +440,16 @@ cliente HTTP real. Todo queda fijado en `tests/test_performance.py` y
 | R-05 | Índice compuesto `markets(status, closes_at)` | idem (elimina el B-TREE temporal) | ✅ `idx_markets_status_close` + `idx_onchain_bets_mkt_opt`: dos `TEMP B-TREE` menos |
 | R-01 | Una sola consulta para la página de predicciones (JOIN + `GROUP BY`) | test de conteo de queries con un `Connection` instrumentado | ✅ la página hace **3 consultas** con 1 o con 11 mercados; la lista de predicciones, 1 |
 | R-02/R-03 | `get_user_stats(user_id)` con `SUM/COUNT` en SQL + `ranking_position(user_id)` | test de equivalencia con el cálculo actual | ✅ equivalencia exacta con el cálculo en Python; el ranking ya muestra puesto |
-| R-06 | `icon.png` a 512×512 WebP/PNG optimizado (<80 KB) | test que falla si un asset estático supera el presupuesto | ✅ 921 682 B → **79 408 B** (−91 %), `scripts/build_icon.py` reproducible |
+| R-06 | `icon.png` a 512×512 PNG optimizado (<80 KB) | test que falla si un asset estático supera el presupuesto | ✅ 921 682 B → **79 408 B** (−91 %); desde la identidad visual, el icono se recorta del logo de marca y pesa **55 535 B** |
 | R-09 | `Cache-Control: public, max-age=31536000, immutable` para assets versionados; gzip en memoria para `/static/*.js|css` | test de cabeceras | ✅ `?v=<huella>` → inmutable; gzip memoizado; `ETag` + `304` en el resto |
 | R-08 | Polling adaptativo: `setInterval` 25 s → backoff 15/30/60 s; `ETag` en `/api/markets` con `304` | test de que un segundo GET devuelve 304 | ✅ sin `setInterval`; escalones 15/30/60 s con reinicio por actividad; `/api/markets` responde `304` |
 | R-07 | Dividir `verify_ton_proof` (E36) y `settle_prediction` (C18) en pasos con nombre | test de complejidad sobre el AST con trinquete | ✅ 36 → **2** y 20 → **1**; la lista base empezó con 16 funciones y hoy tiene 14 (Fase 7) |
 
-**Presupuesto de arranque de la Mini App:** HTML+CSS+JS+icono < 350 KB comprimidos.
-Medido: **93.3 KB** (index.html 2.4 + styles.css 3.0 + app.js 10.5 + icono 77.5),
-frente a los 921 KB del icono anterior.
+**Presupuesto de arranque de la Mini App:** todo lo que descarga el móvil antes de
+pintar < 350 KB comprimidos. Medido hoy: **248.7 KB** (index.html 2.4 + styles.css
+3.0 + app.js 11.0 + icono 54.2 + `tonconnect-ui.min.js` 154.9 + …), de los que el
+icono bajó de 921 KB a 54 KB y el bundle de terceros entró vendorizado en la
+Fase 7.
 
 **Detalles de implementación que importan**
 

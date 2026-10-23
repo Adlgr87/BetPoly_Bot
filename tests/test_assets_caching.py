@@ -169,22 +169,34 @@ class TestAssetBudget:
             f"{STARTUP_BUDGET_BYTES / 1024:.0f} KB"
         )
 
-    def test_icon_builder_refuses_a_bigger_target(self, tmp_path, monkeypatch):
+    def test_icon_builder_refuses_a_bigger_target(self, tmp_path):
         """El script falla si el resultado se pasa del presupuesto."""
 
-        class FakeImage:
+        calls: list[str] = []
+
+        class Surface:
+            """Doble mínimo de `PIL.Image`: solo lo que usa el script."""
+
             LANCZOS = 1
             MEDIANCUT = 0
 
-            def open(self, path):
-                return self
+            def __init__(self, size):
+                self.size = size
 
             def convert(self, mode):
                 return self
 
+            def crop(self, box):
+                calls.append(("crop", box))
+                left, top, right, bottom = box
+                return Surface((right - left, bottom - top))
+
             def resize(self, size, method):
-                assert size == (build_icon.SIZE, build_icon.SIZE)
-                return self
+                calls.append(("resize", size))
+                return Surface(size)
+
+            def paste(self, image, offset, mask=None):
+                calls.append(("paste", offset, mask is not None))
 
             def quantize(self, colors, method):
                 assert colors == build_icon.COLORS
@@ -193,12 +205,65 @@ class TestAssetBudget:
             def save(self, target, optimize=True):
                 target.write_bytes(b"x" * (build_icon.BUDGET_BYTES + 1))
 
+        class FakeImage:
+            LANCZOS = 1
+            MEDIANCUT = 0
+
+            def open(self, path):
+                calls.append("open")
+                return Surface((463, 480))  # misma lámina que el logo de marca
+
+            def new(self, mode, size, color):
+                assert size[0] <= build_icon.SIZE and size[1] <= build_icon.SIZE, size
+                if size == (build_icon.SIZE, build_icon.SIZE):
+                    assert color == build_icon.BACKGROUND
+                    calls.append(("canvas", size))
+                return Surface(size)
+
         source = tmp_path / "original.png"
         source.write_bytes(b"png")
         target = tmp_path / "icon.png"
         code = build_icon.build(source, target, image_module=FakeImage())
+
         assert code == 1
         assert target.stat().st_size > build_icon.BUDGET_BYTES
+        assert calls[0] == "open"
+        assert ("crop", build_icon.CROP) in calls
+        assert ("canvas", (build_icon.SIZE, build_icon.SIZE)) in calls
+        limit = build_icon.SIZE * (1 - 2 * build_icon.MARGIN)
+        fitted = [call[1] for call in calls if call[0] == "resize"][0]
+        assert fitted[0] <= limit and fitted[1] <= limit, fitted
+        # El emblema se pega sobre el lienzo con una máscara: sin ella el borde
+        # del recorte se vería como un marco rectangular.
+        assert any(call[2] for call in calls if call[0] == "paste")
+
+    def test_icon_builder_rejects_a_sheet_smaller_than_the_crop(self, tmp_path):
+        """Si alguien cambia la lámina, el recorte del emblema ya no vale."""
+
+        class SmallSheet:
+            LANCZOS = 1
+            MEDIANCUT = 0
+            size = (200, 200)
+
+            def open(self, path):
+                return self
+
+            def convert(self, mode):
+                return self
+
+            def crop(self, box):  # pragma: no cover - no debe llegar aquí
+                raise AssertionError("no se debe recortar una lámina que no cabe")
+
+        source = tmp_path / "otra.png"
+        source.write_bytes(b"png")
+        assert build_icon.build(
+            source, tmp_path / "out.png", image_module=SmallSheet()
+        ) == 2
+
+    def test_branding_sheet_is_versioned(self):
+        """La lámina del logo se versiona: sin ella el icono no es reproducible."""
+        assert build_icon.SOURCE.is_file(), build_icon.SOURCE
+        assert build_icon.SOURCE.stat().st_size > 100_000
 
     def test_icon_builder_reports_a_missing_source(self, tmp_path):
         class NeverUsed:

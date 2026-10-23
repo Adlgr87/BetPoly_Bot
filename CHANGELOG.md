@@ -524,3 +524,39 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - La verificación de un despliegue real en testnet sigue siendo una acción manual
   con wallet (`RUNBOOK` de `README.md`); el repo solo puede automatizar el
   dry-run.
+
+---
+
+## Identidad visual — logo de BetPoly Bot
+
+**Fecha:** 2026-10-23
+
+### Añadido
+- **Lámina de marca.** `web/branding/logo-source.png` (original) y
+  `web/branding/logo-card.png` (512×512, la que se ve en el README). Se versionan
+  para que el icono sea reproducible; **no** se sirven al cliente, así que no
+  pesan en el arranque de la Mini App.
+- **`scripts/build_icon.py` ahora parte del logo.** Antes reescalaba el
+  `icon.png` existente (una imagen suelta sin origen); ahora recorta el emblema
+  de la lámina (`CROP`), lo encaja centrado sin deformarlo (`MARGIN`), difumina
+  el borde del recorte (`FEATHER`) y lo cuantiza. `web/static/icon.png`:
+  54,2 KB, 512×512, por debajo del presupuesto de 80 KB.
+- **La Mini App usa el logo de verdad**: favicon, `apple-touch-icon`, `og:image`,
+  el icono de arranque (`boot-logo`) y la marca de la cabecera (`brand-mark`)
+  dejan de ser el carácter «◎».
+- `README.md` abre con la tarjeta de marca y gana una sección *Marca e icono* con
+  el comando de regeneración.
+
+### Decidido
+- **El avatar es el emblema, no la lámina completa.** Telegram muestra el avatar
+  recortado en círculo y el rótulo «BETPOLY BOT» queda ilegible a 300 px; la
+  tarjeta completa se usa en el README, donde hay sitio.
+- **El recorte es una constante con test, no magia.** Si la lámina cambia de
+  tamaño, el script sale con código 2 en vez de generar un icono descentrado.
+- **La marca no entra en `web/static/`.** Todo lo que vive ahí se sirve, se
+  versiona con `?v=` y cuenta contra el presupuesto de arranque.
+
+### Guardarraíles nuevos
+`tests/test_web_assets.py::TestBranding` comprueba que el `index.html` declara el
+favicon, que la cabecera y el arranque muestran el logo, que **toda imagen local
+del README existe** y que la lámina no se cuela en `web/static`.

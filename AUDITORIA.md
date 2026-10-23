@@ -367,7 +367,7 @@ No se encontraron secretos, mnemónicos ni direcciones hardcodeadas. Lo que sí 
 ### R-06 — ✅ `icon.png` de 921 KB en cada carga de la Mini App
 `web/static/icon.png` es 1024×1024, RGB (sin canal alfa), 921 682 bytes, y se sirve tal cual dentro de Telegram, donde el ancho útil ronda los 300 px. Es el activo más pesado del proyecto con diferencia.
 
-**Resuelto (Fase 6):** regenerado a 512×512 con paleta de 64 colores: **79 408 B** (−91 %). `scripts/build_icon.py` lo reproduce de forma idempotente y falla si supera los 80 KB; un test vigila el presupuesto.
+**Resuelto (Fase 6):** regenerado a 512×512: **79 408 B** (−91 %). `scripts/build_icon.py` lo reproduce de forma idempotente y falla si supera los 80 KB; un test vigila el presupuesto. **Actualizado:** el icono ya sale del logo de marca (`web/branding/logo-source.png`) y pesa **55 535 B**.
 
 ### R-07 — ✅ Complejidad alta en el núcleo de dinero
 `radon`: `verify_ton_proof` E36, `_process_tx` D26, `_send_profile` D25, `validate_init_data` D22, `verify_wallet` C19, `settle_prediction` C18, `_fetch` C18, `market_view` C16, `prepare_transaction_payload` C16, `bet_amount_message` C16, `prepare_create_market` C14, `Settings.validate` C14. `verify_ton_proof` y `settle_prediction` son las que más se beneficiarían de dividirse en pasos.

@@ -1,6 +1,15 @@
+<p align="center">
+  <img src="web/branding/logo-card.png" alt="BetPoly Bot" width="320" />
+</p>
+
 # BetPoly_Bot 🎯
 
 Predicciones y mercados de apuestas sobre TON, servidos desde un bot de Telegram y una **Mini App** web. El backend **nunca custodia fondos y nunca firma transacciones**: solo *lee* la blockchain y *prepara* transacciones sin firmar que el usuario (o el admin) firma en su propia wallet.
+
+**Estado:** las 8 fases del plan de implementación están cerradas —676 tests en
+verde, cobertura 85,8 %, contrato con hash reproducible y CI de 4 jobs en verde—.
+Lo que queda es producto, no deuda: oráculo automático (F013) y on-ramp fiat
+(F014).
 
 ---
 
@@ -63,7 +72,8 @@ BetPoly_Bot/
 │   ├── keyboards.py         # teclados inline
 │   └── handlers/            # start, predictions, markets, stats, wallet, admin, help
 ├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png,
-│                            # tonconnect-ui.min.js vendorizado con SRI)
+│   │                        # tonconnect-ui.min.js vendorizado con SRI)
+│   └── branding/            # lámina del logo (fuente del icono) y tarjeta para el README
 ├── scripts/                 # utilidades: build_icon.py, dev_server.py
 ├── contracts/               # escrow.fc, stdlib, build.js, deploy.js, tests
 ├── tests/                   # suite pytest offline
@@ -110,7 +120,7 @@ python scripts/dev_server.py --port 8080 --db /tmp/demo.db
 cd contracts
 npm install
 npm run build     # contracts/build/escrow.code.boc + escrow.fif
-npm test          # 22 checks sobre @ton/sandbox (sin red)
+npm test          # 25 checks sobre @ton/sandbox (sin red)
 ```
 
 Hash de referencia del código compilado actual:
@@ -209,8 +219,9 @@ el sondeo de la Mini App cuesta unas decenas de bytes cuando nada cambió. Los
 activos de `/static` salen con la huella del contenido en la URL (`?v=…`) y
 `Cache-Control: public, max-age=31536000, immutable`; JS y CSS viajan con gzip
 comprimido una sola vez por proceso. El arranque completo (HTML + CSS + JS +
-icono) pesa **~93 KB** comprimidos, con un presupuesto de 350 KB que un test
-hace cumplir.
+icono) pesa **~93 KB** comprimidos; con el bundle de TON Connect vendorizado, el
+total que descarga el móvil son **~249 KB** frente a un presupuesto de 350 KB que
+un test hace cumplir (`tests/test_assets_caching.py`).
 
 ---
 
@@ -319,7 +330,7 @@ impone Telegram/aiohttp.
 La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`,
 `FakeClient` para el indexer, claves Ed25519 sintéticas para `ton_proof` y dobles
 de `Update`/`Message`/`CallbackQuery` (`tests/telegram_fakes.py`) para la capa
-Telegram. Cobertura actual: **85 %** global (umbral 83) y **89 %** en
+Telegram. Cobertura actual: **85,8 %** global (umbral 83) y **89 %** en
 `bot/handlers/*` + `bot/keyboards.py` (umbral propio 70; los teclados, 100 %).
 
 **Dependencias del contrato.** `node scripts/audit.js` aplica `npm audit` con
@@ -328,15 +339,30 @@ build; una excepción **caducada**, sin motivo o que ya no corresponde a ningún
 advisory también falla, así que la lista solo puede encogerse. Hoy hay una
 excepción (`zod` vía `@ton/ton`, sin parche publicado) con fecha de caducidad.
 
-**Activos.** `web/static/icon.png` se regenera con `python scripts/build_icon.py`
-(Pillow solo hace falta para esa tarea puntual; el bot no depende de ella). El
-script escribe el PNG y falla si supera los 80 KB.
+### Marca e icono
+
+El logo vive en `web/branding/logo-card.png` (la lámina completa, la que se ve
+arriba) y `web/branding/logo-source.png` (la original). El avatar de Telegram y el
+icono del manifiesto de TON Connect son **el emblema**, no la lámina entera: a
+300 px el rótulo es ilegible y Telegram recorta el avatar en círculo.
+
+```bash
+pip install pillow                    # solo para regenerar el activo
+python scripts/build_icon.py          # lámina → web/static/icon.png (54 KB)
+python scripts/build_icon.py --check  # verifica tamaño y 512×512
+```
+
+El recorte del emblema y el difuminado del borde son explícitos (`CROP`,
+`MARGIN`, `FEATHER`) y tienen test: si alguien cambia la lámina, el script falla
+en vez de generar un icono descentrado. El PNG resultante se sirve con la huella
+del contenido en la URL y con `integrity` verificado para el bundle de TON
+Connect; el presupuesto de 80 KB lo hace cumplir `tests/test_assets_caching.py`.
 
 **CI** (`.github/workflows/ci.yml`) ejecuta en cada push: lint, tests con umbral de
 cobertura, compilación del contrato con verificación del hash reproducible,
 sandbox TVM, `npm audit` y `pip-audit`.
 
-Tres suites son *guardarraíles* y no pruebas funcionales:
+Estas suites son *guardarraíles* y no pruebas funcionales:
 
 - `tests/test_architecture.py` — dirección de las dependencias entre capas.
 - `tests/test_wiring.py` — conectividad: rutas sin consumidor, botones sin
