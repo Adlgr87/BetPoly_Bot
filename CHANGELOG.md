@@ -446,3 +446,81 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - R-07 queda cerrado para las dos funciones del núcleo de dinero; las 16
   funciones del baseline (indexer, `config.validate`, `verify_wallet`) se
   dividen en la Fase 7 con el trinquete ya puesto.
+
+---
+
+## Fase 7 — Mantenibilidad, dependencias y tooling del contrato
+
+**Fecha:** 2026-10-23
+
+### Arreglado
+- **5.1 · 19 símbolos de código muerto.** Fuera `TonCenterClient.get_account_state`,
+  `_Ordered`, `IndexResult.fetched/skipped/last_result`, `prepare_transaction_payload`,
+  `prepare_for_body`, `formatting.link/ton_with_unit/tx_short/parse_iso`,
+  `addresses.TESTNET/derive_address_hash`, `RateLimiter.reset`,
+  `Settings.escrow_admin_address`, `config.__getattr__` y `database.market_pool`.
+  Los cuatro `build_*` que la auditoría marcó como muertos no se borraron: eran la
+  mitad de una función ya implementada, así que ahora los usa el panel del
+  contrato. `bot/chain/__init__.py` pierde sus 25 re-exports; los tests importan
+  submódulos y el paquete queda vacío.
+- **D-04 · El esquema se actualizaba con un `UPDATE … points = 1000`.** Migraciones
+  versionadas con `PRAGMA user_version` (`_MIGRATIONS`, `_apply_migrations`),
+  idempotentes, forward-only y con rechazo explícito de una base más nueva que el
+  código. El saldo inicial se escribe al crear el usuario, así que cambiar
+  `STARTING_POINTS` ya no deja saldos incoherentes.
+- **D-05 · `upsert_user` borraba el `@usuario`.** `COALESCE(excluded.username,
+  users.username)`: un usuario que se quita el alias de Telegram conserva el que
+  ya tenía registrado.
+- **D-06 · `bot/keyboards.py` al 17 % de cobertura.** `tests/test_keyboards.py`
+  (15 tests) lo lleva al **100 %**. Los tests se escribieron contra el
+  comportamiento real —la fila «👛 Wallet vinculada» sale del estado del escrow,
+  el «cancelar» de la confirmación vuelve a la pantalla de resolución—, y lo que
+  parecía un bug (`back_to_menu_keyboard` ignorando `is_admin`) se dejó como
+  no-op documentado: el menú principal ya lleva los botones del rol.
+- **F-07 · `except (AddressError, Exception)`.** `parse_message_body` ya no
+  convierte cualquier bug en «evento irrelevante»: solo degrada errores de
+  parseo, y un fallo inesperado sube.
+- **F-08 · Panel admin sin paginar.** `ADMIN_PREDICTIONS_PAGE = 6`; el texto y los
+  botones salen de la misma página (`admin_preds:<p>`) y el test comprueba que
+  entre todas las páginas aparece cada predicción pendiente.
+- **F-09 · `dev_server.py` sin CLI.** Acepta `--host`, `--port`, `--db`,
+  `--public-base-url` (con `reset_settings()`, para que manifest y validación usen
+  el mismo origen) y `--no-seed`; avisa por consola cuando el manifest sigue en
+  `http://` y ninguna wallet real podrá usarlo.
+- **F-12 · Script de firma cargado desde un CDN sin integridad.** `@tonconnect/ui`
+  5.0.1 vendorizado (`web/static/tonconnect-ui.min.js`, 159 KB gzip) con
+  `integrity="sha384-…"` recalculado por un test; la CSP deja `script-src` en
+  `'self' https://telegram.org` y `unpkg.com` desaparece.
+- **F-13 · `deploy.js` podía cantar un despliegue inexistente.** Si no alcanza
+  `state === 'active'` en el plazo, sale con código 1 y **no** escribe
+  `deploy.json`; además aborta si el hash compilado no es el fijado o si la
+  cuenta no está `active`. `contracts/tests/deploy.test.js` (5 checks).
+- **T-02 · PTB 21.6 → 22.8.** La suite entera pasa sin cambios de código; el pin
+  incluye el extra `job-queue`.
+- **D-01 · Duplicación.** `_user_payload` (sesión y perfil), `_require_admin` y
+  `_market_id` (endpoints de admin), un solo formateador de la línea de mercado
+  del panel y `create_nonce` delegando la caducidad en `purge_nonces`.
+- **R-10 · Ruff a medias.** `UP006/UP045` normalizados (465 anotaciones
+  reescritas), `PLR2004`/`ARG`/`PLC0415` activados: los números mágicos pasan a
+  constantes con nombre (`MIN_OPTIONS`, `MIN_TITLE_LENGTH`, `MAX_OPTION_LENGTH`,
+  `MAX_FEE_BPS`, `MAX_CLOCK_SKEW`, `SECONDS_PER_MINUTE/HOUR/DAY`) y los imports
+  perezosos o están justificados con motivo o suben al encabezado.
+
+### Decidido
+- **Las excepciones del linter viven en `pyproject.toml`, con motivo y por
+  fichero**, no en `# noqa` dispersos: tests (imports dentro de fixtures), anchos
+  de bits de `bot/chain/*` y las firmas que imponen Telegram/aiohttp. Una
+  excepción nueva obliga a tocar un solo sitio revisable.
+- **El baseline de complejidad bajó a 14 entradas** en vez de quedarse quieto:
+  `market_view` (15 → 4) se partió en `_option_views` y `_open_now`, y
+  `_show_admin_panel` (14 → 13) delegó la paginación en su propio callback.
+- **Los tres clones de tres líneas que quedan se aceptan.** Son el guardia
+  `market_id is None → 400` repetido en seis handlers: es el idiom de retorno
+  temprano de aiohttp y cualquier abstracción lo haría menos legible. Queda
+  escrito en `AUDITORIA.md` para que no reaparezca como hallazgo.
+
+### Pendiente
+- Nada del alcance auditado: los 47 hallazgos están cerrados.
+- La verificación de un despliegue real en testnet sigue siendo una acción manual
+  con wallet (`RUNBOOK` de `README.md`); el repo solo puede automatizar el
+  dry-run.

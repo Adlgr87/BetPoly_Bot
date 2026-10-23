@@ -21,13 +21,14 @@ import json
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
 from urllib.parse import parse_qsl
 
 import config
 
 SESSION_TTL = 60 * 60  # 1 hour
 MAX_INIT_DATA_AGE = 24 * 60 * 60
+#: Tolerancia de reloj hacia el futuro antes de rechazar un `auth_date`.
+MAX_CLOCK_SKEW = 300
 
 
 class AuthError(ValueError):
@@ -39,9 +40,9 @@ class AuthError(ValueError):
 @dataclass(frozen=True)
 class TelegramUser:
     user_id: int
-    username: Optional[str]
+    username: str | None
     full_name: str
-    language_code: Optional[str] = None
+    language_code: str | None = None
     is_premium: bool = False
 
 
@@ -55,10 +56,10 @@ def _hmac(key: bytes, message: bytes) -> bytes:
 
 def validate_init_data(
     init_data: str,
-    bot_token: Optional[str] = None,
+    bot_token: str | None = None,
     *,
     max_age: int = MAX_INIT_DATA_AGE,
-    now: Optional[int] = None,
+    now: int | None = None,
 ) -> TelegramUser:
     """Validate Telegram WebApp ``initData`` and return the user."""
     token = bot_token or config.require_bot_token()
@@ -88,7 +89,7 @@ def validate_init_data(
         raise AuthError("bad_init_data", "auth_date inválido.") from exc
     if auth_date <= 0 or current - auth_date > max_age:
         raise AuthError("expired_init_data", "La sesión de Telegram expiró; reabre la Mini App.")
-    if auth_date - current > 300:
+    if auth_date - current > MAX_CLOCK_SKEW:
         raise AuthError("bad_init_data", "auth_date está en el futuro.")
 
     try:
@@ -123,7 +124,7 @@ def _unb64(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + padding)
 
 
-def issue_session(user_id: int, *, ttl: int = SESSION_TTL, now: Optional[int] = None) -> str:
+def issue_session(user_id: int, *, ttl: int = SESSION_TTL, now: int | None = None) -> str:
     settings = config.get_settings()
     issued = int(now if now is not None else time.time())
     expires = issued + max(60, ttl)
@@ -132,7 +133,7 @@ def issue_session(user_id: int, *, ttl: int = SESSION_TTL, now: Optional[int] = 
     return f"{body}.{_b64(signature)}"
 
 
-def verify_session(token: str, *, now: Optional[int] = None) -> int:
+def verify_session(token: str, *, now: int | None = None) -> int:
     settings = config.get_settings()
     if not token:
         raise AuthError("missing_session", "Falta el token de sesión.")
@@ -153,7 +154,7 @@ def verify_session(token: str, *, now: Optional[int] = None) -> int:
     return user_id
 
 
-def dev_session(init_data: Optional[str]) -> Optional[str]:
+def dev_session(init_data: str | None) -> str | None:
     """Explicit, opt-in bypass used only when the Mini App runs outside Telegram.
 
     Disabled by default and rejected in production by ``Settings.validate()``.
@@ -183,9 +184,9 @@ class RateLimiter:
         self.limit = max(1, int(limit))
         self.window = float(window_seconds)
         self.max_keys = max(1, int(max_keys))
-        self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
 
-    def allow(self, key: str, *, now: Optional[float] = None) -> Tuple[bool, float]:
+    def allow(self, key: str, *, now: float | None = None) -> tuple[bool, float]:
         current = float(now if now is not None else time.time())
         bucket = self._hits.get(key)
         if bucket is None:
@@ -206,7 +207,7 @@ class RateLimiter:
     def __len__(self) -> int:
         return len(self._hits)
 
-    def reset(self, key: Optional[str] = None) -> None:
+    def reset(self, key: str | None = None) -> None:
         if key is None:
             self._hits.clear()
         else:

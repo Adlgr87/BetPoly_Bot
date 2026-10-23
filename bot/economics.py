@@ -16,8 +16,6 @@ El contrato (`contracts/escrow.fc`) hace exactamente lo mismo con
 """
 from __future__ import annotations
 
-from typing import Optional
-
 #: Los importes se guardan en la unidad mínima (nanoTON / puntos), así que las
 #: comisiones se expresan en puntos base: 1 % = 100 bps.
 BPS_DENOMINATOR = 10_000
@@ -60,7 +58,7 @@ def payout(stake: int, distributable_pool: int, winning_pool: int) -> int:
     return (stake * distributable_pool) // winning_pool
 
 
-def multiplier(total: int, option_pool: int, fee_bps: int) -> Optional[float]:
+def multiplier(total: int, option_pool: int, fee_bps: int) -> float | None:
     """Multiplicador **neto** de una opción, o ``None`` si aún no hay pozo.
 
     Es lo que se muestra al usuario («x2.45» significa que cada TON apostado

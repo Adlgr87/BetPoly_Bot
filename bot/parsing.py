@@ -13,9 +13,9 @@ caller shows that text directly.
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
-from bot.markets import MarketError
+from bot.markets import MAX_FEE_BPS, MarketError
 
 #: ``1``, ``1.5``, ``1,5``, ``0.000000001`` — up to 9 decimals, no signs, no exponents.
 NANO_RE = re.compile(r"^\d+(?:[.,]\d{1,9})?$")
@@ -47,7 +47,7 @@ def parse_nano(value: Any, *, field: str = "importe") -> int:
     return int(whole) * NANO_PER_TON + int(frac.ljust(9, "0") or 0)
 
 
-def parse_points(value: Any, *, maximum: Optional[int] = None) -> int:
+def parse_points(value: Any, *, maximum: int | None = None) -> int:
     """Parse a points stake, refusing silent losses (S-06).
 
     * ``250`` -> 250
@@ -103,6 +103,6 @@ def parse_fee_bps(value: Any) -> int:
         )
     percent = float(raw)
     bps = int(round(percent * 100))
-    if bps > 1000:
+    if bps > MAX_FEE_BPS:
         raise MarketError("bad_fee", "La comisión máxima es del 10 %.")
     return bps

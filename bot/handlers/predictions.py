@@ -40,7 +40,7 @@ from bot.keyboards import (
     options_keyboard,
     predictions_list_keyboard,
 )
-from bot.markets import MarketError
+from bot.markets import MIN_TITLE_LENGTH, MarketError
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +370,7 @@ async def crear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def ask_title_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     title = " ".join((update.effective_message.text or "").split())
-    if len(title) < 6:
+    if len(title) < MIN_TITLE_LENGTH:
         await update.effective_message.reply_text(
             "❌ El título debe tener al menos 6 caracteres. Inténtalo de nuevo."
         )
@@ -401,7 +401,7 @@ async def ask_options_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         if label:
             options.append(label)
 
-    if not 2 <= len(options) <= settings.max_options:
+    if not database.MIN_OPTIONS <= len(options) <= settings.max_options:
         await update.effective_message.reply_text(
             f"❌ Necesitas entre 2 y {settings.max_options} opciones separadas por comas."
         )

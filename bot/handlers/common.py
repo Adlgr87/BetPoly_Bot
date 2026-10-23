@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from telegram import Update
 from telegram.constants import ChatType
@@ -19,7 +18,7 @@ create_limiter = security.RateLimiter(limit=5, window_seconds=3600)
 notify_limiter = security.RateLimiter(limit=20, window_seconds=60)
 
 
-def is_admin(user_id: Optional[int]) -> bool:
+def is_admin(user_id: int | None) -> bool:
     return bool(user_id) and int(user_id) in config.get_settings().admin_ids
 
 
@@ -54,7 +53,7 @@ def _user_id(update: Update):
     return getattr(user, "id", None)
 
 
-async def safe_answer(query, text: Optional[str] = None, alert: bool = False) -> None:
+async def safe_answer(query, text: str | None = None, alert: bool = False) -> None:
     """Answer a callback query, ignoring 'already answered' races."""
     try:
         await query.answer(text=text, show_alert=alert)

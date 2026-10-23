@@ -20,7 +20,7 @@ perdida no genera mensaje (para eso está ``/misbets``).
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any
 
 from bot.database import (
     NOTIFICATION_MARKET_CLAIM,
@@ -35,7 +35,7 @@ KIND_MARKET_CLAIM = NOTIFICATION_MARKET_CLAIM
 KIND_MARKET_REFUND = NOTIFICATION_MARKET_REFUND
 
 
-def render(row: Dict[str, Any]) -> Optional[str]:
+def render(row: dict[str, Any]) -> str | None:
     """Texto HTML del aviso, o ``None`` si la fila no es representable."""
     try:
         payload = json.loads(row.get("payload") or "{}")
@@ -54,7 +54,7 @@ def render(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _prediction_result(payload: Dict[str, Any]) -> str:
+def _prediction_result(payload: dict[str, Any]) -> str:
     title = esc(payload.get("title") or "tu predicción")
     payout = int(payload.get("payout") or 0)
     stake = int(payload.get("stake") or 0)
@@ -73,7 +73,7 @@ def _prediction_result(payload: Dict[str, Any]) -> str:
     )
 
 
-def _market_claim(payload: Dict[str, Any]) -> str:
+def _market_claim(payload: dict[str, Any]) -> str:
     title = esc(payload.get("title") or "el mercado")
     market_id = payload.get("market_id")
     return (
@@ -84,7 +84,7 @@ def _market_claim(payload: Dict[str, Any]) -> str:
     )
 
 
-def _market_refund(payload: Dict[str, Any]) -> str:
+def _market_refund(payload: dict[str, Any]) -> str:
     title = esc(payload.get("title") or "el mercado")
     market_id = payload.get("market_id")
     return (

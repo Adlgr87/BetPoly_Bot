@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 
 import config
 from bot.formatting import bold, code, ton
-from bot.handlers.common import back_keyboard, is_admin, safe_answer
+from bot.handlers.common import back_keyboard, edit_or_reply, is_admin, safe_answer
 from bot.keyboards import help_keyboard
 
 
@@ -103,7 +103,6 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await safe_answer(query)
-    from bot.handlers.common import edit_or_reply
 
     await edit_or_reply(
         update, build_help_text(is_admin=_is_admin(update)), reply_markup=help_keyboard(is_admin=_is_admin(update))
@@ -113,6 +112,5 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def how_it_works_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await safe_answer(query)
-    from bot.handlers.common import edit_or_reply
 
     await edit_or_reply(update, build_how_it_works(), reply_markup=back_keyboard(update))

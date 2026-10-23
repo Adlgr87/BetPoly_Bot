@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlencode
 
 import config
@@ -42,6 +42,11 @@ from bot.formatting import ton
 logger = logging.getLogger(__name__)
 
 NANO = 1_000_000_000
+
+#: Límites de validación de mercados, alineados con los del contrato.
+MIN_TITLE_LENGTH = 6
+MAX_TITLE_LENGTH = 140
+MAX_OPTION_LENGTH = 60
 
 #: Ventana durante la que se rechazan apuestas mientras hay una resolución
 #: preparada: el contrato las rechazaría y el usuario pagaría gas para nada.
@@ -99,9 +104,9 @@ class PreparedTx:
     valid_until: int
     summary: str
     deeplink: str
-    details: Dict[str, Any]
+    details: dict[str, Any]
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "to": self.to,
             "amount": str(self.amount),
@@ -136,7 +141,7 @@ def friendly_escrow() -> str:
     return to_friendly(escrow_address())
 
 
-def tonkeeper_link(address: str, amount: int, body_b64url: str, text: Optional[str] = None) -> str:
+def tonkeeper_link(address: str, amount: int, body_b64url: str, text: str | None = None) -> str:
     """Deep link that opens a wallet with a pre-filled transaction."""
     params = {"amount": str(max(0, int(amount)))}
     if text:
@@ -146,7 +151,7 @@ def tonkeeper_link(address: str, amount: int, body_b64url: str, text: Optional[s
 
 
 def _prepared(
-    body_cell, *, amount: int, kind: str, summary: str, details: Dict[str, Any]
+    body_cell, *, amount: int, kind: str, summary: str, details: dict[str, Any]
 ) -> PreparedTx:
     escrow = escrow_address()
     valid_until = int(time.time()) + tx_ttl_seconds()
@@ -162,7 +167,7 @@ def _prepared(
     )
 
 
-async def require_linked_wallet(user_id: int) -> Dict[str, Any]:
+async def require_linked_wallet(user_id: int) -> dict[str, Any]:
     wallet = await database.get_wallet(user_id)
     if not wallet:
         raise MarketError(
@@ -172,7 +177,7 @@ async def require_linked_wallet(user_id: int) -> Dict[str, Any]:
     return wallet
 
 
-def _assert_open(market: Dict[str, Any], now: Optional[int] = None) -> None:
+def _assert_open(market: dict[str, Any], now: int | None = None) -> None:
     now = int(now if now is not None else time.time())
     if market["status"] != "open":
         raise MarketError("market_closed", "Este mercado ya no acepta apuestas.")
@@ -192,23 +197,23 @@ def _assert_open(market: Dict[str, Any], now: Optional[int] = None) -> None:
 # ---------------------------------------------------------------------------
 
 async def prepare_create_market(
-    user_id: int, title: str, options: List[str], closes_at: int
+    user_id: int, title: str, options: list[str], closes_at: int
 ) -> PreparedTx:
     settings = config.get_settings()
     wallet = await require_linked_wallet(user_id)
     title = " ".join((title or "").split())
-    if len(title) < 6:
+    if len(title) < MIN_TITLE_LENGTH:
         raise MarketError("bad_title", "El título debe tener al menos 6 caracteres.")
-    if len(title) > 140:
+    if len(title) > MAX_TITLE_LENGTH:
         raise MarketError("bad_title", "El título no puede superar 140 caracteres.")
     cleaned = [" ".join(o.split()) for o in options if o and o.strip()]
-    if not 2 <= len(cleaned) <= settings.max_options:
+    if not database.MIN_OPTIONS <= len(cleaned) <= settings.max_options:
         raise MarketError(
             "bad_options", f"Necesitas entre 2 y {settings.max_options} opciones."
         )
     if len({o.lower() for o in cleaned}) != len(cleaned):
         raise MarketError("bad_options", "Las opciones deben ser distintas.")
-    if any(len(o) > 60 for o in cleaned):
+    if any(len(o) > MAX_OPTION_LENGTH for o in cleaned):
         raise MarketError("bad_options", "Cada opción puede tener hasta 60 caracteres.")
 
     now = int(time.time())
@@ -347,7 +352,7 @@ async def prepare_claim(user_id: int, market_id: int) -> PreparedTx:
     return tx
 
 
-def estimate_payout(bet: Dict[str, Any], market: Dict[str, Any]) -> int:
+def estimate_payout(bet: dict[str, Any], market: dict[str, Any]) -> int:
     """Off-chain estimate of a claim; the contract has the final word."""
     stake = int(bet.get("stake") or 0)
     if market.get("status") == "cancelled":
@@ -366,7 +371,7 @@ def estimate_payout(bet: Dict[str, Any], market: Dict[str, Any]) -> int:
     return economics.payout(stake, economics.distributable(total, fee_bps), winning_pool)
 
 
-async def quote_payout(market_id: int, option: int, stake: int) -> Dict[str, Any]:
+async def quote_payout(market_id: int, option: int, stake: int) -> dict[str, Any]:
     """Pago estimado de una apuesta nueva, calculado **solo** aquí (F-03).
 
     La Mini App no reimplementa la fórmula pari-mutuel: pide este *quote* y se
@@ -416,7 +421,7 @@ async def quote_payout(market_id: int, option: int, stake: int) -> Dict[str, Any
 # ---------------------------------------------------------------------------
 
 async def prepare_resolve(
-    user_id: int, market_id: int, winning_option: int, *, now: Optional[int] = None
+    user_id: int, market_id: int, winning_option: int, *, now: int | None = None
 ) -> PreparedTx:
     settings = config.get_settings()
     if user_id not in settings.admin_ids:
@@ -453,7 +458,7 @@ async def prepare_resolve(
 
 
 async def prepare_cancel(
-    user_id: int, market_id: int, *, force: bool = False, now: Optional[int] = None
+    user_id: int, market_id: int, *, force: bool = False, now: int | None = None
 ) -> PreparedTx:
     """Cancel a market and enable refunds.
 
@@ -496,12 +501,12 @@ def _require_admin(user_id: int) -> None:
         raise MarketError("forbidden", "Solo un administrador puede operar el contrato.")
 
 
-def _configured_admin() -> Optional[str]:
+def _configured_admin() -> str | None:
     """Admin advertised by configuration (the contract has no getter for it)."""
     return config.get_settings().escrow_admin_address or None
 
 
-def _assert_signing_wallet_is_admin(wallet: Optional[Dict[str, Any]]) -> None:
+def _assert_signing_wallet_is_admin(wallet: dict[str, Any] | None) -> None:
     """Fail *before* signing when the operator's wallet is not the contract admin.
 
     Only enforced when ``ESCROW_ADMIN_ADDRESS`` is configured: without it there
@@ -518,7 +523,7 @@ def _assert_signing_wallet_is_admin(wallet: Optional[Dict[str, Any]]) -> None:
         )
 
 
-async def _admin_wallet(user_id: int) -> Dict[str, Any]:
+async def _admin_wallet(user_id: int) -> dict[str, Any]:
     _require_admin(user_id)
     wallet = await require_linked_wallet(user_id)
     _assert_signing_wallet_is_admin(wallet)
@@ -531,7 +536,7 @@ def escrow_state_cache() -> EscrowStateCache:
 
 
 async def escrow_state(
-    client: Optional[Any] = None, *, force: bool = False
+    client: Any | None = None, *, force: bool = False
 ) -> EscrowState:
     """Current contract state, served from a 30 s cache (see escrow_state.py)."""
     if not config.get_settings().escrow_enabled:
@@ -539,7 +544,7 @@ async def escrow_state(
             "escrow_disabled",
             "El contrato escrow no está habilitado en esta instancia.",
         )
-    from bot.chain.toncenter import TonCenterClient  # flat import graph
+    from bot.chain.toncenter import TonCenterClient  # noqa: PLC0415 - grafo de imports plano
 
     address = escrow_address()
     admin = _configured_admin()
@@ -553,10 +558,10 @@ async def escrow_state(
 
 
 async def _read_state(
-    client: Any, address: str, admin: Optional[str], force: bool
+    client: Any, address: str, admin: str | None, force: bool
 ) -> EscrowState:
     """Translate chain failures into one domain error (handlers never see the chain)."""
-    from bot.chain.toncenter import TonApiError
+    from bot.chain.toncenter import TonApiError  # noqa: PLC0415 - solo al leer la cadena
 
     try:
         return await _escrow_state_cache.get(
@@ -570,7 +575,7 @@ async def _read_state(
 
 
 async def prepare_withdraw_fees(
-    user_id: int, amount_nano: int, *, state: Optional[EscrowState] = None
+    user_id: int, amount_nano: int, *, state: EscrowState | None = None
 ) -> PreparedTx:
     """Withdraw accrued fees. Never touches user funds: the contract enforces it."""
     wallet = await _admin_wallet(user_id)
@@ -659,33 +664,47 @@ async def prepare_change_admin(user_id: int, new_address: str) -> PreparedTx:
 # read helpers for the API
 # ---------------------------------------------------------------------------
 
-def _is_resolving(market: Dict[str, Any], now: int) -> bool:
+def _is_resolving(market: dict[str, Any], now: int) -> bool:
     pending_at = int(market.get("pending_resolve_at") or 0)
     return bool(pending_at) and pending_at + RESOLVE_WINDOW_SECONDS > now
 
 
-def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
-                user_id: Optional[int] = None) -> Dict[str, Any]:
-    """Serialize a mirrored market with odds, deadlines and the caller's bet."""
-    now = int(time.time())
-    total_pool = int(market.get("pool") or market.get("total_pool") or 0)
+def _option_views(
+    market: dict[str, Any], total_pool: int, fee_bps: int
+) -> list[dict[str, Any]]:
+    """Una entrada por opción, con su multiplicador ya calculado (F-03)."""
     pools = market.get("option_pools") or {}
-    options_out: List[Dict[str, Any]] = []
-    fee_bps = int(market.get("fee_bps") or 0)
+    views: list[dict[str, Any]] = []
     for option in market.get("options", []):
         idx = int(option["idx"])
         pool = int(pools.get(str(idx), 0))
-        multiplier = economics.multiplier(total_pool, pool, fee_bps)
-        options_out.append(
+        views.append(
             {
                 "index": idx,
                 "label": option["label"],
                 "pool": str(pool),
                 "pool_ton": ton(pool),
-                "multiplier": multiplier,
+                "multiplier": economics.multiplier(total_pool, pool, fee_bps),
             }
         )
+    return views
 
+
+def _open_now(market: dict[str, Any], closes_at: int, now: int) -> bool:
+    """Abierto = estado `open`, sin cierre pasado y sin resolución preparada."""
+    if market.get("status") != "open":
+        return False
+    if closes_at and closes_at <= now:
+        return False
+    return not _is_resolving(market, now)
+
+
+def market_view(market: dict[str, Any], *, wallet: str | None = None) -> dict[str, Any]:
+    """Serialize a mirrored market with odds, deadlines and the caller's bet."""
+    now = int(time.time())
+    total_pool = int(market.get("pool") or market.get("total_pool") or 0)
+    fee_bps = int(market.get("fee_bps") or 0)
+    options_out = _option_views(market, total_pool, fee_bps)
     closes_at = int(market.get("closes_at") or 0)
     view = {
         "market_id": int(market["market_id"]),
@@ -701,9 +720,7 @@ def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
         "fee_percent": f"{fee_bps / 100:.2f}",
         "options": options_out,
         "seconds_left": max(0, closes_at - now) if closes_at else None,
-        "is_open": market.get("status") == "open"
-        and (not closes_at or closes_at > now)
-        and not _is_resolving(market, now),
+        "is_open": _open_now(market, closes_at, now),
         "resolving": _is_resolving(market, now),
         "creator": market.get("creator_address"),
     }
@@ -712,11 +729,11 @@ def market_view(market: Dict[str, Any], *, wallet: Optional[str] = None,
     return view
 
 
-async def market_detail(market_id: int, *, user_id: Optional[int] = None) -> Dict[str, Any]:
+async def market_detail(market_id: int, *, user_id: int | None = None) -> dict[str, Any]:
     market = await database.get_market(int(market_id))
     if not market:
         raise MarketError("market_not_found", "Ese mercado no existe todavía en la cadena.")
-    pools: Dict[str, int] = {}
+    pools: dict[str, int] = {}
     total = 0
     async with database.connection() as db:
         async with db.execute(
@@ -752,17 +769,3 @@ async def market_detail(market_id: int, *, user_id: Optional[int] = None) -> Dic
                 }
                 view["my_estimate"] = str(estimate_payout(bet, market))
     return view
-
-
-async def prepare_for_body(kind: str, *args, **kwargs) -> PreparedTx:
-    """Dispatch helper used by API tests."""
-    handlers = {
-        "create_market": prepare_create_market,
-        "place_bet": prepare_bet,
-        "claim_payout": prepare_claim,
-        "resolve_market": prepare_resolve,
-        "cancel_market": prepare_cancel,
-    }
-    if kind not in handlers:
-        raise MarketError("unknown_kind", f"Tipo de transacción desconocido: {kind}")
-    return await handlers[kind](*args, **kwargs)

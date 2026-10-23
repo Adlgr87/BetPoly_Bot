@@ -35,7 +35,7 @@ Dos economías conviven (`BET_MODE`):
 
 | Capa | Tecnología |
 | :--- | :--- |
-| Bot | Python 3.11+, `python-telegram-bot` 21.6 (async, `JobQueue`) |
+| Bot | Python 3.11+, `python-telegram-bot` 22.8 (async, `JobQueue`) |
 | Mini App / API | `aiohttp` (sirve `web/`, sin build step) |
 | Persistencia | SQLite vía `aiosqlite` (una conexión, `BEGIN IMMEDIATE`) |
 | Contrato | FunC (`contracts/escrow.fc`), pari-mutuel, probado en `@ton/sandbox` |
@@ -62,7 +62,8 @@ BetPoly_Bot/
 │   ├── formatting.py        # helpers HTML/formatos TON y fechas
 │   ├── keyboards.py         # teclados inline
 │   └── handlers/            # start, predictions, markets, stats, wallet, admin, help
-├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png)
+├── web/                     # Mini App (index.html + static/app.js, styles.css, icon.png,
+│                            # tonconnect-ui.min.js vendorizado con SRI)
 ├── scripts/                 # utilidades: build_icon.py, dev_server.py
 ├── contracts/               # escrow.fc, stdlib, build.js, deploy.js, tests
 ├── tests/                   # suite pytest offline
@@ -88,6 +89,14 @@ python main.py            # bot + Mini App + indexer
 ```
 
 Para desarrollo sin Telegram: `WEB_ENABLED=true ALLOW_DEV_SESSION=true python main.py` y abre `http://localhost:8080`.
+
+O con el servidor de demo, que siembra mercados y acepta flags en vez de obligar
+a exportar medio `.env`:
+
+```bash
+python scripts/dev_server.py --help          # --host, --port, --db, --public-base-url, --no-seed
+python scripts/dev_server.py --port 8080 --db /tmp/demo.db
+```
 
 > `ALLOW_DEV_SESSION=true` desactiva la verificación de `initData`: `config.validate()` lo rechaza en producción.
 
@@ -220,8 +229,12 @@ hace cumplir.
   (`/api/session`, `/api/wallet/*`, `/api/markets/prepare`) que no depende de la
   identidad: rotar IPs o sesiones no lo esquiva. Las respuestas `429` incluyen
   `Retry-After`, y el limitador desaloja por LRU real (memoria acotada).
-* **CSP estricta** sin `'unsafe-inline'` para scripts: la Mini App no usa
-  manejadores inline y un test lo verifica.
+* **CSP estricta** sin `'unsafe-inline'`: los scripts solo pueden venir del propio
+  dominio (`'self'`) o de `telegram.org`, la Mini App no usa manejadores inline y
+  ambos hechos tienen test. `@tonconnect/ui` —el componente que construye las
+  transacciones que el usuario firma— se sirve desde `web/static` con `integrity`
+  SRI (un `sha384` que el test recalcula), así que un CDN comprometido no puede
+  cambiar el código que firma.
 * **CSP** con `frame-ancestors` configurable (`FRAME_ANCESTORS`) para permitir Telegram y bloquear el resto.
 * **Índice idempotente**: cada transacción se procesa una vez (`chain_txs`), el cursor solo avanza tras confirmar, y un fallo de red nunca bloquea al bot.
 
@@ -298,11 +311,16 @@ Los eventos (`0xE0A00001…03`) se envían al `indexer` dentro de una cell con u
 cd contracts && node tests/escrow.test.js   # contrato real en el sandbox TVM
 ```
 
+Reglas de lint: `E`,`F`,`I`,`B`,`C4`,`SIM`,`UP` (sin tipado legacy) más
+`PLR2004` (números mágicos), `ARG` (argumentos sin usar) y `PLC0415` (imports
+perezosos), con excepciones justificadas por fichero para los argumentos que
+impone Telegram/aiohttp.
+
 La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path`,
 `FakeClient` para el indexer, claves Ed25519 sintéticas para `ton_proof` y dobles
 de `Update`/`Message`/`CallbackQuery` (`tests/telegram_fakes.py`) para la capa
-Telegram. Cobertura actual: **85 %** global (umbral 83) y **87 %** en
-`bot/handlers/*` + `bot/keyboards.py` (umbral propio 70).
+Telegram. Cobertura actual: **85 %** global (umbral 83) y **89 %** en
+`bot/handlers/*` + `bot/keyboards.py` (umbral propio 70; los teclados, 100 %).
 
 **Dependencias del contrato.** `node scripts/audit.js` aplica `npm audit` con
 `contracts/audit-allowlist.json`: un advisory alto/crítico sin excepción falla el
@@ -327,6 +345,11 @@ Tres suites son *guardarraíles* y no pruebas funcionales:
   solo queda `/api/health`, endpoint de sondas).
 - `tests/test_web_assets.py` — la Mini App no lleva manejadores inline y la CSP
   que se publica de verdad los bloquearía.
+- `tests/test_complexity.py` — complejidad de McCabe sobre el AST: ninguna función
+  nueva pasa de 12 y el baseline solo puede encogerse.
+- `tests/test_migrations.py` y `tests/test_keyboards.py` — el esquema se actualiza
+  con `PRAGMA user_version` (y se niega a abrir una base más nueva) y todos los
+  teclados tienen su test.
 - `tests/test_performance.py` y `tests/test_assets_caching.py` — los planes de
   consulta no hacen `SCAN`, el número de consultas no crece con las filas, la
   caché/`304`/gzip funcionan y ningún activo se pasa del presupuesto.

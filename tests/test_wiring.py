@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, Set
 
 ROOT = Path(__file__).resolve().parent.parent
 API_PY = ROOT / "bot" / "api.py"
@@ -25,13 +24,13 @@ BODIES_PY = ROOT / "bot" / "chain" / "bodies.py"
 
 # Ruta de API sin consumidor en el frontend -> motivo. Desde la Fase 3 la lista
 # solo conserva el endpoint de sondas, que por diseño no consume la UI.
-KNOWN_API_ORPHANS: Dict[str, str] = {
+KNOWN_API_ORPHANS: dict[str, str] = {
     "/api/health": "Endpoint de orquestador / sondas; no lo consume la UI (correcto).",
 }
 
 # Builders de cuerpo sin consumidor -> motivo y fase. Vacío desde la Fase 2:
 # el panel de administración del contrato ya usa los cuatro.
-KNOWN_BUILDER_ORPHANS: Dict[str, str] = {}
+KNOWN_BUILDER_ORPHANS: dict[str, str] = {}
 
 
 def _normalise(path: str) -> str:
@@ -42,19 +41,19 @@ def _normalise(path: str) -> str:
     return path.rstrip("/") or "/"
 
 
-def _api_routes() -> Set[str]:
+def _api_routes() -> set[str]:
     source = API_PY.read_text(encoding="utf-8")
     routes = re.findall(r"app\.router\.add_(?:get|post|put|delete|patch)\(\s*\"([^\"]+)\"", source)
     return {_normalise(route) for route in routes if route.startswith("/api")}
 
 
-def _frontend_calls() -> Set[str]:
+def _frontend_calls() -> set[str]:
     source = APP_JS.read_text(encoding="utf-8")
     calls = re.findall(r"\bapi\(\s*[`'\"]([^`'\"]+)[`'\"]", source)
     return {_normalise(call) for call in calls if call.startswith("/api")}
 
 
-def _keyboard_callbacks() -> Set[str]:
+def _keyboard_callbacks() -> set[str]:
     """Todos los callback_data que el bot puede emitir, con muestras.
 
     Se escanean los teclados **y** los handlers: algunos flujos de admin
@@ -72,7 +71,7 @@ def _keyboard_callbacks() -> Set[str]:
     return samples
 
 
-def _handler_patterns() -> Set[str]:
+def _handler_patterns() -> set[str]:
     source = MAIN_PY.read_text(encoding="utf-8")
     patterns = set(re.findall(r"\(\s*r?\"(\^[^\"]*)\"\s*,", source))
     for handler_file in sorted(ROOT.joinpath("bot", "handlers").glob("*.py")):
@@ -83,14 +82,14 @@ def _handler_patterns() -> Set[str]:
     return patterns
 
 
-def _builder_names() -> Set[str]:
+def _builder_names() -> set[str]:
     source = BODIES_PY.read_text(encoding="utf-8")
     return set(re.findall(r"^def (build_[a-z_]+)\(", source, flags=re.MULTILINE))
 
 
-def _builder_consumers() -> Set[str]:
+def _builder_consumers() -> set[str]:
     """Builders usados por el producto (los tests no cuentan como consumidor)."""
-    used: Set[str] = set()
+    used: set[str] = set()
     for path in list(ROOT.joinpath("bot").rglob("*.py")) + [ROOT / "main.py"]:
         if path == BODIES_PY or "__pycache__" in path.parts:
             continue
@@ -99,7 +98,7 @@ def _builder_consumers() -> Set[str]:
     return used
 
 
-def _assert_ratchet(kind: str, current: Set[str], baseline: Dict[str, str]) -> None:
+def _assert_ratchet(kind: str, current: set[str], baseline: dict[str, str]) -> None:
     new = current - set(baseline)
     assert not new, (
         f"[{kind}] elementos sin consumidor: {sorted(new)}.\n"

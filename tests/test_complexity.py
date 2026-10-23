@@ -13,27 +13,24 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Dict
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_COMPLEXITY = 12
 
 #: Funciones que hoy superan el techo. Es un trinquete: una entrada solo puede
 #: bajar, y ninguna función nueva puede entrar en la lista. Fase 7 las divide.
-BASELINE: Dict[str, int] = {
+BASELINE: dict[str, int] = {
     "bot/api.py::verify_wallet": 19,
-    "bot/chain/bodies.py::prepare_transaction_payload": 16,
     "bot/chain/indexer.py::_poll": 14,
     "bot/chain/indexer.py::_fetch": 18,
     "bot/chain/indexer.py::_process_tx": 26,
     "bot/chain/toncenter.py::_request": 14,
     "bot/database.py::enrich_market_from_event": 18,
-    "bot/handlers/admin.py::_show_admin_panel": 14,
+    "bot/handlers/admin.py::_show_admin_panel": 13,
     "bot/handlers/markets.py::market_view_callback": 19,
     "bot/handlers/predictions.py::bet_amount_message": 14,
     "bot/handlers/stats.py::_send_profile": 14,
     "bot/markets.py::prepare_create_market": 14,
-    "bot/markets.py::market_view": 15,
     "bot/security.py::validate_init_data": 22,
     "config.py::validate": 20,
     "main.py::post_init": 14,
@@ -70,8 +67,8 @@ def _python_files() -> list[Path]:
     ]
 
 
-def scores() -> Dict[str, int]:
-    found: Dict[str, int] = {}
+def scores() -> dict[str, int]:
+    found: dict[str, int] = {}
     for path in _python_files():
         relative = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

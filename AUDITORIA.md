@@ -28,6 +28,12 @@
 
 **Conteo:** 7 hallazgos críticos/altos · 15 medios · 25 menores, más 19 símbolos de código muerto.
 
+**Estado tras la Fase 7 (2026-10-23):** los 47 hallazgos están cerrados. La tabla
+de arriba es la foto del commit auditado y se conserva como registro; cada
+hallazgo lleva al final su línea *Resuelto*. Medido hoy: `pytest` **668 tests en
+verde**, cobertura **85,8 %**; `ruff check .` y `vulture --min-confidence 80`
+limpios; contrato con el mismo hash reproducible y 25/25 comprobaciones.
+
 ---
 
 ## 1. Metodología y evidencia
@@ -174,13 +180,20 @@ En cambio `estimate_payout` sí aplica `fee_bps` (`bot/markets.py:322`) y el con
 ### F-06 — 🟠 Carrera entre la resolución on-chain y el espejo local
 El admin puede firmar `resolve` cuando el espejo dice `open`; hasta que el indexador procese el evento, la Mini App y el bot siguen ofreciendo apostar en ese mercado. No hay bloqueo optimista ni estado `resolving`.
 
-### F-07 — 🟠 `parse_message_body` captura cualquier excepción
+### F-07 — ✅ `parse_message_body` captura cualquier excepción
 `bot/chain/bodies.py`: `except (AddressError, Exception)` — la tupla es redundante y convierte cualquier bug en «mensaje irrelevante», enmascarando fallos de parseo.
 
-### F-08 — 🟠 La UI del admin lista menos predicciones de las que el teclado permite pulsar
+### F-08 — ✅ La UI del admin lista menos predicciones de las que el teclado permite pulsar
+**Resuelto (Fase 7):** el panel pagina (`ADMIN_PREDICTIONS_PAGE = 6`) y el
+texto y los botones salen de la misma página; un test comprueba que entre
+todas las páginas aparece cada predicción pendiente.
 El texto del panel recorta a `predictions[:8]` (`bot/handlers/admin.py:75`) mientras `admin_predictions_keyboard()` (`bot/keyboards.py:201-212`) renderiza una fila por predicción; los botones sobrantes apuntan a predicciones que el usuario no ve listadas.
 
-### F-09 — 🟠 `dev_server.py` sirve un manifest `http://` y no pasa por la validación de configuración
+### F-09 — ✅ `dev_server.py` sirve un manifest `http://` y no pasa por la validación de configuración
+**Resuelto (Fase 7):** `scripts/dev_server.py` acepta `--host`, `--port`,
+`--db`, `--public-base-url` (con `reset_settings()`, así que el manifest y la
+validación usan el mismo origen) y `--no-seed`; avisa por consola cuando el
+manifest sigue siendo `http://` y no será usable por wallets reales.
 `scripts/dev_server.py:26` fija `PUBLIC_BASE_URL=http://localhost:8080`; TON Connect rechaza orígenes no HTTPS (el propio `config.validate()` lo exige en `bot`/`api`). En el preview local funciona porque la validación no se ejecuta en ese camino, pero el manifest resultante no es usable por wallets reales.
 
 ### F-10 — 🟠 No hay CI: 263 tests que nadie ejecuta automáticamente
@@ -189,12 +202,18 @@ No existe `.github/`, ni `Makefile`, ni `tox.ini`, ni `pre-commit`. La suite es 
 ### F-11 — 🟠 El flujo de instalación documentado no permite ejecutar los tests
 `README.md:80` indica `pip install -r requirements.txt` y `README.md:243` invita a `pytest`. `requirements.txt` no incluye `pytest` ni `pytest-asyncio` (necesario por `asyncio_mode = auto` en `pytest.ini`), y no existe `requirements-dev.txt`.
 
-### F-12 — 🟠 Dependencia de CDN sin integridad para el componente que firma transacciones
+### F-12 — ✅ Dependencia de CDN sin integridad para el componente que firma transacciones
+**Resuelto (Fase 7):** `@tonconnect/ui` 5.0.1 vendorizado en
+`web/static/tonconnect-ui.min.js` con `integrity` SRI (recalculado por un
+test) y CSP `script-src 'self' https://telegram.org`; `unpkg.com` fuera.
 `web/index.html:11` carga `https://unpkg.com/@tonconnect/ui@5.0.1/dist/tonconnect-ui.min.js` sin `integrity`/`crossorigin`, y la CSP autoriza `unpkg.com` (`bot/api.py:629`). Es el script que construye las transacciones que el usuario firma: un compromiso del CDN afecta directamente a la firma.
 
-### F-13 — 🟠 `deploy.js` puede reportar un despliegue que no ocurrió
+### F-13 — ✅ `deploy.js` puede reportar un despliegue que no ocurrió
 `contracts/scripts/deploy.js`: tras 30 intentos × 4 s sin alcanzar `state === 'active'`, el bucle termina sin error y **se escribe igualmente** `contracts/build/deploy.json` con la dirección esperada, con exit `0`.
 **Impacto:** falso positivo de despliegue; el operador configura `ESCROW_ADDRESS` de un contrato que puede no existir.
+**Resuelto (Fase 7):** si no alcanza `active` en el plazo termina con exit 1 y
+no escribe `deploy.json`; además aborta si el hash compilado no es el
+esperado o si la cuenta no está `active`. `contracts/tests/deploy.test.js`.
 
 ### F-14 — ✅ `main.py` construye el menú sin `is_admin` y el teclado de volver ignora el flag
 Complemento de F-01 en el arranque: `main.py:159` arma el teclado del mensaje de bienvenida sin rol, por lo que el primer `/start` de un admin tras reiniciar tampoco muestra la fila.
@@ -204,7 +223,13 @@ Complemento de F-01 en el arranque: `main.py:159` arma el teclado del mensaje de
 
 ## 5. Hallazgos bajos — código muerto y duplicación
 
-### 5.1 Código muerto confirmado (sin ninguna referencia)
+### 5.1 Código muerto confirmado (sin ninguna referencia) — ✅ resuelto en la Fase 7
+**Resuelto:** los 19 símbolos se eliminaron (o se conectaron, cuando eran la
+mitad de una función ya implementada: `build_set_paused`, `build_set_fee`,
+`build_change_admin` y `build_withdraw_fees` los usa el panel del contrato) y
+`bot/chain/__init__.py` queda sin re-exports. `vulture --min-confidence 80` corre
+en CI con lista blanca vacía. Se conserva la tabla original como registro.
+
 | Elemento | Ubicación |
 | :--- | :--- |
 | `TonCenterClient.get_account_state` | `bot/chain/toncenter.py` |
@@ -223,7 +248,15 @@ Complemento de F-01 en el arranque: `main.py:159` arma el teclado del mensaje de
 
 `bot/chain/__init__.py` re-exporta 25 símbolos, pero **ningún módulo de producción importa desde el paquete** (todos usan los submódulos: `from bot.chain.bodies import ...`); solo los tests hacen `from bot.chain import bodies`. La fachada no aporta nada al runtime.
 
-### D-01 — 🟡 Duplicación real (jscpd: 3 clones, 24 líneas, 0.42 %)
+### D-01 — ✅ Duplicación real (jscpd: 3 clones, 24 líneas, 0.42 %)
+**Resuelto (fases 3 y 7):** el bloque `user` de `/api/session` y `/api/me`
+sale de un único `_user_payload`; la validación de admin y el parseo de
+`market_id` viven en `_require_admin`/`_market_id`; la línea de mercado del
+admin se formatea con un helper; `create_nonce` delega la caducidad en
+`purge_nonces`. Los tres clones textuales restantes (24 líneas) son el
+guardia de tres líneas `market_id is None → 400` repetido en seis handlers:
+es el idiom de retorno temprano de aiohttp y cualquier abstracción lo haría
+menos legible, así que se acepta.
 - `bot/api.py:282-290` ≈ `bot/api.py:397-405` → construcción del bloque `user` (`username/full_name/points/is_admin`) repetida en `/api/session` y `/api/me`.
 - `bot/api.py:532-540` ≈ `bot/api.py:552-560` → validación de admin + parseo de `market_id` en `prepare_resolve` / `prepare_cancel`.
 - `bot/handlers/admin.py:315-323` ≈ `bot/handlers/admin.py:361-369` → misma línea de mercado formateada dos veces.
@@ -249,13 +282,24 @@ Se verificaron las 19 rutas contra las 12 llamadas reales de `web/static/app.js`
 - `BETPOLY_INSECURE_SECRET_WARNING` (`config.py:214`) se escribe en el entorno y **ningún código la lee**: la advertencia de secreto efímero nunca se muestra.
 - `Settings.__getattr__` (ver 5.1).
 
-### D-04 — 🟡 `init_db` «migra» con un literal mágico
+### D-04 — ✅ `init_db` «migra» con un literal mágico
+**Resuelto (Fase 7):** migraciones versionadas con `PRAGMA user_version`
+(`_MIGRATIONS` + `_apply_migrations`), cada una idempotente y forward-only;
+una base con versión futura se rechaza en vez de corromperse, y el saldo
+inicial se escribe al crear el usuario. Test de ida y vuelta en
+`tests/test_migrations.py`.
 `bot/database.py:341-343` ejecuta `UPDATE users SET points = ? WHERE points = 1000 AND ...` — el `1000` es el valor por defecto de `STARTING_POINTS` incrustado en SQL. Solo funciona si el valor histórico fue exactamente 1000 y solo para usuarios vírgenes; comprobado: con `STARTING_POINTS=5000` el saldo real de un usuario nuevo sigue siendo 1000 porque el `UPDATE` corre en el siguiente arranque, no al crearlo.
 
-### D-05 — 🟡 `upsert_user` borra el `username` cuando Telegram no lo envía
+### D-05 — ✅ `upsert_user` borra el `username` cuando Telegram no lo envía
+**Resuelto (Fase 7):** `username = COALESCE(excluded.username, users.username)`
+y `ON CONFLICT` cubierto por test.
 `bot/database.py:394-401`: `username = excluded.username` con `None` sobrescribe el valor previo. Un usuario que quite su @usuario del perfil se queda sin nombre de usuario en la base.
 
-### D-06 — 🟡 `bot/keyboards.py` con 17 % de cobertura
+### D-06 — ✅ `bot/keyboards.py` con 17 % de cobertura
+**Resuelto (Fase 7):** `tests/test_keyboards.py` cubre los 15 teclados
+(**100 %** del módulo). `back_to_menu_keyboard` mantiene el flag `is_admin`
+como no-op documentado: el menú principal ya lleva los botones del rol y
+duplicarlos rompería la navegación.
 Es el módulo con más condicionales de presentación y el menos probado; `back_to_menu_keyboard(is_admin=...)` ignora el parámetro recibido.
 
 ---
@@ -346,7 +390,12 @@ tienen un techo congelado y las dos funciones de dinero, tope duro de 8.
 
 **Resuelto (Fase 6):** `index.html` versiona sus activos con `?v=<huella>`; esos ficheros salen con `Cache-Control: public, max-age=31536000, immutable`. JS/CSS se sirven con gzip en memoria (comprimido una vez por proceso) y ETag para el resto. Arranque medido: **93.3 KB** comprimidos frente a un presupuesto de 350 KB.
 
-### R-10 — 🔵 Estilo y tipado (ruff)
+### R-10 — ✅ Estilo y tipado (ruff)
+**Resuelto (Fase 7):** `UP006/UP045` normalizados (465 anotaciones
+reescritas), `PLR2004`/`ARG`/`PLC0415` activados con números mágicos
+convertidos en constantes con nombre y excepciones solo donde la firma la
+impone Telegram/aiohttp. `ruff check .` limpio sobre `bot`, `config.py`,
+`main.py`, `scripts` y `tests`.
 `UP006`/`UP045` (tipado legacy `List`, `Optional`), `PLR2004` (números mágicos en `bodies.py`), `ARG001` (6 handlers de `api.py` con argumentos sin usar), `PLC0415` (imports dentro de funciones), `UP041`. Nada funcional; es deuda de estilo coherente en todo el repo.
 
 ---
@@ -358,10 +407,10 @@ Cobertura por módulo: **todos** los `bot/handlers/*` al **0 %**, `keyboards.py`
 Es exactamente donde están F-01, F-02, F-04 y S-06: los defectos se concentran en el código sin cobertura.
 **Resuelto (Fase 5):** `tests/telegram_fakes.py` + `tests/test_handlers_navigation.py` + `tests/test_handlers_flows.py` llevan `bot/handlers/*` al **85 %** y `bot/keyboards.py` al **86 %**; CI falla por debajo del 70 % en esa capa. `main.py` (arranque y `build_application`) sigue sin cubrir: se aborda en la Fase 7.
 
-### T-02 — 🔵 Deriva de dependencias
+### T-02 — ✅ Deriva de dependencias
 | Paquete | Pin | Última | Estado |
 | :--- | :--- | :--- | :--- |
-| python-telegram-bot | 21.6 | 22.8 | ⚠️ una major por detrás |
+| python-telegram-bot | 21.6 → **22.8** | 22.8 | ✅ actualizado en la Fase 7 |
 | aiohttp | 3.14.5 | 3.14.5 | ✅ |
 | aiosqlite | 0.22.1 | 0.22.1 | ✅ |
 | python-dotenv | 1.2.4 | 1.2.4 | ✅ |

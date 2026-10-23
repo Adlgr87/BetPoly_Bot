@@ -26,6 +26,9 @@ STATIC = ROOT / "web" / "static"
 STARTUP_BUDGET_BYTES = 350 * 1024
 #: R-06: el icono es el activo más pesado y tiene tope propio.
 ICON_BUDGET_BYTES = 80 * 1024
+#: F-12: bundle de terceros vendorizado (minificado, sin recompilar). Se mide
+#: comprimido, como lo descarga el móvil, no como ocupa en el repositorio.
+VENDORED = {"tonconnect-ui.min.js"}
 
 
 @pytest_asyncio.fixture
@@ -147,14 +150,19 @@ class TestAssetBudget:
             "Regenéralo con `python scripts/build_icon.py`."
         )
 
-    def test_no_static_asset_is_absurdly_large(self):
+    def test_no_first_party_asset_is_absurdly_large(self):
         for path in STATIC.iterdir():
-            if path.is_file():
+            if path.is_file() and path.name not in VENDORED:
                 assert path.stat().st_size <= STARTUP_BUDGET_BYTES, path.name
 
     def test_startup_payload_is_under_budget(self):
-        files = [ROOT / "web" / "index.html", STATIC / "styles.css",
-                 STATIC / "app.js", STATIC / "icon.png"]
+        files = [
+            ROOT / "web" / "index.html",
+            STATIC / "styles.css",
+            STATIC / "app.js",
+            STATIC / "icon.png",
+            STATIC / "tonconnect-ui.min.js",  # 528 KB → ~155 KB gzip
+        ]
         total = sum(len(gzip.compress(path.read_bytes(), 9)) for path in files)
         assert total <= STARTUP_BUDGET_BYTES, (
             f"el arranque comprimido pesa {total / 1024:.1f} KB; el tope es "
@@ -188,7 +196,7 @@ class TestAssetBudget:
         source = tmp_path / "original.png"
         source.write_bytes(b"png")
         target = tmp_path / "icon.png"
-        code = build_icon.build(source, target, FakeImage())
+        code = build_icon.build(source, target, image_module=FakeImage())
         assert code == 1
         assert target.stat().st_size > build_icon.BUDGET_BYTES
 
@@ -197,7 +205,9 @@ class TestAssetBudget:
             LANCZOS = 1
             MEDIANCUT = 0
 
-        assert build_icon.build(tmp_path / "nada.png", tmp_path / "out.png", NeverUsed()) == 2
+        assert build_icon.build(
+            tmp_path / "nada.png", tmp_path / "out.png", image_module=NeverUsed()
+        ) == 2
 
     def test_icon_builder_never_crashes_without_a_source(self, tmp_path):
         """Sin fuente (o sin Pillow) sale con código 2 y un mensaje, no con traza."""

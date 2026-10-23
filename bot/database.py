@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -26,13 +27,11 @@ from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
-    Dict,
+    Awaitable,
+    Callable,
     Iterable,
-    List,
     NamedTuple,
-    Optional,
     Sequence,
-    Tuple,
 )
 
 import aiosqlite
@@ -93,11 +92,11 @@ class WalletConflict(DatabaseError):
 # ---------------------------------------------------------------------------
 # Connection handling
 # ---------------------------------------------------------------------------
-_conn: Optional[aiosqlite.Connection] = None
-_conn_path: Optional[str] = None
+_conn: aiosqlite.Connection | None = None
+_conn_path: str | None = None
 _lock = asyncio.Lock()
 
-_override_path: Optional[str] = None
+_override_path: str | None = None
 
 
 def configure_database(path: str) -> None:
@@ -382,7 +381,7 @@ CREATE INDEX IF NOT EXISTS idx_notifications_due  ON notifications(status, next_
 
 # Columns added after the first public release.  ``init_db`` adds them only
 # when missing so that an existing betpoly.db keeps working.
-_LEGACY_COLUMNS: Sequence[Tuple[str, str, str]] = (
+_LEGACY_COLUMNS: Sequence[tuple[str, str, str]] = (
     ("users", "updated_at", "TEXT NOT NULL DEFAULT ''"),
     ("predictions", "mode", "TEXT NOT NULL DEFAULT 'points'"),
     ("bets", "payout", "INTEGER NOT NULL DEFAULT 0"),
@@ -391,7 +390,7 @@ _LEGACY_COLUMNS: Sequence[Tuple[str, str, str]] = (
 )
 
 
-async def _table_columns(conn: aiosqlite.Connection, table: str) -> List[str]:
+async def _table_columns(conn: aiosqlite.Connection, table: str) -> list[str]:
     try:
         async with conn.execute(f"PRAGMA table_info({table})") as cur:
             return [row["name"] for row in await cur.fetchall()]
@@ -420,25 +419,70 @@ async def _migrate_wallet_links(db: aiosqlite.Connection) -> None:
     await db.execute("DROP TABLE wallet_links_legacy")
 
 
+#: Versión del esquema en disco. Sube **siempre** que se añada una migración.
+SCHEMA_VERSION = 1
+
+
+async def _schema_version(db: aiosqlite.Connection) -> int:
+    async with db.execute("PRAGMA user_version") as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _migration_1(db: aiosqlite.Connection, settings: config.Settings) -> None:
+    """Primera versión con control de esquema (D-04).
+
+    Absorbe las migraciones ad-hoc anteriores: reconstruye `wallet_links`,
+    añade las columnas tardías y corrige los puntos iniciales de los usuarios
+    que quedaron con el literal histórico 1000.
+    """
+    await _migrate_wallet_links(db)
+    for table, column, ddl in _LEGACY_COLUMNS:
+        columns = await _table_columns(db, table)
+        if columns and column not in columns:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            logger.info("Migración 1: añadida la columna %s.%s", table, column)
+    await db.execute(
+        "UPDATE users SET points = ? WHERE points = 1000 AND created_at = updated_at "
+        "AND ? != 1000 AND NOT EXISTS (SELECT 1 FROM bets WHERE bets.user_id = users.user_id)",
+        (settings.starting_points, settings.starting_points),
+    )
+
+
+#: Migraciones por versión: `_MIGRATIONS[n]` lleva el esquema de n-1 a n.
+_MIGRATIONS: dict[int, Callable[..., Awaitable[None]]] = {1: _migration_1}
+
+
 async def init_db() -> None:
-    """Create/upgrade the schema. Safe to call repeatedly."""
+    """Crea o actualiza el esquema. Seguro de llamar en cada arranque."""
     settings = config.get_settings()
     async with transaction() as db:
         await db.executescript(_SCHEMA)
-        await _migrate_wallet_links(db)
-        for table, column, ddl in _LEGACY_COLUMNS:
-            columns = await _table_columns(db, table)
-            if columns and column not in columns:
-                await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-                logger.info("Migrated %s: added column %s", table, column)
-        # New databases start with the configured amount of points.
-        await db.execute(
-            "UPDATE users SET points = ? WHERE points = 1000 AND created_at = updated_at "
-            "AND ? != 1000 AND NOT EXISTS (SELECT 1 FROM bets WHERE bets.user_id = users.user_id)",
-            (settings.starting_points, settings.starting_points),
-        )
+        await _apply_migrations(db, settings)
         await db.commit()
     logger.info("Database ready at %s (mode=%s)", database_path(), settings.mode)
+
+
+async def _apply_migrations(db: aiosqlite.Connection, settings: config.Settings) -> None:
+    """Aplica, en orden y una sola vez, las migraciones pendientes.
+
+    `PRAGMA user_version` es el marcador: no hay tabla de control que se pueda
+    desincronizar, y una base de datos de una versión futura se rechaza en vez
+    de corromperse.
+    """
+    current = await _schema_version(db)
+    if current > SCHEMA_VERSION:
+        raise DatabaseError(
+            f"La base de datos es de la versión {current} y este bot entiende hasta "
+            f"la {SCHEMA_VERSION}. Actualiza el bot antes de arrancar."
+        )
+    for version in range(current + 1, SCHEMA_VERSION + 1):
+        migration = _MIGRATIONS.get(version)
+        if migration is None:  # pragma: no cover - guardarraíl de desarrollo
+            raise DatabaseError(f"Falta la migración {version}")
+        await migration(db, settings)
+        await db.execute(f"PRAGMA user_version = {int(version)}")
+        logger.info("Esquema migrado a la versión %s", version)
 
 
 # ---------------------------------------------------------------------------
@@ -463,14 +507,14 @@ class SettlementResult:
     total_pool: int
     winning_pool: int
     rake: int = 0
-    bets: List[BetSettlement] = field(default_factory=list)
+    bets: list[BetSettlement] = field(default_factory=list)
 
     @property
-    def winners(self) -> List[BetSettlement]:
+    def winners(self) -> list[BetSettlement]:
         return [b for b in self.bets if b.result in ("win", "refund")]
 
     @property
-    def losers(self) -> List[BetSettlement]:
+    def losers(self) -> list[BetSettlement]:
         return [b for b in self.bets if b.result == "lose"]
 
     @property
@@ -482,29 +526,36 @@ class SettlementResult:
 # Users
 # ---------------------------------------------------------------------------
 
-async def upsert_user(user_id: int, username: Optional[str], full_name: Optional[str]) -> None:
+async def upsert_user(user_id: int, username: str | None, full_name: str | None) -> None:
+    """Crea o refresca el usuario sin perder datos que Telegram no envía.
+
+    D-05: si el usuario quita su @usuario, Telegram manda ``None``; un
+    ``username = excluded.username`` lo habría borrado. Con ``COALESCE`` se
+    conserva el último conocido.
+    """
+    starting_points = int(config.get_settings().starting_points)
     async with transaction() as db:
         await db.execute(
             """
-            INSERT INTO users (user_id, username, full_name)
-            VALUES (?, ?, ?)
+            INSERT INTO users (user_id, username, full_name, points)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                username   = excluded.username,
+                username   = COALESCE(excluded.username, users.username),
                 full_name  = excluded.full_name,
                 updated_at = ?
             """,
-            (user_id, username, full_name or "", iso_now()),
+            (user_id, username or None, full_name or "", starting_points, iso_now()),
         )
 
 
-async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user(user_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 
-async def get_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
+async def get_leaderboard(limit: int = 10) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 100))
     async with connection() as db:
         async with db.execute(
@@ -535,18 +586,22 @@ async def adjust_points(user_id: int, delta: int) -> int:
 # Predictions (off-chain sandbox mode)
 # ---------------------------------------------------------------------------
 
+#: Un mercado necesita al menos dos opciones para poder repartir.
+MIN_OPTIONS = 2
+
+
 async def create_prediction(
     creator_id: int,
     chat_id: int,
     title: str,
-    options: List[str],
+    options: list[str],
     closes_at: datetime,
     mode: str = "points",
 ) -> int:
     settings = config.get_settings()
     if not title.strip():
         raise DatabaseError("El título no puede estar vacío.")
-    if not 2 <= len(options) <= settings.max_options:
+    if not MIN_OPTIONS <= len(options) <= settings.max_options:
         raise DatabaseError(f"Necesitas entre 2 y {settings.max_options} opciones.")
     async with transaction() as db:
         cur = await db.execute(
@@ -561,14 +616,14 @@ async def create_prediction(
     return pred_id
 
 
-async def get_prediction(pred_id: int) -> Optional[Dict[str, Any]]:
+async def get_prediction(pred_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute("SELECT * FROM predictions WHERE id = ?", (pred_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 
-async def get_open_predictions(chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
+async def get_open_predictions(chat_id: int | None = None) -> list[dict[str, Any]]:
     """Predicciones abiertas **con su pozo**, en una sola consulta (R-01).
 
     Antes la lista pedía una consulta por predicción para el pozo: con 8 filas
@@ -581,7 +636,7 @@ async def get_open_predictions(chat_id: Optional[int] = None) -> List[Dict[str, 
         LEFT JOIN bets b ON b.prediction_id = p.id
         WHERE p.status = 'open' AND p.closes_at > ?
     """
-    params: List[Any] = [now]
+    params: list[Any] = [now]
     if chat_id is not None:
         sql += " AND p.chat_id = ?"
         params.append(chat_id)
@@ -591,7 +646,7 @@ async def get_open_predictions(chat_id: Optional[int] = None) -> List[Dict[str, 
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_predictions_to_resolve() -> List[Dict[str, Any]]:
+async def get_predictions_to_resolve() -> list[dict[str, Any]]:
     """Closed predictions that still need a winner (admin panel)."""
     async with connection() as db:
         async with db.execute(
@@ -600,7 +655,7 @@ async def get_predictions_to_resolve() -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def close_expired_predictions() -> List[int]:
+async def close_expired_predictions() -> list[int]:
     """Mark predictions whose ``closes_at`` has passed as ``closed``."""
     now = iso_now()
     async with transaction() as db:
@@ -676,8 +731,8 @@ async def place_bet(user_id: int, pred_id: int, option_id: int, amount: int) -> 
 
 
 def _split_payouts(
-    winners: List[Dict[str, Any]], distributable_pool: int, winning_pool: int
-) -> Dict[int, int]:
+    winners: list[dict[str, Any]], distributable_pool: int, winning_pool: int
+) -> dict[int, int]:
     """Reparto pari-mutuel con redondeo determinista.
 
     Cada ganador recibe ``payout(stake, distributable, winning_pool)`` (la única
@@ -741,7 +796,7 @@ async def settle_prediction(pred_id: int, winning_option_id: int) -> SettlementR
 class _SettlementPlan(NamedTuple):
     """Qué cobra cada apuesta y cuánto se queda el rake."""
 
-    payouts: Dict[int, int]
+    payouts: dict[int, int]
     rake: int
     refunded: bool
 
@@ -771,7 +826,7 @@ async def _winning_label(
     return option["label"]
 
 
-async def _prediction_bets(db: aiosqlite.Connection, pred_id: int) -> List[Dict[str, Any]]:
+async def _prediction_bets(db: aiosqlite.Connection, pred_id: int) -> list[dict[str, Any]]:
     async with db.execute(
         "SELECT id, user_id, option_id, amount FROM bets WHERE prediction_id = ? ORDER BY id",
         (pred_id,),
@@ -779,7 +834,7 @@ async def _prediction_bets(db: aiosqlite.Connection, pred_id: int) -> List[Dict[
         return [dict(r) for r in await cur.fetchall()]
 
 
-def _pool_totals(bets: List[Dict[str, Any]], winning_option_id: int) -> Tuple[int, int]:
+def _pool_totals(bets: list[dict[str, Any]], winning_option_id: int) -> tuple[int, int]:
     total = sum(int(b["amount"]) for b in bets)
     winning = sum(
         int(b["amount"]) for b in bets if int(b["option_id"]) == int(winning_option_id)
@@ -788,7 +843,7 @@ def _pool_totals(bets: List[Dict[str, Any]], winning_option_id: int) -> Tuple[in
 
 
 def _plan_payouts(
-    bets: List[Dict[str, Any]],
+    bets: list[dict[str, Any]],
     winning_option_id: int,
     total_pool: int,
     winning_pool: int,
@@ -815,12 +870,12 @@ def _bet_result(option_id: int, winning_option_id: int, refunded: bool) -> str:
 
 async def _write_settlements(
     db: aiosqlite.Connection,
-    bets: List[Dict[str, Any]],
+    bets: list[dict[str, Any]],
     winning_option_id: int,
     plan: _SettlementPlan,
-) -> List[BetSettlement]:
+) -> list[BetSettlement]:
     """Marca cada apuesta, paga a quien corresponda y devuelve el resumen."""
-    settlements: List[BetSettlement] = []
+    settlements: list[BetSettlement] = []
     now = iso_now()
     for bet in bets:
         payout = int(plan.payouts.get(bet["id"], 0))
@@ -852,7 +907,7 @@ async def _queue_result_notifications(
     pred: aiosqlite.Row,
     pred_id: int,
     winning_label: str,
-    settlements: List[BetSettlement],
+    settlements: list[BetSettlement],
 ) -> None:
     """F-04: quien ganó o recuperó puntos merece saberlo.
 
@@ -890,7 +945,7 @@ async def resolve_prediction(pred_id: int, winning_option_id: int) -> str:
 # Options / history
 # ---------------------------------------------------------------------------
 
-async def get_options(pred_id: int) -> List[Dict[str, Any]]:
+async def get_options(pred_id: int) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM options WHERE prediction_id = ? ORDER BY id", (pred_id,)
@@ -898,7 +953,7 @@ async def get_options(pred_id: int) -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_user_bets(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+async def get_user_bets(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             """
@@ -918,7 +973,7 @@ async def get_user_bets(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_user_stats(user_id: int) -> Dict[str, Any]:
+async def get_user_stats(user_id: int) -> dict[str, Any]:
     """Resumen del perfil calculado en SQL (R-02).
 
     Antes se traían hasta 500 apuestas al proceso para contar ganadas, perdidas,
@@ -949,7 +1004,7 @@ async def get_user_stats(user_id: int) -> Dict[str, Any]:
     return stats
 
 
-async def ranking_position(user_id: int) -> Optional[int]:
+async def ranking_position(user_id: int) -> int | None:
     """Puesto en el ranking por puntos, contado en SQL (R-03)."""
     async with connection() as db:
         async with db.execute("SELECT points FROM users WHERE user_id = ?", (int(user_id),)) as cur:
@@ -965,7 +1020,7 @@ async def ranking_position(user_id: int) -> Optional[int]:
     return int(better["better"]) + 1
 
 
-async def get_bettors_for_prediction(pred_id: int) -> List[Dict[str, Any]]:
+async def get_bettors_for_prediction(pred_id: int) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             """
@@ -980,7 +1035,7 @@ async def get_bettors_for_prediction(pred_id: int) -> List[Dict[str, Any]]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_prediction_pools(pred_id: int) -> Dict[int, int]:
+async def get_prediction_pools(pred_id: int) -> dict[int, int]:
     """Return ``{option_id: staked_points}`` plus a ``-1`` key with the total."""
     async with connection() as db:
         async with db.execute(
@@ -993,7 +1048,7 @@ async def get_prediction_pools(pred_id: int) -> Dict[int, int]:
     return pools
 
 
-async def get_user_bet(pred_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user_bet(pred_id: int, user_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM bets WHERE prediction_id = ? AND user_id = ?",
@@ -1007,7 +1062,7 @@ async def get_user_bet(pred_id: int, user_id: int) -> Optional[Dict[str, Any]]:
 # Reminders (deduplicated push notifications)
 # ---------------------------------------------------------------------------
 
-async def claim_reminders(kind: str = "closing") -> List[Dict[str, Any]]:
+async def claim_reminders(kind: str = "closing") -> list[dict[str, Any]]:
     """Atomically claim due reminders so a job repeat cannot spam users."""
     settings = config.get_settings()
     if settings.reminder_hours_before <= 0:
@@ -1030,7 +1085,7 @@ async def claim_reminders(kind: str = "closing") -> List[Dict[str, Any]]:
         ) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
 
-        claimed: List[Dict[str, Any]] = []
+        claimed: list[dict[str, Any]] = []
         for row in rows:
             cur = await db.execute(
                 "INSERT OR IGNORE INTO reminders (prediction_id, user_id, kind, sent_at) VALUES (?, ?, ?, ?)",
@@ -1041,7 +1096,7 @@ async def claim_reminders(kind: str = "closing") -> List[Dict[str, Any]]:
         return claimed
 
 
-async def get_reminder_targets(pred_id: int) -> List[int]:
+async def get_reminder_targets(pred_id: int) -> list[int]:
     async with connection() as db:
         async with db.execute(
             "SELECT user_id FROM bets WHERE prediction_id = ?", (pred_id,)
@@ -1067,9 +1122,9 @@ async def _queue_notification(
     user_id: int,
     kind: str,
     ref_id: Any,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     *,
-    now: Optional[int] = None,
+    now: int | None = None,
     delay: int = 0,
 ) -> None:
     """Inserta un aviso pendiente; el UNIQUE evita duplicados (dedupe)."""
@@ -1089,7 +1144,7 @@ async def _queue_notification(
 
 
 async def queue_notification(
-    user_id: int, kind: str, ref_id: Any, payload: Dict[str, Any], *, delay: int = 0
+    user_id: int, kind: str, ref_id: Any, payload: dict[str, Any], *, delay: int = 0
 ) -> bool:
     """Encola un aviso fuera de una transacción; devuelve si era nuevo."""
     async with transaction() as db:
@@ -1109,7 +1164,7 @@ async def queue_notification(
         return bool(cur.rowcount)
 
 
-async def due_notifications(limit: int = 20, *, now: Optional[int] = None) -> List[Dict[str, Any]]:
+async def due_notifications(limit: int = 20, *, now: int | None = None) -> list[dict[str, Any]]:
     """Avisos pendientes cuya hora de reintento ya pasó."""
     async with connection() as db:
         async with db.execute(
@@ -1164,10 +1219,10 @@ async def reschedule_notification(notification_id: int, delay: int) -> None:
         )
 
 
-async def notifications_for(user_id: int, status: Optional[str] = None) -> List[Dict[str, Any]]:
+async def notifications_for(user_id: int, status: str | None = None) -> list[dict[str, Any]]:
     """Avisos de un usuario; útil para `/misbets` y para los tests."""
     query = "SELECT * FROM notifications WHERE user_id = ?"
-    params: List[Any] = [int(user_id)]
+    params: list[Any] = [int(user_id)]
     if status:
         query += " AND status = ?"
         params.append(status)
@@ -1180,7 +1235,7 @@ async def notifications_for(user_id: int, status: Optional[str] = None) -> List[
 # ---------------------------------------------------------------------------
 
 async def link_wallet(
-    user_id: int, address: str, network: str = "ton", public_key: Optional[str] = None
+    user_id: int, address: str, network: str = "ton", public_key: str | None = None
 ) -> None:
     address = address.strip()
     if not address:
@@ -1213,7 +1268,7 @@ async def link_wallet(
             ) from exc
 
 
-async def get_wallet(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_wallet(user_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM wallet_links WHERE user_id = ? AND is_active = 1", (user_id,)
@@ -1222,7 +1277,7 @@ async def get_wallet(user_id: int) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
-async def get_wallet_owner(address: str) -> Optional[Dict[str, Any]]:
+async def get_wallet_owner(address: str) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM wallet_links WHERE address = ? AND is_active = 1", (address,)
@@ -1243,18 +1298,16 @@ async def unlink_wallet(user_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 async def create_nonce(user_id: int, purpose: str, ttl_seconds: int = 600) -> str:
-    import secrets as _s
 
-    nonce = _s.token_hex(16)
+    nonce = secrets.token_hex(16)
     now = int(datetime.now(timezone.utc).timestamp())
     async with transaction() as db:
         await db.execute(
             "INSERT INTO auth_nonces (nonce, user_id, purpose, created_at) VALUES (?, ?, ?, ?)",
             (nonce, user_id, purpose, now),
         )
-        await db.execute(
-            "DELETE FROM auth_nonces WHERE created_at < ?", (now - max(ttl_seconds, 3600),)
-        )
+    # D-01: la política de caducidad vive en `purge_nonces`, no duplicada aquí.
+    await purge_nonces(max(ttl_seconds, 3600))
     return nonce
 
 
@@ -1287,10 +1340,10 @@ async def purge_nonces(older_than_seconds: int = 86_400) -> None:
 
 async def insert_market_placeholder(
     market_id: int,
-    creator_address: Optional[str],
+    creator_address: str | None,
     option_count: int,
-    created_lt: Optional[int] = None,
-    created_tx: Optional[str] = None,
+    created_lt: int | None = None,
+    created_tx: str | None = None,
 ) -> bool:
     """Create a minimal row for a market we only know through a bet.
 
@@ -1314,21 +1367,21 @@ async def insert_market_placeholder(
         return cur.rowcount == 1
 
 
-def _is_placeholder_title(title: Optional[str], market_id: int) -> bool:
+def _is_placeholder_title(title: str | None, market_id: int) -> bool:
     return not title or title.strip() == f"Mercado #{int(market_id)}"
 
 
 async def enrich_market_from_event(
     market_id: int,
-    creator_address: Optional[str],
+    creator_address: str | None,
     title: str,
     option_count: int,
     closes_at: int,
-    title_hash: Optional[str] = None,
-    created_lt: Optional[int] = None,
-    created_tx: Optional[str] = None,
-    fee_bps: Optional[int] = None,
-) -> Tuple[bool, bool]:
+    title_hash: str | None = None,
+    created_lt: int | None = None,
+    created_tx: str | None = None,
+    fee_bps: int | None = None,
+) -> tuple[bool, bool]:
     """Apply the authoritative metadata of a ``market_created`` event.
 
     Returns ``(created, enriched)``. Only empty or placeholder fields are
@@ -1360,7 +1413,7 @@ async def enrich_market_from_event(
         if current.get("metadata_source") == "event":
             return False, False
 
-        updates: Dict[str, Any] = {}
+        updates: dict[str, Any] = {}
         if title and _is_placeholder_title(current.get("title"), market_id):
             updates["title"] = title[:200]
         if int(current.get("closes_at") or 0) == 0 and int(closes_at or 0) > 0:
@@ -1454,7 +1507,7 @@ async def update_market_cancelled(market_id: int) -> None:
         await _queue_market_notifications(db, int(market_id), cancelled=True)
 
 
-async def get_market(market_id: int) -> Optional[Dict[str, Any]]:
+async def get_market(market_id: int) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute("SELECT * FROM markets WHERE market_id = ?", (market_id,)) as cur:
             row = await cur.fetchone()
@@ -1465,7 +1518,7 @@ async def get_market(market_id: int) -> Optional[Dict[str, Any]]:
         return market
 
 
-async def _market_options(db: aiosqlite.Connection, market_id: int) -> List[Dict[str, Any]]:
+async def _market_options(db: aiosqlite.Connection, market_id: int) -> list[dict[str, Any]]:
     async with db.execute(
         "SELECT idx, label FROM market_options WHERE market_id = ? ORDER BY idx", (market_id,)
     ) as cur:
@@ -1479,18 +1532,18 @@ async def _market_options(db: aiosqlite.Connection, market_id: int) -> List[Dict
     return _default_options(count)
 
 
-def _default_options(count: int) -> List[Dict[str, Any]]:
+def _default_options(count: int) -> list[dict[str, Any]]:
     """Etiquetas de relleno para mercados creados fuera de la Mini App."""
     return [{"idx": i, "label": f"Opción {i + 1}"} for i in range(max(0, int(count)))]
 
 
 async def list_markets(
-    status: Optional[str] = "open", limit: int = 25, offset: int = 0
-) -> List[Dict[str, Any]]:
+    status: str | None = "open", limit: int = 25, offset: int = 0
+) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
     sql = "SELECT * FROM markets"
-    params: List[Any] = []
+    params: list[Any] = []
     if status:
         sql += " WHERE status = ?"
         params.append(status)
@@ -1520,15 +1573,15 @@ async def list_markets(
 
 
 async def _labels_for(
-    db: aiosqlite.Connection, ids: List[int], placeholders: str
-) -> Dict[int, List[Dict[str, Any]]]:
+    db: aiosqlite.Connection, ids: list[int], placeholders: str
+) -> dict[int, list[dict[str, Any]]]:
     async with db.execute(
         "SELECT market_id, idx, label FROM market_options"
         f" WHERE market_id IN ({placeholders}) ORDER BY market_id, idx",
         ids,
     ) as cur:
         rows = await cur.fetchall()
-    labels: Dict[int, List[Dict[str, Any]]] = {}
+    labels: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
         labels.setdefault(int(row["market_id"]), []).append(
             {"idx": int(row["idx"]), "label": row["label"]}
@@ -1537,8 +1590,8 @@ async def _labels_for(
 
 
 async def _pools_for(
-    db: aiosqlite.Connection, ids: List[int], placeholders: str
-) -> Tuple[Dict[int, Dict[str, int]], Dict[int, int], Dict[int, int]]:
+    db: aiosqlite.Connection, ids: list[int], placeholders: str
+) -> tuple[dict[int, dict[str, int]], dict[int, int], dict[int, int]]:
     async with db.execute(
         "SELECT market_id, option, COALESCE(SUM(stake),0) AS pool, COUNT(*) AS bets"
         f" FROM onchain_bets WHERE market_id IN ({placeholders})"
@@ -1546,9 +1599,9 @@ async def _pools_for(
         ids,
     ) as cur:
         rows = await cur.fetchall()
-    pools: Dict[int, Dict[str, int]] = {}
-    totals: Dict[int, int] = {}
-    counts: Dict[int, int] = {}
+    pools: dict[int, dict[str, int]] = {}
+    totals: dict[int, int] = {}
+    counts: dict[int, int] = {}
     for row in rows:
         market_id = int(row["market_id"])
         stake = int(row["pool"] or 0)
@@ -1556,14 +1609,6 @@ async def _pools_for(
         totals[market_id] = totals.get(market_id, 0) + stake
         counts[market_id] = counts.get(market_id, 0) + int(row["bets"] or 0)
     return pools, totals, counts
-
-
-async def _option_pools(db: aiosqlite.Connection, market_id: int) -> Dict[str, int]:
-    async with db.execute(
-        "SELECT option, COALESCE(SUM(stake),0) AS pool FROM onchain_bets WHERE market_id = ? GROUP BY option",
-        (market_id,),
-    ) as cur:
-        return {str(int(r["option"])): int(r["pool"]) for r in await cur.fetchall()}
 
 
 async def set_market_options(market_id: int, labels: Iterable[str]) -> None:
@@ -1602,7 +1647,7 @@ async def record_onchain_bet(
             return False
 
 
-async def mark_onchain_bet_claimed(market_id: int, bettor: str, payout: Optional[int] = None) -> None:
+async def mark_onchain_bet_claimed(market_id: int, bettor: str, payout: int | None = None) -> None:
     async with transaction() as db:
         await db.execute(
             "UPDATE onchain_bets SET claimed = 1, payout = COALESCE(?, payout) "
@@ -1611,7 +1656,7 @@ async def mark_onchain_bet_claimed(market_id: int, bettor: str, payout: Optional
         )
 
 
-async def get_onchain_bet(market_id: int, bettor: str) -> Optional[Dict[str, Any]]:
+async def get_onchain_bet(market_id: int, bettor: str) -> dict[str, Any] | None:
     async with connection() as db:
         async with db.execute(
             "SELECT * FROM onchain_bets WHERE market_id = ? AND bettor = ?",
@@ -1621,7 +1666,7 @@ async def get_onchain_bet(market_id: int, bettor: str) -> Optional[Dict[str, Any
             return dict(row) if row else None
 
 
-async def list_onchain_bets(bettor: str, limit: int = 50) -> List[Dict[str, Any]]:
+async def list_onchain_bets(bettor: str, limit: int = 50) -> list[dict[str, Any]]:
     async with connection() as db:
         async with db.execute(
             """
@@ -1651,7 +1696,7 @@ async def market_pool(market_id: int) -> int:
 # Indexer bookkeeping
 # ---------------------------------------------------------------------------
 
-async def get_cursor(name: str) -> Tuple[int, Optional[str]]:
+async def get_cursor(name: str) -> tuple[int, str | None]:
     async with connection() as db:
         async with db.execute(
             "SELECT lt, last_hash FROM chain_cursors WHERE name = ?", (name,)
@@ -1660,7 +1705,7 @@ async def get_cursor(name: str) -> Tuple[int, Optional[str]]:
         return (int(row["lt"]), row["last_hash"]) if row else (0, None)
 
 
-async def set_cursor(name: str, lt: int, last_hash: Optional[str]) -> None:
+async def set_cursor(name: str, lt: int, last_hash: str | None) -> None:
     async with transaction() as db:
         await db.execute(
             """
@@ -1672,7 +1717,7 @@ async def set_cursor(name: str, lt: int, last_hash: Optional[str]) -> None:
         )
 
 
-async def mark_tx_processed(tx_hash: str, lt: int, account: Optional[str], op: Optional[int]) -> bool:
+async def mark_tx_processed(tx_hash: str, lt: int, account: str | None, op: int | None) -> bool:
     async with transaction() as db:
         try:
             cur = await db.execute(
@@ -1691,7 +1736,7 @@ async def unmark_tx_processed(tx_hash: str, lt: int) -> None:
 
 
 async def register_chain_tx_failure(
-    tx_hash: str, lt: int, op: Optional[int], error: str
+    tx_hash: str, lt: int, op: int | None, error: str
 ) -> int:
     """Record a failed transaction and return how many times it has failed.
 
@@ -1729,10 +1774,10 @@ async def schedule_chain_tx_retry(tx_hash: str, lt: int, delay_seconds: int) -> 
         )
 
 
-async def list_chain_tx_failures(limit: int = 100, *, due_only: bool = False) -> List[Dict[str, Any]]:
+async def list_chain_tx_failures(limit: int = 100, *, due_only: bool = False) -> list[dict[str, Any]]:
     """Failed transactions, oldest first. ``due_only`` filters by backoff."""
     sql = "SELECT * FROM chain_tx_failures"
-    params: List[Any] = []
+    params: list[Any] = []
     if due_only:
         sql += " WHERE next_retry_at IS NULL OR next_retry_at <= ?"
         params.append(iso_now())
@@ -1758,7 +1803,7 @@ async def clear_chain_tx_failure(tx_hash: str, lt: int) -> None:
 
 
 async def record_indexer_run(
-    last_lt: Optional[int], error: Optional[str], processed: int = 0
+    last_lt: int | None, error: str | None, processed: int = 0
 ) -> None:
     async with transaction() as db:
         await db.execute(
@@ -1775,7 +1820,7 @@ async def record_indexer_run(
         )
 
 
-async def get_indexer_status() -> Dict[str, Any]:
+async def get_indexer_status() -> dict[str, Any]:
     async with connection() as db:
         async with db.execute("SELECT * FROM indexer_status WHERE id = 1") as cur:
             row = await cur.fetchone()
@@ -1797,9 +1842,9 @@ async def get_indexer_status() -> Dict[str, Any]:
 async def create_pending_action(
     user_id: int,
     kind: str,
-    match_a: Optional[str] = None,
-    match_b: Optional[str] = None,
-    payload: Optional[Dict[str, Any]] = None,
+    match_a: str | None = None,
+    match_b: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> int:
     async with transaction() as db:
         cur = await db.execute(
@@ -1813,10 +1858,10 @@ async def create_pending_action(
 
 
 async def find_pending_action(
-    kind: str, match_a: Optional[str] = None, match_b: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
+    kind: str, match_a: str | None = None, match_b: str | None = None
+) -> dict[str, Any] | None:
     sql = "SELECT * FROM pending_actions WHERE kind = ? AND consumed_at IS NULL"
-    params: List[Any] = [kind]
+    params: list[Any] = [kind]
     if match_a is not None:
         sql += " AND match_a = ?"
         params.append(match_a)

@@ -5,12 +5,9 @@ target-version = "py311"
 extend-exclude = [".venv", "contracts", "build", "dist"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I", "B", "C4", "SIM", "UP"]
+select = ["E4", "E7", "E9", "F", "I", "B", "C4", "SIM", "UP", "PLR2004", "ARG", "PLC0415"]
 ignore = [
-    # Legacy typing style (List/Dict/Optional) is normalised in phase 7, not now.
-    "UP006",
     "UP035",
-    "UP045",
     # We deliberately keep timezone.utc on 3.11 for readability parity.
     "UP017",
     # Nested `with` blocks are sometimes clearer around aiosqlite cursors.
@@ -23,9 +20,25 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["B011", "SIM105"]
+# Los tests importan módulos dentro de fixtures para aislar `monkeypatch`
+# y para no arrastrar dependencias de arranque.
+"tests/*" = [
+    "B011",
+    "SIM105",
+    "PLR2004",
+    "PLC0415",
+    "ARG001",
+    "ARG002",
+    "ARG005",
+]
+# Los anchos de bits (32/64/256) y los topes del protocolo TON son parte de la
+# especificación: nombrarlos uno a uno oscurecería el parseo binario.
+"bot/chain/*" = ["PLR2004"]
+# Firmas impuestas por Telegram/aiohttp: `context` y `request` no siempre se usan.
+"bot/handlers/*" = ["ARG001"]
+"bot/api.py" = ["ARG001"]
+"main.py" = ["ARG001"]
 "scripts/dev_server.py" = ["E402"]
-"bot/chain/__init__.py" = ["F401"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["bot", "config", "main"]

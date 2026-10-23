@@ -15,13 +15,14 @@ from __future__ import annotations
 import gzip
 import hashlib
 import ipaddress
+import json
 import logging
 import math
 import re
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from aiohttp import web
 
@@ -74,7 +75,7 @@ class _Asset:
         self.gzipped = gzip.compress(body, 6) if compress else None
 
 
-_assets: Dict[str, _Asset] = {}
+_assets: dict[str, _Asset] = {}
 
 
 def _asset_version() -> str:
@@ -90,7 +91,7 @@ def _asset_version() -> str:
     return digest.hexdigest()[:12]
 
 
-def _load_asset(name: str) -> Optional[_Asset]:
+def _load_asset(name: str) -> _Asset | None:
     """Carga (una vez) un activo de ``web/static`` y lo cachea en memoria.
 
     Rechaza cualquier ruta que no sea un nombre de fichero simple dentro del
@@ -127,7 +128,7 @@ _verify_limiter = security.RateLimiter(limit=10, window_seconds=300)
 #: Global backstop per endpoint (limit, window seconds). These are *not* keyed by
 #: client: even a client that rotates IPs or sessions hits this ceiling, which is
 #: what makes S-04 impossible to exploit by forging headers (see Fase 3).
-BACKSTOP_LIMITS: Dict[str, Tuple[int, float]] = {
+BACKSTOP_LIMITS: dict[str, tuple[int, float]] = {
     "/api/session": (300, 60),
     "/api/wallet/nonce": (300, 60),
     "/api/wallet/verify": (120, 60),
@@ -136,8 +137,8 @@ BACKSTOP_LIMITS: Dict[str, Tuple[int, float]] = {
 }
 
 def _new_backstops(
-    limits: Optional[Dict[str, Tuple[int, float]]] = None,
-) -> Dict[str, security.RateLimiter]:
+    limits: dict[str, tuple[int, float]] | None = None,
+) -> dict[str, security.RateLimiter]:
     """Fresh limiters per app: a test app must not inherit another's counters."""
     return {
         path: security.RateLimiter(limit=limit, window_seconds=window)
@@ -162,7 +163,7 @@ def _settings() -> config.Settings:
 # ---------------------------------------------------------------------------
 
 def json_ok(data: Any = None, status: int = 200, **extra: Any) -> web.Response:
-    payload: Dict[str, Any] = {"ok": True}
+    payload: dict[str, Any] = {"ok": True}
     if data is not None:
         payload["data"] = data
     payload.update(extra)
@@ -176,12 +177,10 @@ def json_error(code: str, message: str, status: int = 400) -> web.Response:
 
 
 def _dumps(value: Any) -> str:
-    import json
-
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-async def read_json(request: web.Request) -> Dict[str, Any]:
+async def read_json(request: web.Request) -> dict[str, Any]:
     if request.content_length and request.content_length > MAX_BODY:
         raise web.HTTPRequestEntityTooLarge(max_size=MAX_BODY, actual_size=request.content_length)
     try:
@@ -194,12 +193,12 @@ async def read_json(request: web.Request) -> Dict[str, Any]:
 
 
 @lru_cache(maxsize=32)
-def _networks(cidrs: Tuple[str, ...]) -> Tuple[Any, ...]:
+def _networks(cidrs: tuple[str, ...]) -> tuple[Any, ...]:
     """Parsed networks, cached: ``_client_ip`` runs on every request."""
     return tuple(ipaddress.ip_network(cidr, strict=False) for cidr in cidrs)
 
 
-def _is_trusted_proxy(ip: str, cidrs: Tuple[str, ...]) -> bool:
+def _is_trusted_proxy(ip: str, cidrs: tuple[str, ...]) -> bool:
     if not cidrs:
         return False
     try:
@@ -248,7 +247,7 @@ def _admin(user_id: int) -> bool:
     return user_id in _settings().admin_ids
 
 
-def _user_payload(user_id: int, user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _user_payload(user_id: int, user: dict[str, Any] | None) -> dict[str, Any]:
     """Public shape of a user, shared by ``/api/session`` and ``/api/me``."""
     return {
         "user_id": user_id,
@@ -259,7 +258,7 @@ def _user_payload(user_id: int, user: Optional[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
-def _market_id(request: web.Request) -> Optional[int]:
+def _market_id(request: web.Request) -> int | None:
     """``market_id`` from the URL, or ``None`` when it is not an integer."""
     try:
         return int(request.match_info["market_id"])
@@ -275,7 +274,7 @@ def _require_admin(request: web.Request) -> int:
     return user_id
 
 
-def _wallet_view(wallet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _wallet_view(wallet: dict[str, Any] | None) -> dict[str, Any] | None:
     if not wallet:
         return None
     return {
@@ -285,7 +284,7 @@ def _wallet_view(wallet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     }
 
 
-def public_config() -> Dict[str, Any]:
+def public_config() -> dict[str, Any]:
     settings = _settings()
     return {
         "mode": settings.mode,
@@ -789,7 +788,7 @@ async def admin_contract_state(request: web.Request) -> web.Response:
     return json_ok(payload)
 
 
-async def _admin_matches_wallet(user_id: int, state: Any) -> Optional[bool]:
+async def _admin_matches_wallet(user_id: int, state: Any) -> bool | None:
     """Whether the linked wallet can actually sign these ops (informational)."""
     if not state.admin:
         return None
@@ -893,7 +892,7 @@ def _error_middleware():
     return middleware
 
 
-def _backstop_middleware(backstops: Dict[str, security.RateLimiter]):
+def _backstop_middleware(backstops: dict[str, security.RateLimiter]):
     """Ceiling per endpoint, independent of the caller's identity.
 
     Forging ``X-Forwarded-For`` or minting sessions cannot bypass this: the key
@@ -927,7 +926,7 @@ def _headers_middleware(allowed_ancestors: str):
                 "Content-Security-Policy",
                 "default-src 'self'; "
                 f"frame-ancestors {allowed_ancestors}; "
-                "script-src 'self' https://telegram.org https://unpkg.com; "
+                "script-src 'self' https://telegram.org; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob: https:; "
                 "connect-src 'self' https: wss:; "
@@ -941,7 +940,7 @@ def _headers_middleware(allowed_ancestors: str):
 def create_app(
     ton_client: Any = None,
     *,
-    backstop_limits: Optional[Dict[str, Tuple[int, float]]] = None,
+    backstop_limits: dict[str, tuple[int, float]] | None = None,
 ) -> web.Application:
     settings = _settings()
     app = web.Application(
@@ -985,7 +984,7 @@ def create_app(
 
 
 async def start_server(
-    *, host: Optional[str] = None, port: Optional[int] = None, ton_client: Any = None
+    *, host: str | None = None, port: int | None = None, ton_client: Any = None
 ) -> web.AppRunner:
     settings = _settings()
     app = create_app(ton_client=ton_client)

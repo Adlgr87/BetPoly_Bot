@@ -11,7 +11,8 @@ Two different jobs live here:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -61,6 +62,9 @@ async def _deny(update: Update) -> bool:
 # Panel
 # ---------------------------------------------------------------------------
 
+#: Predicciones pendientes por página en el panel (F-08).
+ADMIN_PREDICTIONS_PAGE = 6
+
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _deny(update):
         return
@@ -74,23 +78,43 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await _show_admin_panel(update, context)
 
 
-async def _show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def admin_predictions_page_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Paginación del panel (F-08): un panel con 50 botones no cabe en Telegram."""
+    query = update.callback_query
+    await safe_answer(query)
+    if await _deny(update):
+        return
+    try:
+        page = int((query.data or "").split(":")[1])
+    except (IndexError, ValueError):
+        page = 0
+    await _show_admin_panel(update, context, page=page)
+
+
+async def _show_admin_panel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, page: int = 0
+) -> None:
     settings = config.get_settings()
     predictions = await database.get_predictions_to_resolve()
+    total_pages = max(1, -(-len(predictions) // ADMIN_PREDICTIONS_PAGE))
+    page = min(max(page, 0), total_pages - 1)
+    start = page * ADMIN_PREDICTIONS_PAGE
+    chunk = predictions[start:start + ADMIN_PREDICTIONS_PAGE]
     lines = ["🔧 <b>Panel de administrador</b>", ""]
 
     if predictions:
-        lines.append(
-            f"🪙 <b>{len(predictions)}</b> predicción(es) de puntos esperando resolución:"
-        )
-        for pred in predictions:
+        header = f"🪙 <b>{len(predictions)}</b> predicción(es) de puntos esperando resolución"
+        if total_pages > 1:
+            header += f" · página {page + 1}/{total_pages}"
+        lines.append(header + ":")
+        for pred in chunk:
             lines.append(f"   • {esc(pred['title'][:48])}")
+        if len(predictions) > len(chunk):
+            lines.append(f"   … y {len(predictions) - len(chunk)} más")
     else:
         lines.append("🪙 No hay predicciones de puntos pendientes.")
-
-    keyboard_rows = []
-    if predictions:
-        keyboard_rows = admin_predictions_keyboard(predictions).inline_keyboard
 
     if settings.escrow_enabled:
         status = await database.get_indexer_status()
@@ -111,21 +135,20 @@ async def _show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "<i>Al resolver, el bot genera una transacción sin firmar: tú la firmas "
             "desde tu propia wallet. El backend no tiene llaves.</i>",
         ]
-        keyboard_rows = [
-            [InlineKeyboardButton(f"📌 {_short(p['title'])}", callback_data=f"admin_resolve:{p['id']}")]
-            for p in predictions
-        ]
-        keyboard_rows.append(
-            [InlineKeyboardButton("🔒 Mercados on-chain", callback_data="admin_chain:0")]
+        keyboard_rows = list(
+            admin_predictions_keyboard(page, total_pages, chunk).inline_keyboard
         )
-        keyboard_rows.append(
-            [InlineKeyboardButton("⚙️ Contrato escrow", callback_data="admin_contract")]
+        # «Contrato escrow» va antes del botón de salir que añade el teclado.
+        keyboard_rows.insert(
+            -1,
+            [InlineKeyboardButton("⚙️ Contrato escrow", callback_data="admin_contract")],
         )
-        keyboard_rows.append([InlineKeyboardButton("🔙 Salir", callback_data="main_menu")])
     else:
-        keyboard_rows = keyboard_rows or [
-            [InlineKeyboardButton("🔙 Salir", callback_data="main_menu")]
-        ]
+        keyboard_rows = list(
+            admin_predictions_keyboard(
+                page, total_pages, chunk, onchain=False
+            ).inline_keyboard
+        )
 
     await edit_or_reply(
         update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard_rows)
@@ -138,7 +161,6 @@ def _short(text: str, size: int = 36) -> str:
 
 
 def _now() -> int:
-    import time
 
     return int(time.time())
 
@@ -517,7 +539,7 @@ CONTRACT_WITHDRAW, CONTRACT_FEE, CONTRACT_ADMIN = range(3)
 _PENDING_KEY = "contract_pending"
 
 
-def _pending(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+def _pending(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any]:
     return context.user_data.setdefault(_PENDING_KEY, {})
 
 
@@ -525,7 +547,7 @@ def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(_PENDING_KEY, None)
 
 
-async def _contract_state_text(user_id: int) -> Tuple[str, Any]:
+async def _contract_state_text(user_id: int) -> tuple[str, Any]:
     """Render the on-chain state plus how it relates to the operator's wallet."""
     state = await markets.escrow_state()
     wallet = await database.get_wallet(user_id)
@@ -579,7 +601,7 @@ async def admin_contract_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def _show_contract_panel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, *, error: Optional[str] = None
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, error: str | None = None
 ) -> None:
     if not config.get_settings().escrow_enabled:
         await edit_or_reply(

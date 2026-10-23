@@ -492,20 +492,48 @@ class TestWallet:
 # ---------------------------------------------------------------------------
 
 class TestAdminPanel:
-    async def test_panel_lists_every_prediction_the_keyboard_offers(self, db):
-        """U-04: el texto y el teclado muestran lo mismo."""
-        for index in range(10):
+    async def _closed_predictions(self, db, count):
+        for index in range(count):
             pred_id = await _prediction(db, title=f"Predicción número {index}")
             await _bet(db, pred_id, user_id=2, amount=50)
         async with db.connection() as conn:
             await conn.execute("UPDATE predictions SET status = 'closed'")
             await conn.commit()
+
+    async def test_panel_pages_predictions_and_never_hides_them(self, db):
+        """F-08/U-04: un panel paginado; entre todas las páginas está todo."""
+        await self._closed_predictions(db, admin_handler.ADMIN_PREDICTIONS_PAGE + 4)
+        total = admin_handler.ADMIN_PREDICTIONS_PAGE + 4
+
         update, context, recorder = make_update(user_id=ADMIN, text="/admin")
         await admin_handler.admin_handler(update, context)
-        text = recorder.last["text"]
-        buttons = [b for b in recorder.callbacks() if b.startswith("admin_resolve:")]
-        assert len(buttons) == 10
-        assert text.count("Predicción número") == 10
+        first_text = recorder.last["text"]
+        first_buttons = [
+            b for b in recorder.callbacks() if b.startswith("admin_resolve:")
+        ]
+        assert len(first_buttons) == admin_handler.ADMIN_PREDICTIONS_PAGE
+        assert first_text.count("Predicción número") == admin_handler.ADMIN_PREDICTIONS_PAGE
+        assert f"… y {total - admin_handler.ADMIN_PREDICTIONS_PAGE} más" in first_text
+        assert "admin_preds:1" in recorder.callbacks()
+
+        update, context, recorder = make_update(user_id=ADMIN, data="admin_preds:1")
+        await admin_handler.admin_predictions_page_callback(update, context)
+        second_buttons = [
+            b for b in recorder.callbacks() if b.startswith("admin_resolve:")
+        ]
+        assert len(second_buttons) == total - admin_handler.ADMIN_PREDICTIONS_PAGE
+        assert "admin_preds:0" in recorder.callbacks()
+        # Ninguna predicción se pierde entre las dos páginas.
+        assert len(set(first_buttons) | set(second_buttons)) == total
+
+    async def test_panel_page_is_clamped_to_the_last_page(self, db):
+        await self._closed_predictions(db, 2)
+        update, context, recorder = make_update(user_id=ADMIN, data="admin_preds:99")
+        await admin_handler.admin_predictions_page_callback(update, context)
+        assert "1/1" not in recorder.last["text"]
+        assert len(
+            [b for b in recorder.callbacks() if b.startswith("admin_resolve:")]
+        ) == 2
 
     async def test_panel_without_predictions(self, db):
         update, context, recorder = make_update(user_id=ADMIN, text="/admin")

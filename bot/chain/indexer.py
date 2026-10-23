@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from bot import database
 from bot.chain.addresses import AddressError, normalize_address, same_address
@@ -54,7 +54,6 @@ RETRY_BACKOFF_SECONDS = (60, 300, 900, 3600, 3600)
 
 @dataclass
 class IndexResult:
-    fetched: int = 0
     processed: int = 0
     markets_created: int = 0
     markets_enriched: int = 0
@@ -62,9 +61,8 @@ class IndexResult:
     resolutions: int = 0
     cancellations: int = 0
     claims: int = 0
-    skipped: int = 0
     parked: int = 0
-    errors: List[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -78,13 +76,13 @@ class IndexResult:
         )
 
 
-def _out_msg_body(msg: Dict[str, Any]) -> Optional[str]:
+def _out_msg_body(msg: dict[str, Any]) -> str | None:
     data = msg.get("msg_data") or {}
     body = data.get("body")
     return body if isinstance(body, str) and body else None
 
 
-def _out_msg_destination(msg: Dict[str, Any]) -> Optional[str]:
+def _out_msg_destination(msg: dict[str, Any]) -> str | None:
     dest = msg.get("destination")
     if not dest:
         return None
@@ -94,17 +92,11 @@ def _out_msg_destination(msg: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def _out_msg_value(msg: Dict[str, Any]) -> int:
+def _out_msg_value(msg: dict[str, Any]) -> int:
     try:
         return int(str(msg.get("value") or 0))
     except ValueError:
         return 0
-
-
-@dataclass
-class _Ordered:
-    lt: int
-    tx: ChainTransaction
 
 
 class EscrowIndexer:
@@ -126,9 +118,8 @@ class EscrowIndexer:
         self.batch = max(1, min(int(batch), 100))
         self.backfill_pages = max(0, int(backfill_pages))
         self.min_stake_nano = max(0, int(min_stake_nano))
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
-        self.last_result = IndexResult()
 
     # ------------------------------------------------------------------
     # polling
@@ -145,14 +136,12 @@ class EscrowIndexer:
             logger.exception("Unexpected indexer failure")
             result.errors.append(str(exc))
             await database.record_indexer_run(None, f"unexpected: {exc}", result.processed)
-        self.last_result = result
         return result
 
     async def _poll(self, result: IndexResult) -> None:
         await self._rewind_for_retries()
         cursor_lt, cursor_hash = await database.get_cursor(CURSOR_NAME)
         txs = await self._fetch(cursor_lt, cursor_hash)
-        result.fetched = len(txs)
         if not txs:
             await database.record_indexer_run(cursor_lt, None, 0)
             return
@@ -208,14 +197,14 @@ class EscrowIndexer:
 
     async def _process_with_retries(
         self, tx: ChainTransaction, result: IndexResult
-    ) -> Optional[str]:
+    ) -> str | None:
         """Apply a transaction, retrying inline. Returns the last error or None.
 
         A failure always releases the ``chain_txs`` marker, otherwise the next
         attempt would consider the transaction already applied and silently
         drop the work that did not complete.
         """
-        last_error: Optional[str] = None
+        last_error: str | None = None
         for attempt in range(MAX_INLINE_RETRIES + 1):
             try:
                 await self._process_tx(tx, result)
@@ -231,7 +220,7 @@ class EscrowIndexer:
         return last_error
 
     @staticmethod
-    def _tx_op(tx: ChainTransaction) -> Optional[int]:
+    def _tx_op(tx: ChainTransaction) -> int | None:
         if not (tx.is_internal_inbound and tx.inbound_body):
             return None
         try:
@@ -263,11 +252,11 @@ class EscrowIndexer:
         )
         await database.set_cursor(CURSOR_NAME, target, None)
 
-    async def _fetch(self, cursor_lt: int, cursor_hash: Optional[str]) -> List[ChainTransaction]:
+    async def _fetch(self, cursor_lt: int, cursor_hash: str | None) -> list[ChainTransaction]:
         """Fetch every transaction newer than the cursor (ascending order)."""
         pages = self.backfill_pages if not cursor_lt else 20
-        lt: Optional[int] = None
-        collected: List[ChainTransaction] = []
+        lt: int | None = None
+        collected: list[ChainTransaction] = []
         seen_hashes: set[tuple[str, int]] = set()
 
         for _ in range(max(1, pages)):
@@ -314,7 +303,6 @@ class EscrowIndexer:
         op = parsed.op if parsed else None
         first_time = await database.mark_tx_processed(tx.tx_hash, tx.lt, self.escrow_address, op)
         if not first_time:
-            result.skipped += 1
             return
 
         # 1) lifecycle events emitted to the indexer address
@@ -366,7 +354,7 @@ class EscrowIndexer:
                     "Admin action %s rejected for market %s", parsed.name, parsed.market_id
                 )
 
-    def _claim_payout(self, tx: ChainTransaction) -> Optional[int]:
+    def _claim_payout(self, tx: ChainTransaction) -> int | None:
         best = None
         for msg in tx.out_messages or []:
             dest = _out_msg_destination(msg)

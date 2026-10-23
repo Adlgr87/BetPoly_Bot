@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+from datetime import datetime, timezone
 
 from telegram import BotCommand, MenuButtonWebApp, Update, WebAppInfo
 from telegram.error import BadRequest, Forbidden
@@ -48,6 +49,7 @@ from bot.handlers.admin import (
     admin_contract_pause_callback,
     admin_handler,
     admin_panel_callback,
+    admin_predictions_page_callback,
     admin_resolve_callback,
     admin_winner_callback,
     build_admin_contract_conversation,
@@ -123,15 +125,11 @@ async def job_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _epoch(value) -> int:
-    from datetime import datetime
-
     try:
         if isinstance(value, (int, float)):
             return int(value)
         dt = datetime.fromisoformat(str(value))
         if dt.tzinfo is None:
-            from datetime import timezone
-
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp())
     except Exception:  # noqa: BLE001
@@ -342,6 +340,7 @@ def build_application() -> Application:
         (r"^list_markets:\d+$", list_markets_callback),
         (r"^market_view:\d+$", market_view_callback),
         ("^admin_panel$", admin_panel_callback),
+        (r"^admin_preds:\d+$", admin_predictions_page_callback),
         (r"^admin_resolve:\d+$", admin_resolve_callback),
         (r"^admin_winner:\d+:\d+$", admin_winner_callback),
         (r"^admin_confirm:\d+:\d+$", admin_confirm_callback),

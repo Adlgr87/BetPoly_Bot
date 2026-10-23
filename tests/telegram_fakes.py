@@ -8,7 +8,7 @@ teclado para comprobar la fila «🔧 Admin» (F-01/F-14).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from telegram import Chat
 from telegram.error import BadRequest
@@ -16,26 +16,26 @@ from telegram.error import BadRequest
 
 class Recorder:
     def __init__(self) -> None:
-        self.events: List[Dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
 
-    def add(self, kind: str, text: Any, kwargs: Dict[str, Any], **extra) -> None:
+    def add(self, kind: str, text: Any, kwargs: dict[str, Any], **extra) -> None:
         self.events.append({"kind": kind, "text": text, "kwargs": kwargs, **extra})
 
     # -- consultas cómodas -------------------------------------------------
     @property
-    def last(self) -> Dict[str, Any]:
+    def last(self) -> dict[str, Any]:
         assert self.events, "no se envió ningún mensaje"
         return self.events[-1]
 
     @property
-    def texts(self) -> List[str]:
+    def texts(self) -> list[str]:
         return [e["text"] for e in self.events]
 
     @property
     def all_text(self) -> str:
         return "\n".join(str(e["text"]) for e in self.events)
 
-    def buttons(self, index: int = -1) -> List[Any]:
+    def buttons(self, index: int = -1) -> list[Any]:
         if not self.events:
             return []
         markup = self.events[index]["kwargs"].get("reply_markup")
@@ -43,7 +43,7 @@ class Recorder:
             return []
         return [button for row in markup.inline_keyboard for button in row]
 
-    def callbacks(self, index: int = -1) -> List[str]:
+    def callbacks(self, index: int = -1) -> list[str]:
         return [b.callback_data for b in self.buttons(index) if b.callback_data]
 
     def reset(self) -> None:
@@ -72,10 +72,10 @@ class FakeMessage:
     def __init__(
         self,
         recorder: Recorder,
-        text: Optional[str] = None,
+        text: str | None = None,
         *,
-        chat: Optional[FakeChat] = None,
-        reply_to_message: Optional[FakeMessage] = None,
+        chat: FakeChat | None = None,
+        reply_to_message: FakeMessage | None = None,
     ):
         self.recorder = recorder
         self.text = text
@@ -95,7 +95,7 @@ class FakeCallbackQuery:
         self.data = data
         self.from_user = user
         self.message = message
-        self.answers: List[Dict[str, Any]] = []
+        self.answers: list[dict[str, Any]] = []
 
     async def answer(self, text=None, show_alert=False):
         self.answers.append({"text": text, "alert": show_alert})
@@ -113,10 +113,10 @@ class FailingCallbackQuery(FakeCallbackQuery):
 
 
 class FakeBot:
-    def __init__(self, recorder: Recorder, error: Optional[Exception] = None):
+    def __init__(self, recorder: Recorder, error: Exception | None = None):
         self.recorder = recorder
         self.error = error
-        self.sent: List[Dict[str, Any]] = []
+        self.sent: list[dict[str, Any]] = []
 
     async def send_message(self, chat_id, text, **kwargs):
         if self.error:
@@ -133,10 +133,10 @@ class FakeBot:
 
 
 class FakeContext:
-    def __init__(self, recorder: Recorder, bot: Optional[FakeBot] = None):
+    def __init__(self, recorder: Recorder, bot: FakeBot | None = None):
         self.recorder = recorder
-        self.user_data: Dict[str, Any] = {}
-        self.chat_data: Dict[str, Any] = {}
+        self.user_data: dict[str, Any] = {}
+        self.chat_data: dict[str, Any] = {}
         self.bot = bot or FakeBot(recorder)
         self.error = None
         self.application = None
@@ -148,9 +148,9 @@ class FakeUpdate:
         recorder: Recorder,
         user: FakeUser,
         *,
-        chat: Optional[FakeChat] = None,
-        message: Optional[FakeMessage] = None,
-        callback_query: Optional[FakeCallbackQuery] = None,
+        chat: FakeChat | None = None,
+        message: FakeMessage | None = None,
+        callback_query: FakeCallbackQuery | None = None,
     ):
         self.recorder = recorder
         self.effective_user = user
@@ -163,12 +163,12 @@ def make_update(
     *,
     user_id: int = 1,
     username: str = "tester",
-    text: Optional[str] = None,
-    data: Optional[str] = None,
-    chat_id: Optional[int] = None,
+    text: str | None = None,
+    data: str | None = None,
+    chat_id: int | None = None,
     chat_type: str = Chat.PRIVATE,
-    reply_to: Optional[FakeMessage] = None,
-    recorder: Optional[Recorder] = None,
+    reply_to: FakeMessage | None = None,
+    recorder: Recorder | None = None,
     failing_answer: bool = False,
 ):
     """Construye ``(update, context, recorder)`` para un mensaje o un callback."""

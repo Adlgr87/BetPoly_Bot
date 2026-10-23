@@ -8,7 +8,7 @@ import config
 from bot import database
 from bot.chain.addresses import to_friendly
 from bot.formatting import bold, esc, points, ton
-from bot.handlers.common import menu_for, register_user
+from bot.handlers.common import edit_or_reply, menu_for, register_user, safe_answer
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -67,7 +67,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from bot.handlers.common import edit_or_reply, safe_answer
 
     query = update.callback_query
     await safe_answer(query)

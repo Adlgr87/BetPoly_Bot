@@ -7,6 +7,8 @@ cabecera que se envía de verdad coincide con esa política.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from pathlib import Path
 
@@ -42,6 +44,24 @@ class TestNoInlineHandlers:
         for tag in re.findall(r"<script\b[^>]*>", html):
             assert "src=" in tag, f"script inline bloqueado por la CSP: {tag}"
 
+    def test_only_first_party_scripts_are_loaded(self):
+        """F-12: el componente que construye las transacciones ya no viene de un CDN."""
+        html = INDEX.read_text(encoding="utf-8")
+        sources = re.findall(r'<script[^>]*src="([^"]+)"', html)
+        assert sources, "la Mini App no carga ningún script"
+        for src in sources:
+            assert src.startswith("/static/") or src.startswith("https://telegram.org/"), src
+
+    def test_vendored_tonconnect_matches_its_sri(self):
+        html = INDEX.read_text(encoding="utf-8")
+        match = re.search(
+            r'src="(/static/[^"?]+)"\s+integrity="sha384-([^"]+)"', html
+        )
+        assert match, "el bundle vendorizado debe declarar integrity"
+        path = ROOT / "web" / match.group(1).lstrip("/")
+        digest = base64.b64encode(hashlib.sha384(path.read_bytes()).digest()).decode()
+        assert digest == match.group(2), "la integridad no coincide con el archivo"
+
     def test_the_retry_button_uses_event_delegation(self):
         source = APP_JS.read_text(encoding="utf-8")
         assert 'data-reload="1"' in source
@@ -57,6 +77,8 @@ class TestCspHeader:
             part.strip() for part in csp.split(";") if part.strip().startswith("script-src")
         )
         assert "'unsafe-inline'" not in script_src
+        assert "unpkg.com" not in script_src, "el CDN ya no está autorizado"
+        assert "https://telegram.org" in script_src
         assert "'self'" in script_src
         assert "frame-ancestors" in csp
         assert "default-src 'self'" in csp

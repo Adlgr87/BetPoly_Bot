@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Callable, Dict, List, Set, Tuple
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 
 # (archivo relativo, módulo importado prohibido) -> motivo / fase que lo resuelve
-KNOWN_VIOLATIONS: Dict[Tuple[str, str], str] = {
+KNOWN_VIOLATIONS: dict[tuple[str, str], str] = {
     ("bot/keyboards.py", "config"): (
         "Los teclados leen config.get_settings() (7 usos). Deben recibir los datos "
         "ya resueltos; se refactoriza en la Fase 5 junto con menu_for()."
@@ -25,17 +25,17 @@ KNOWN_VIOLATIONS: Dict[Tuple[str, str], str] = {
 }
 
 
-def _python_files() -> List[Path]:
+def _python_files() -> list[Path]:
     paths = sorted(ROOT.joinpath("bot").rglob("*.py"))
     paths += [ROOT / "main.py", ROOT / "config.py"]
     paths += sorted(ROOT.joinpath("scripts").rglob("*.py"))
     return [p for p in paths if p.is_file() and "__pycache__" not in p.parts]
 
 
-def _imports(path: Path) -> Set[str]:
+def _imports(path: Path) -> set[str]:
     """Full dotted names imported anywhere in the file (functions included)."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names: Set[str] = set()
+    names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
@@ -44,8 +44,8 @@ def _imports(path: Path) -> Set[str]:
     return names
 
 
-def _violations(predicate: Callable[[str], bool], forbidden: str) -> Set[Tuple[str, str]]:
-    found: Set[Tuple[str, str]] = set()
+def _violations(predicate: Callable[[str], bool], forbidden: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
     for path in _python_files():
         rel = path.relative_to(ROOT).as_posix()
         if not predicate(rel):

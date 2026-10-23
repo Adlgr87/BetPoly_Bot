@@ -30,7 +30,7 @@ import hashlib
 import hmac
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable
 
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
@@ -135,11 +135,11 @@ def state_init_data_cell(state_init: Cell) -> Cell:
     return data
 
 
-def _candidate_keys(data_cell: Cell, max_depth: int = 1) -> List[bytes]:
+def _candidate_keys(data_cell: Cell, max_depth: int = 1) -> list[bytes]:
     """Scan 256-bit windows of the data cell (and one level of refs)."""
-    cells: List[Cell] = [data_cell]
+    cells: list[Cell] = [data_cell]
     for _ in range(max_depth):
-        extra: List[Cell] = []
+        extra: list[Cell] = []
         for cell in cells[-1:]:
             try:
                 refs = getattr(cell, "refs", None) or []
@@ -149,7 +149,7 @@ def _candidate_keys(data_cell: Cell, max_depth: int = 1) -> List[bytes]:
                 extra.append(ref)
         cells.extend(extra)
 
-    candidates: List[bytes] = []
+    candidates: list[bytes] = []
     seen = set()
     for cell in cells:
         try:
@@ -193,10 +193,10 @@ def verify_ton_proof(
     expected_domain: str,
     expected_nonce: str,
     max_age_seconds: int = 600,
-    state_init: Optional[str] = None,
-    public_key: Optional[str] = None,
-    onchain_public_key: Optional[str] = None,
-    now: Optional[int] = None,
+    state_init: str | None = None,
+    public_key: str | None = None,
+    onchain_public_key: str | None = None,
+    now: int | None = None,
 ) -> VerifiedWallet:
     """Validate a ``ton_proof`` payload.
 
@@ -261,7 +261,7 @@ def _check_domain(proof: dict, expected_domain: str) -> str:
     return value
 
 
-def _check_timestamp(proof: dict, max_age_seconds: int, now: Optional[int]) -> int:
+def _check_timestamp(proof: dict, max_age_seconds: int, now: int | None) -> int:
     try:
         timestamp = int(proof.get("timestamp"))
     except (TypeError, ValueError) as exc:
@@ -289,7 +289,7 @@ def _decode_signature(proof: dict) -> bytes:
     return signature
 
 
-def _check_address(address: str, network: str) -> Tuple[Any, int, bytes]:
+def _check_address(address: str, network: str) -> tuple[Any, int, bytes]:
     try:
         parsed = parse_address(address)
     except AddressError as exc:
@@ -302,7 +302,7 @@ def _check_address(address: str, network: str) -> Tuple[Any, int, bytes]:
     return parsed, workchain, address_hash
 
 
-def _check_state_init(state_init: Optional[str], address_hash: bytes) -> Optional[Cell]:
+def _check_state_init(state_init: str | None, address_hash: bytes) -> Cell | None:
     """El state init debe definir exactamente la dirección declarada."""
     if not state_init:
         return None
@@ -318,8 +318,8 @@ def _check_state_init(state_init: Optional[str], address_hash: bytes) -> Optiona
 def _resolve_public_key(
     digest: bytes,
     signature: bytes,
-    state_init_cell: Optional[Cell],
-    onchain_public_key: Optional[str],
+    state_init_cell: Cell | None,
+    onchain_public_key: str | None,
 ) -> bytes:
     """Prueba las claves candidatas; solo la firma decide cuál es la buena.
 
@@ -340,7 +340,7 @@ def _resolve_public_key(
     )
 
 
-def _check_declared_key(public_key: Optional[str], resolved_key: bytes) -> None:
+def _check_declared_key(public_key: str | None, resolved_key: bytes) -> None:
     """Si el SDK declaró una clave, tiene que ser la que firmó."""
     if not public_key:
         return
@@ -349,7 +349,7 @@ def _check_declared_key(public_key: Optional[str], resolved_key: bytes) -> None:
         raise ProofError("key_mismatch", "La clave pública no coincide con la firma.")
 
 
-def _hex_key(value: str) -> Optional[bytes]:
+def _hex_key(value: str) -> bytes | None:
     try:
         key = bytes.fromhex(value.strip())
     except (ValueError, AttributeError):

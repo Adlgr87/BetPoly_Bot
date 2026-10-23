@@ -1,49 +1,45 @@
 #!/usr/bin/env python3
-"""Genera ``web/static/icon.png`` dentro del presupuesto de la Mini App (R-06).
+"""Regenera `web/static/icon.png` dentro del presupuesto de la Mini App (R-06).
 
-El icono original era un PNG de 1024×1024 y 921 KB que Telegram sirve tal cual en
-un hueco de ~300 px: el activo más pesado del proyecto con diferencia. Este
-script lo reduce a 512×512 con una paleta de 64 colores (suficiente para un
-degradado como este) y lo deja por debajo de 80 KB.
+El icono original era un PNG de 1024×1024 y 921 KB que Telegram sirve tal cual
+en un hueco de ~300 px: el activo más pesado del proyecto con diferencia. Este
+script lo deja en 512×512 con una paleta de 64 colores (suficiente para un
+degradado como este) y por debajo de 80 KB.
 
-Es idempotente: si el archivo ya está en 512×512 se vuelve a cuantizar sin
-pérdida visible, así que sirve tanto para regenerar desde el original como para
-volver a comprimir uno nuevo.
+Pillow **no** es dependencia del bot: solo se importa aquí, y si falta el script
+sale con código 2 y una instrucción clara. Los tests del presupuesto no
+necesitan Pillow.
 
-Uso::
-
-    python scripts/build_icon.py                     # usa web/static/icon.png
+Uso:
+    python scripts/build_icon.py                    # usa web/static/icon.png
     python scripts/build_icon.py ruta/al/original.png
+    python scripts/build_icon.py --check            # solo verifica el resultado
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "web" / "static" / "icon.png"
 SIZE = 512
 COLORS = 64
-#: Presupuesto del plan: el icono por debajo de 80 KB.
+#: Tope del plan (§9): el icono por debajo de 80 KB.
 BUDGET_BYTES = 80 * 1024
 
 
-def _pillow() -> object:
-    """Pillow no es dependencia del bot: solo se usa para generar el activo."""
+def _pillow() -> Any | None:
+    """Devuelve ``PIL.Image`` o ``None`` si Pillow no está instalado."""
     try:
-        from PIL import Image
+        from PIL import Image  # noqa: PLC0415 - dependencia opcional
     except ImportError:
         return None
     return Image
 
 
-def build(source: Path, target: Path = TARGET, image_module: object = None) -> int:
-    """Cuantiza ``source`` en ``target`` y verifica el presupuesto.
-
-    ``image_module`` permite probar el guardarraíl sin instalar Pillow: el
-    script no puede ser dependencia de test, pero su tope de tamaño sí debe
-    estar bajo test (es lo que impide volver a un PNG de 900 KB).
-    """
+def build(source: Path, target: Any = TARGET, image_module: Any = None) -> int:
+    """Cuantiza `source` en `target`; devuelve el código de salida."""
     module = _pillow() if image_module is None else image_module
     if module is None:
         print(
@@ -60,9 +56,13 @@ def build(source: Path, target: Path = TARGET, image_module: object = None) -> i
     resized = image.resize((SIZE, SIZE), module.LANCZOS)
     optimized = resized.quantize(colors=COLORS, method=module.MEDIANCUT)
     optimized.save(target, optimize=True)
+    return check(target)
 
-    size = target.stat().st_size
-    print(f"✅ {target} — {SIZE}×{SIZE}, {COLORS} colores, {size / 1024:.1f} KB")
+
+def check(target: Any = TARGET, image_module: Any = None) -> int:
+    """Verifica tamaño y dimensiones sin volver a escribir el archivo."""
+    size = Path(target).stat().st_size
+    print(f"{Path(target)}: {size:,} B ({size / 1024:.1f} KB)")
     if size > BUDGET_BYTES:
         print(
             f"❌ Supera el presupuesto de {BUDGET_BYTES / 1024:.0f} KB. "
@@ -70,10 +70,20 @@ def build(source: Path, target: Path = TARGET, image_module: object = None) -> i
             file=sys.stderr,
         )
         return 1
+    module = _pillow() if image_module is None else image_module
+    if module is None:  # sin Pillow no se pueden leer las dimensiones
+        return 0
+    with module.open(target) as image:
+        width, height = image.size
+    if (width, height) != (SIZE, SIZE):
+        print(f"❌ Se esperaba {SIZE}×{SIZE} y hay {width}×{height}", file=sys.stderr)
+        return 1
     return 0
 
 
 def main(argv: list[str]) -> int:
+    if "--check" in argv:
+        return check()
     source = Path(argv[1]) if len(argv) > 1 else TARGET
     return build(source)
 

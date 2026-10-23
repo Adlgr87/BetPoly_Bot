@@ -107,7 +107,10 @@ Cada decisión incluye la alternativa descartada y **por qué es subóptima para
 **Alternativa descartada:** `nonce` por respuesta. Requiere tocar el HTML servido y complica el servido estático, sin beneficio frente a quitar un atributo.
 
 ### ADR-10 · `@tonconnect/ui` se sirve desde el propio dominio
-**Decisión:** vendorizar el bundle (`dist/tonconnect-ui.min.js`) en `web/static/vendor/`, con hash SRI y CSP `script-src 'self'`.
+**Decisión:** vendorizar el bundle (`dist/tonconnect-ui.min.js`) en
+`web/static/tonconnect-ui.min.js`, con hash SRI y CSP
+`script-src 'self' https://telegram.org` (Telegram sigue haciendo falta para el
+SDK de la Mini App; nada más).
 **Por qué:** elimina F-12 (CDN sin integridad en el script que construye las transacciones), quita `unpkg.com` de la CSP y ahorra una conexión TLS en el arranque de la Mini App (importante en móvil).
 **Alternativa descartada:** SRI apuntando a unpkg. Protege la integridad, pero mantiene la dependencia externa y el coste de red.
 
@@ -128,7 +131,7 @@ Cada decisión incluye la alternativa descartada y **por qué es subóptima para
 | ✅ | **4** | Economía única y coherencia mostrada | F-03, H-*, U-05 | 2-3 | 1 |
 | ✅ | **5** | Capa Telegram: navegación, entrada, notificaciones | F-01, F-14, F-02, F-04, **S-06**, U-01…U-04, U-06 | 4 | 1, 4 |
 | ✅ | **6** | Rendimiento y activos | R-01…R-09 | 2-3 | 1, 5 |
-| ⬜ | **7** | Mantenibilidad, dependencias, contrato-tooling | 5.1, D-04, D-05, D-06, F-07, F-08, F-09, F-12, F-13, T-02 | 3 | 3, 4 |
+| ✅ | **7** | Mantenibilidad, dependencias, contrato-tooling | 5.1, D-01, D-04, D-05, D-06, F-07, F-08, F-09, F-12, F-13, T-02, R-10 | 3 | 3, 4 |
 
 \* Días de trabajo efectivo de una persona, indicativos. Las fases 3 y 6 pueden ejecutarse en paralelo si hay más de un desarrollador; 1 → 2 → 5 es una cadena estricta.
 
@@ -440,7 +443,7 @@ cliente HTTP real. Todo queda fijado en `tests/test_performance.py` y
 | R-06 | `icon.png` a 512×512 WebP/PNG optimizado (<80 KB) | test que falla si un asset estático supera el presupuesto | ✅ 921 682 B → **79 408 B** (−91 %), `scripts/build_icon.py` reproducible |
 | R-09 | `Cache-Control: public, max-age=31536000, immutable` para assets versionados; gzip en memoria para `/static/*.js|css` | test de cabeceras | ✅ `?v=<huella>` → inmutable; gzip memoizado; `ETag` + `304` en el resto |
 | R-08 | Polling adaptativo: `setInterval` 25 s → backoff 15/30/60 s; `ETag` en `/api/markets` con `304` | test de que un segundo GET devuelve 304 | ✅ sin `setInterval`; escalones 15/30/60 s con reinicio por actividad; `/api/markets` responde `304` |
-| R-07 | Dividir `verify_ton_proof` (E36) y `settle_prediction` (C18) en pasos con nombre | test de complejidad sobre el AST con trinquete | ✅ 36 → **2** y 20 → **1**; queda una lista base de 16 funciones que solo puede encogerse |
+| R-07 | Dividir `verify_ton_proof` (E36) y `settle_prediction` (C18) en pasos con nombre | test de complejidad sobre el AST con trinquete | ✅ 36 → **2** y 20 → **1**; la lista base empezó con 16 funciones y hoy tiene 14 (Fase 7) |
 
 **Presupuesto de arranque de la Mini App:** HTML+CSS+JS+icono < 350 KB comprimidos.
 Medido: **93.3 KB** (index.html 2.4 + styles.css 3.0 + app.js 10.5 + icono 77.5),
@@ -457,27 +460,44 @@ frente a los 921 KB del icono anterior.
 - El presupuesto de activos es un test (`STARTUP_BUDGET_BYTES`, `ICON_BUDGET_BYTES`),
   no una convención: un PNG de 900 KB falla el CI.
 - La complejidad también es un test (`tests/test_complexity.py`, McCabe sobre el
-  AST, sin dependencias nuevas): ninguna función nueva pasa de 12, las 16 que ya
-  estaban por encima tienen un techo congelado y las dos del núcleo de dinero
-  tienen tope duro de 8. Una función puede salir del baseline; nunca entrar.
+  AST, sin dependencias nuevas): ninguna función nueva pasa de 12, las que ya
+  estaban por encima tienen un techo congelado (hoy 14, tras la Fase 7) y las dos
+  del núcleo de dinero tienen tope duro de 8. Una función puede salir del
+  baseline; nunca entrar.
 
 ---
 
 ## 10. Fase 7 — Mantenibilidad, dependencias y tooling del contrato
 
-| Bloque | Acción |
-| :--- | :--- |
-| Código muerto (5.1) | Eliminar los 19 símbolos listados. `vulture --min-confidence 80` en CI con lista blanca vacía. |
-| Fachada `bot/chain/__init__.py` | **Eliminar** re-exports y dejar el paquete vacío; los tests importan submódulos (ya lo hacen). |
-| D-04 | Sustituir el `UPDATE ... points = 1000` por migraciones versionadas con `PRAGMA user_version` (1..N), cada una idempotente y con test de ida y vuelta. |
-| D-05 | `upsert_user`: `username = COALESCE(excluded.username, users.username)`. |
-| D-06 | Tests de teclados (cubierto parcialmente en Fase 5). |
-| F-07 | `parse_message_body`: capturar `(BodyError, Exception)` → `except Exception` con re-lanzado de `BodyError` ya presente; eliminar la tupla. |
-| F-08/F-09 | Panel admin paginado; `dev_server.py` con `--help`, `--port`, y manifest configurable (o `PUBLIC_BASE_URL` en https cuando exista túnel). |
-| F-12 | Vendorizar `@tonconnect/ui` (ADR-10) con SRI; CSP `script-src 'self'`. |
-| F-13 | `deploy.js`: si no alcanza `active` en el plazo → `process.exit(1)` y **no** escribir `deploy.json`; comparar el hash compilado con `CODE_HASH` antes de desplegar. |
-| T-02 | PTB 21.6 → 22.8. Impacto verificado sobre este código: no usa `filters.CHAT`, ni `Defaults.quote`, ni `proxy_url`, ni `*_timeout` en `run_polling`. Revisar `disable_web_page_preview` (sustituido por `link_preview_options` en la API 7.0) y `BaseRequest` en los dobles de test. Actualizar en un PR aislado con la suite completa. |
-| R-10 | Normalizar ruff (`UP006/UP045`, `PLR2004`, `ARG001`, `PLC0415`), activar reglas nuevas por bloques. |
+**Estado: ✅ completada.** Todo lo que sigue se comprobó ejecutándolo, no
+leyéndolo. `pytest`: **668 tests**, cobertura **85,8 %**; `ruff check .` y
+`vulture --min-confidence 80` limpios; contrato sin cambios de hash
+(`a29c5c51…92db9b`, 25/25 en sandbox).
+
+| Bloque | Acción | Verificación | Resultado |
+| :--- | :--- | :--- | :--- |
+| Código muerto (5.1) | Eliminar los 19 símbolos listados | `vulture --min-confidence 80` en CI con lista blanca vacía | ✅ 19 símbolos fuera; 4 `build_*` que eran mitad de función se conectaron al panel del contrato en vez de borrarse |
+| Fachada `bot/chain/__init__.py` | Eliminar re-exports; los tests importan submódulos | test de arquitectura + imports | ✅ el paquete queda vacío |
+| D-04 | Migraciones versionadas con `PRAGMA user_version` (1..N), idempotentes | test de ida y vuelta, y de rechazo de una base futura | ✅ `_MIGRATIONS` + `_apply_migrations`; `tests/test_migrations.py` |
+| D-05 | `upsert_user`: `COALESCE(excluded.username, users.username)` | test de usuario que borra su @usuario | ✅ el username conocido nunca se anula |
+| D-06 | Tests de teclados | cobertura del módulo | ✅ 15 tests, `bot/keyboards.py` al **100 %** |
+| F-07 | `parse_message_body`: no enmascarar bugs con `except Exception` | test que inyecta un evento desconocido | ✅ solo `BodyError`/`ValueError` se degradan; un `AttributeError` ya no se silencia |
+| F-08 | Panel admin paginado | test: entre todas las páginas está cada predicción pendiente | ✅ `ADMIN_PREDICTIONS_PAGE = 6`, texto y botones de la misma página, navegación `admin_preds:<p>` |
+| F-09 | `dev_server.py` con flags y manifest configurable | `--help` + `tests/test_dev_server.py` | ✅ `--host/--port/--db/--public-base-url/--no-seed`; avisa si el manifest sigue en `http://` |
+| F-12 | Vendorizar `@tonconnect/ui` (ADR-10) con SRI | test que recalcula el `sha384` y comprueba que solo se cargan scripts de primer dominio | ✅ 528 KB vendorizados (159 KB gzip), `unpkg.com` fuera de la CSP |
+| F-13 | `deploy.js`: sin `active` → exit 1 y sin `deploy.json`; comparar hash antes | `contracts/tests/deploy.test.js` (5 checks) | ✅ |
+| T-02 | PTB 21.6 → 22.8 | suite completa con la versión nueva | ✅ sin cambios de código; `job-queue` sigue en el pin |
+| D-01 | Duplicación textual y conceptual | revisión + test de cada extracción | ✅ `_user_payload`, `_require_admin`, `_market_id`, un formateador de línea de mercado y `create_nonce` delegando en `purge_nonces` |
+| R-10 | Ruff normalizado (`UP006/UP045`, `PLR2004`, `ARG`, `PLC0415`) | `ruff check .` en CI | ✅ 465 anotaciones reescritas; números mágicos con nombre (`MIN_OPTIONS`, `MAX_FEE_BPS`, `MAX_CLOCK_SKEW`, `SECONDS_PER_*`) |
+
+**Presupuesto de complejidad:** el baseline baja de 15 a 14 entradas
+(`market_view` 15 → 4 tras extraer `_option_views`/`_open_now`; `_show_admin_panel`
+14 → 13 con la paginación como función aparte).
+
+**Decisión de proceso:** las excepciones del linter viven en
+`pyproject.toml` por fichero y con motivo escrito (tests, `bot/chain/*`,
+firmas de Telegram/aiohttp), no en `# noqa` dispersos; así una excepción nueva
+obliga a tocar un solo sitio revisable.
 
 ---
 
@@ -492,7 +512,7 @@ frente a los 921 KB del icono anterior.
 | 4 | F-03, H-*, U-05 |
 | 5 | F-01, F-14, F-02, F-04, **S-06**, U-01…U-04, U-06, T-01 (objetivo) |
 | 6 | R-01…R-09 |
-| 7 | 5.1, D-04, D-05, D-06, F-07, F-08, F-09, F-12, F-13, T-02, R-10 |
+| 7 | 5.1, D-01, D-04, D-05, D-06, F-07, F-08, F-09, F-12, F-13, T-02, R-10 |
 
 Sin asignar: **ninguno**. Los 6 bloques del encargo quedan cubiertos: funcionalidad (1, 2, 5), hardcodeo (4), duplicación (3, 4, 7), scripts no funcionales (0, 7), partes desconectadas (1, 2, 3, 7), optimalidad (6) y seguridad (1, 2, 3, 4).
 

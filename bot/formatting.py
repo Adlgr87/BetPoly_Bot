@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import html
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import config
 
 NANO = 1_000_000_000  # nanoTON per TON
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86_400
 
 
 def esc(value: object) -> str:
@@ -34,10 +36,6 @@ def code(value: object) -> str:
     return f"<code>{esc(value)}</code>"
 
 
-def link(text: object, url: str) -> str:
-    return f'<a href="{html.escape(url, quote=True)}">{esc(text)}</a>'
-
-
 def points(value: int) -> str:
     """Format an integer amount of points with thousands separators."""
     return f"{int(value):,}".replace(",", ".")
@@ -52,19 +50,9 @@ def ton(nano: int) -> str:
     return str(whole)
 
 
-def ton_with_unit(nano: int) -> str:
-    return f"{ton(nano)} TON"
-
-
-def tx_short(tx_hash: Optional[str], size: int = 8) -> str:
-    if not tx_hash:
-        return "—"
-    return tx_hash[:size] + "…"
-
-
 def tz() -> timezone:
     try:
-        from zoneinfo import ZoneInfo
+        from zoneinfo import ZoneInfo  # noqa: PLC0415 - tzdata opcional
 
         return ZoneInfo(config.get_settings().timezone)
     except Exception:  # pragma: no cover - validated by config
@@ -107,24 +95,17 @@ def iso_now(offset_seconds: int = 0) -> str:
     return iso_utc(now_utc() + timedelta(seconds=int(offset_seconds)))
 
 
-def parse_iso(value: str) -> datetime:
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def relative(epoch_seconds: int, now: Optional[datetime] = None) -> str:
+def relative(epoch_seconds: int, now: datetime | None = None) -> str:
     """Human friendly 'en 3 h' / 'hace 12 min' label."""
     now = now or now_utc()
     delta = int(epoch_seconds - now.timestamp())
     future = delta >= 0
     delta = abs(delta)
-    if delta < 60:
+    if delta < SECONDS_PER_MINUTE:
         amount, unit = delta, "s"
-    elif delta < 3600:
+    elif delta < SECONDS_PER_HOUR:
         amount, unit = delta // 60, "min"
-    elif delta < 86400:
+    elif delta < SECONDS_PER_DAY:
         amount, unit = delta // 3600, "h"
     else:
         amount, unit = delta // 86400, "d"

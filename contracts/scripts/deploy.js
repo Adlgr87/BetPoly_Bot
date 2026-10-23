@@ -27,6 +27,8 @@ const { TonClient, WalletContractV4 } = require('@ton/ton');
 const { compile } = require('./build');
 
 const ROOT = path.resolve(__dirname, '..');
+//: Pin de paridad con el bot; el despliegue no escribe nada si no coincide.
+const CONTRACT_SYNC = path.resolve(ROOT, '..', 'tests', 'test_contract_sync.py');
 
 function required(name) {
   const value = (process.env[name] || '').trim();
@@ -35,6 +37,46 @@ function required(name) {
     process.exit(1);
   }
   return value;
+}
+
+/**
+ * Hash del bytecode pineado en `tests/test_contract_sync.py`.
+ *
+ * Desplegar un bytecode distinto al que verifican los tests dejaría al bot
+ * hablando otro protocolo: se comprueba antes de enviar nada.
+ */
+function pinnedCodeHash(file = CONTRACT_SYNC) {
+  const source = fs.readFileSync(file, 'utf8');
+  const match = source.match(/CODE_HASH\s*=\s*"([0-9a-f]+)"/);
+  if (!match) {
+    throw new Error(`no se encontró CODE_HASH en ${file}`);
+  }
+  return match[1];
+}
+
+function verifyCodeHash(actual, pinned) {
+  if (actual !== pinned) {
+    throw new Error(
+      `el bytecode compilado (${actual}) no coincide con CODE_HASH (${pinned}); ` +
+        'actualiza el pin, el README y el despliegue en el mismo commit',
+    );
+  }
+  return true;
+}
+
+/**
+ * Espera a que la cuenta esté `active`. Devuelve `false` si no lo consigue:
+ * el llamador **no** debe escribir `deploy.json` en ese caso (F-13).
+ */
+async function waitForActive(client, address, { attempts = 30, delayMs = 4000 } = {}) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const current = await client.getContractState(address);
+    if (current.state === 'active') {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function main() {
@@ -66,6 +108,8 @@ async function main() {
   const indexer = Address.parse(indexerAddress);
 
   const code = await compile();
+  const codeHash = code.hash().toString('hex');
+  verifyCodeHash(codeHash, pinnedCodeHash());
 
   const data = beginCell()
     .storeAddress(admin)
@@ -85,8 +129,8 @@ async function main() {
   if (dryRun) {
     console.log('🧪 DRY RUN — no se envía ninguna transacción');
     console.log(`   address   : ${address.toString()}`);
-    console.log(`   code hash : ${code.hash().toString('hex')}`);
-    return;
+    console.log(`   code hash : ${codeHash} (coincide con CODE_HASH)`);
+    return 0;
   }
 
   const endpoint =
@@ -119,22 +163,20 @@ async function main() {
         }),
       ],
     });
-    // Give the network a moment, then confirm.
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 4000));
-      const current = await client.getContractState(contract.address);
-      if (current.state === 'active') {
-        console.log('✅ Contrato activo');
-        break;
-      }
-    }
   }
+
+  // Confirmación explícita: sin `active` no hay despliegue que reportar.
+  if (!(await waitForActive(client, contract.address))) {
+    console.error('❌ El contrato no alcanzó el estado "active"; no se escribe deploy.json');
+    return 1;
+  }
+  console.log('✅ Contrato activo');
 
   const output = {
     network,
     address: contract.address.toString(),
     addressRaw: `0:${contract.address.hash.toString('hex')}`,
-    codeHash: code.hash().toString('hex'),
+    codeHash,
     admin: admin.toString(),
     indexer: indexer.toString(),
     feeBps,
@@ -151,13 +193,18 @@ async function main() {
   console.log(`  ESCROW_ADMIN_ADDRESS=${output.admin}`);
   console.log(`  MIN_STAKE_NANO=${output.minStakeNano}`);
   console.log(`\nArtefacto: ${path.relative(process.cwd(), outFile)}`);
+  return 0;
 }
 
 if (require.main === module) {
-  main().catch((error) => {
-    console.error('❌ ' + (error && error.message ? error.message : error));
-    process.exit(1);
-  });
+  main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error) => {
+      console.error('❌ ' + (error && error.message ? error.message : error));
+      process.exitCode = 1;
+    });
 }
 
-module.exports = { main };
+module.exports = { main, pinnedCodeHash, verifyCodeHash, waitForActive };

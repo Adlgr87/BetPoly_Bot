@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 from bot.chain.toncenter import TonCenterClient
 
@@ -51,11 +51,11 @@ class EscrowState:
     total_locked_nano: int = 0
     fees_nano: int = 0
     market_count: int = 0
-    balance_nano: Optional[int] = None
-    admin: Optional[str] = None
+    balance_nano: int | None = None
+    admin: str | None = None
     read_at: int = 0
     stale: bool = False
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
     def is_paused(self) -> bool:
@@ -66,7 +66,7 @@ class EscrowState:
         """Fees are the only funds the admin may ever take out."""
         return max(0, int(self.fees_nano))
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["is_paused"] = self.is_paused
         data["max_withdrawable_nano"] = str(self.max_withdrawable_nano)
@@ -91,8 +91,8 @@ async def read_escrow_state(
     client: TonCenterClient,
     address: str,
     *,
-    admin: Optional[str] = None,
-    now: Optional[int] = None,
+    admin: str | None = None,
+    now: int | None = None,
 ) -> EscrowState:
     """Read every getter. Raises :class:`TonApiError` if the contract fails."""
     state = EscrowState(
@@ -121,7 +121,7 @@ async def read_escrow_state(
 
 @dataclass
 class _Entry:
-    state: Optional[EscrowState] = None
+    state: EscrowState | None = None
     fetched_at: float = 0.0
 
 
@@ -130,7 +130,7 @@ class EscrowStateCache:
 
     def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> None:
         self.ttl = max(1, int(ttl_seconds))
-        self._entries: Dict[str, _Entry] = {}
+        self._entries: dict[str, _Entry] = {}
 
     def reset(self) -> None:
         self._entries.clear()
@@ -140,9 +140,9 @@ class EscrowStateCache:
         client: TonCenterClient,
         address: str,
         *,
-        admin: Optional[str] = None,
+        admin: str | None = None,
         force: bool = False,
-        now: Optional[float] = None,
+        now: float | None = None,
     ) -> EscrowState:
         moment = float(now if now is not None else time.time())
         entry = self._entries.get(address)

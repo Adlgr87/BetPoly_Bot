@@ -21,11 +21,11 @@ from __future__ import annotations
 import base64
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from pytoniq_core import Cell, begin_cell
 
-from bot.chain.addresses import AddressError, normalize_address, parse_address
+from bot.chain.addresses import normalize_address, parse_address
 
 OP_CREATE_MARKET = 0x1A0A0001
 OP_PLACE_BET = 0x1A0A0002
@@ -79,29 +79,29 @@ class BodyError(ValueError):
 @dataclass
 class MessageBody:
     op: int
-    market_id: Optional[int] = None
-    option: Optional[int] = None
-    stake: Optional[int] = None
-    winning_option: Optional[int] = None
-    title_hash: Optional[str] = None
-    closes_at: Optional[int] = None
-    option_count: Optional[int] = None
-    address: Optional[str] = None
-    amount: Optional[int] = None
-    flag: Optional[int] = None
-    raw_op: Optional[int] = None
+    market_id: int | None = None
+    option: int | None = None
+    stake: int | None = None
+    winning_option: int | None = None
+    title_hash: str | None = None
+    closes_at: int | None = None
+    option_count: int | None = None
+    address: str | None = None
+    amount: int | None = None
+    flag: int | None = None
+    raw_op: int | None = None
 
     @property
     def name(self) -> str:
         return OP_NAMES.get(self.op, f"0x{self.op:08x}")
 
     @property
-    def admin_fee_bps(self) -> Optional[int]:
+    def admin_fee_bps(self) -> int | None:
         """``set_fee`` payload: the contract stores the fee as ``uint16`` bps."""
         return self.amount if self.op == OP_SET_FEE else None
 
     @property
-    def paused_flag(self) -> Optional[bool]:
+    def paused_flag(self) -> bool | None:
         """``set_paused`` payload: ``uint8`` 1/0."""
         return None if self.flag is None else bool(self.flag)
 
@@ -276,41 +276,11 @@ def parse_message_body(body: Any) -> MessageBody:
             parsed.address = normalize_address(slice_.load_address().to_str())
         elif op == OP_WITHDRAW_FEES:
             parsed.amount = slice_.load_coins()
-    except (AddressError, Exception) as exc:  # noqa: BLE001 - truncated body
-        if isinstance(exc, BodyError):
-            raise
+    except BodyError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - cuerpo truncado o de otra cuenta
         raise BodyError(f"malformed body for {parsed.name}: {exc}") from exc
     return parsed
-
-
-def prepare_transaction_payload(
-    *, kind: str, market_id: Optional[int] = None, option: Optional[int] = None,
-    stake: Optional[int] = None, winning_option: Optional[int] = None,
-    title_hash: Optional[str] = None, closes_at: Optional[int] = None,
-    option_count: Optional[int] = None,
-) -> str:
-    """Build the base64 payload for a Mini App ``sendTransaction`` call."""
-    if kind == "create_market":
-        if title_hash is None or closes_at is None or option_count is None:
-            raise BodyError("create_market requires title_hash, closes_at and option_count")
-        return payload_b64(build_create_market(title_hash, closes_at, option_count))
-    if kind == "place_bet":
-        if market_id is None or option is None or stake is None:
-            raise BodyError("place_bet requires market_id, option and stake")
-        return payload_b64(build_place_bet(market_id, option, stake))
-    if kind == "resolve_market":
-        if market_id is None or winning_option is None:
-            raise BodyError("resolve_market requires market_id and winning_option")
-        return payload_b64(build_resolve_market(market_id, winning_option))
-    if kind == "cancel_market":
-        if market_id is None:
-            raise BodyError("cancel_market requires market_id")
-        return payload_b64(build_cancel_market(market_id))
-    if kind == "claim_payout":
-        if market_id is None:
-            raise BodyError("claim_payout requires market_id")
-        return payload_b64(build_claim_payout(market_id))
-    raise BodyError(f"unknown payload kind {kind!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -320,21 +290,21 @@ def prepare_transaction_payload(
 class EscrowEvent:
     op: int
     market_id: int
-    creator: Optional[str] = None
-    title_hash: Optional[str] = None
-    closes_at: Optional[int] = None
-    option_count: Optional[int] = None
-    fee_bps: Optional[int] = None
-    winning_option: Optional[int] = None
-    total_pool: Optional[int] = None
-    winning_pool: Optional[int] = None
+    creator: str | None = None
+    title_hash: str | None = None
+    closes_at: int | None = None
+    option_count: int | None = None
+    fee_bps: int | None = None
+    winning_option: int | None = None
+    total_pool: int | None = None
+    winning_pool: int | None = None
 
     @property
     def name(self) -> str:
         return OP_NAMES.get(self.op, f"0x{self.op:08x}")
 
 
-def parse_event(body: Any) -> Optional[EscrowEvent]:
+def parse_event(body: Any) -> EscrowEvent | None:
     """Parse a contract event. Returns ``None`` for non-event bodies."""
     try:
         cell = _to_cell(body)

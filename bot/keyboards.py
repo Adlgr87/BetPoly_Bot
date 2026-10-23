@@ -5,7 +5,7 @@ and always carry the numeric ids only.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
@@ -27,12 +27,12 @@ def _esc_label(text: str, size: int = 34) -> str:
 
 def main_menu_keyboard(*, is_admin: bool = False, wallet=None) -> InlineKeyboardMarkup:
     settings = config.get_settings()
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
 
     if settings.escrow_enabled:
         rows.append([_webapp(settings.webapp_url, "⚡ Apostar TON (Mini App)")])
 
-    points_row: List[InlineKeyboardButton] = []
+    points_row: list[InlineKeyboardButton] = []
     if settings.points_enabled:
         points_row.append(
             InlineKeyboardButton("📋 Predicciones", callback_data="list_predictions:0")
@@ -71,9 +71,9 @@ def main_menu_keyboard(*, is_admin: bool = False, wallet=None) -> InlineKeyboard
 # ---------------------------------------------------------------------------
 
 def predictions_list_keyboard(
-    page: int, total_pages: int, predictions: List[Dict[str, Any]]
+    page: int, total_pages: int, predictions: list[dict[str, Any]]
 ) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
     for pred in predictions:
         rows.append(
             [
@@ -82,7 +82,7 @@ def predictions_list_keyboard(
                 )
             ]
         )
-    nav: List[InlineKeyboardButton] = []
+    nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(
             InlineKeyboardButton("⬅️", callback_data=f"list_predictions:{page - 1}")
@@ -99,7 +99,7 @@ def predictions_list_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def options_keyboard(prediction_id: int, options: List[dict]) -> InlineKeyboardMarkup:
+def options_keyboard(prediction_id: int, options: list[dict]) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -156,9 +156,9 @@ def confirm_create_keyboard() -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 def markets_list_keyboard(
-    page: int, total_pages: int, markets_list: List[Dict[str, Any]]
+    page: int, total_pages: int, markets_list: list[dict[str, Any]]
 ) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
     for market in markets_list:
         rows.append(
             [
@@ -168,7 +168,7 @@ def markets_list_keyboard(
                 )
             ]
         )
-    nav: List[InlineKeyboardButton] = []
+    nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"list_markets:{page - 1}"))
     if total_pages > 1:
@@ -184,9 +184,9 @@ def markets_list_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def market_detail_keyboard(market: Dict[str, Any]) -> InlineKeyboardMarkup:
+def market_detail_keyboard(market: dict[str, Any]) -> InlineKeyboardMarkup:
     settings = config.get_settings()
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
     if settings.escrow_enabled:
         rows.append([_webapp(settings.webapp_url, "🎲 Apostar en la Mini App")])
     if market.get("status") == "open":
@@ -201,8 +201,15 @@ def market_detail_keyboard(market: Dict[str, Any]) -> InlineKeyboardMarkup:
 # Admin panel
 # ---------------------------------------------------------------------------
 
-def admin_predictions_keyboard(predictions: List[dict]) -> InlineKeyboardMarkup:
-    rows = [
+def admin_predictions_keyboard(
+    page: int, total_pages: int, predictions: list[dict], *, onchain: bool = True
+) -> InlineKeyboardMarkup:
+    """Predicciones pendientes de una página (F-08).
+
+    ``predictions`` es ya el trozo de la página: el llamador pagina y este
+    teclado solo añade la navegación, igual que ``predictions_list_keyboard``.
+    """
+    rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
                 f"📌 {_esc_label(p['title'], 36)}", callback_data=f"admin_resolve:{p['id']}"
@@ -210,12 +217,22 @@ def admin_predictions_keyboard(predictions: List[dict]) -> InlineKeyboardMarkup:
         ]
         for p in predictions
     ]
-    rows.append([InlineKeyboardButton("🔒 Mercados on-chain", callback_data="admin_chain:0")])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_preds:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_preds:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if onchain:
+        rows.append([InlineKeyboardButton("🔒 Mercados on-chain", callback_data="admin_chain:0")])
     rows.append([InlineKeyboardButton("🔙 Salir", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
 
 
-def admin_options_keyboard(pred_id: int, options: List[dict]) -> InlineKeyboardMarkup:
+def admin_options_keyboard(pred_id: int, options: list[dict]) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -244,7 +261,7 @@ def confirm_resolve_keyboard(pred_id: int, option_id: int) -> InlineKeyboardMark
 
 
 def admin_chain_markets_keyboard(
-    page: int, total_pages: int, markets_list: List[Dict[str, Any]]
+    page: int, total_pages: int, markets_list: list[dict[str, Any]]
 ) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -255,7 +272,7 @@ def admin_chain_markets_keyboard(
         ]
         for m in markets_list
     ]
-    nav: List[InlineKeyboardButton] = []
+    nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_chain:{page - 1}"))
     if total_pages > 1:
@@ -268,7 +285,7 @@ def admin_chain_markets_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def admin_chain_options_keyboard(market_id: int, options: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+def admin_chain_options_keyboard(market_id: int, options: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -285,7 +302,7 @@ def admin_chain_options_keyboard(market_id: int, options: List[Dict[str, Any]]) 
 
 
 def admin_chain_market_keyboard(market_id: int, status: str) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
     if status == "open":
         rows.append(
             [InlineKeyboardButton("🏁 Resolver", callback_data=f"admin_chain_options:{market_id}")]
@@ -300,7 +317,7 @@ def admin_chain_market_keyboard(market_id: int, status: str) -> InlineKeyboardMa
 
 def admin_contract_keyboard(state: Any) -> InlineKeyboardMarkup:
     """Actions for the escrow contract itself (fees, pause, admin)."""
-    rows: List[List[InlineKeyboardButton]] = [
+    rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
                 "💸 Retirar comisiones", callback_data="admin_contract_withdraw"
@@ -350,7 +367,7 @@ def back_to_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     Antes el parámetro ``is_admin`` se aceptaba y se ignoraba, así que el botón
     «🔧 Admin» desaparecía en cuanto el admin navegaba una pantalla (F-01).
     """
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
     settings = config.get_settings()
     if settings.escrow_enabled:
         rows.append([_webapp(settings.webapp_url, "🚀 Mini App")])
@@ -381,9 +398,9 @@ def help_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def wallet_keyboard(wallet: Optional[Dict[str, Any]]) -> InlineKeyboardMarkup:
+def wallet_keyboard(wallet: dict[str, Any] | None) -> InlineKeyboardMarkup:
     settings = config.get_settings()
-    rows: List[List[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = []
     if settings.escrow_enabled:
         rows.append([_webapp(settings.webapp_url, "👛 Vincular wallet en la Mini App")])
     if wallet:

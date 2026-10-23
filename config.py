@@ -20,7 +20,6 @@ import os
 import secrets as _secrets
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -42,13 +41,13 @@ def _str(key: str, default: str = "") -> str:
     return (os.getenv(key) or default).strip()
 
 
-def _opt_str(key: str) -> Optional[str]:
+def _opt_str(key: str) -> str | None:
     value = (os.getenv(key) or "").strip()
     return value or None
 
 
-def _int(key: str, default: int, *, minimum: Optional[int] = None,
-         maximum: Optional[int] = None) -> int:
+def _int(key: str, default: int, *, minimum: int | None = None,
+         maximum: int | None = None) -> int:
     raw = (os.getenv(key) or "").strip()
     if not raw:
         return default
@@ -70,7 +69,7 @@ def _bool(key: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "y", "on", "si", "sí")
 
 
-def _cidrs(key: str) -> Tuple[str, ...]:
+def _cidrs(key: str) -> tuple[str, ...]:
     """Parse a comma separated list of CIDRs, rejecting anything malformed."""
     raw = (os.getenv(key) or "").strip()
     if not raw:
@@ -87,7 +86,7 @@ def _cidrs(key: str) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _ids(key: str) -> Tuple[int, ...]:
+def _ids(key: str) -> tuple[int, ...]:
     raw = (os.getenv(key) or "").strip()
     if not raw:
         return ()
@@ -111,7 +110,7 @@ def _ids(key: str) -> Tuple[int, ...]:
 class Settings:
     # --- Telegram ---------------------------------------------------------
     bot_token: str
-    admin_ids: Tuple[int, ...]
+    admin_ids: tuple[int, ...]
     log_level: str
 
     # --- storage ----------------------------------------------------------
@@ -131,11 +130,11 @@ class Settings:
     # --- TON chain (read only for the bot) --------------------------------
     ton_network: str
     ton_api_url: str
-    ton_api_key: Optional[str]
-    ton_public_key_api: Optional[str]
-    escrow_address: Optional[str]
-    escrow_admin_address: Optional[str]
-    ton_proof_domain: Optional[str]
+    ton_api_key: str | None
+    ton_public_key_api: str | None
+    escrow_address: str | None
+    escrow_admin_address: str | None
+    ton_proof_domain: str | None
     ton_proof_max_age: int
     min_stake_nano: int
     max_stake_nano: int
@@ -164,11 +163,11 @@ class Settings:
     allow_dev_session: bool
     environment: str
     app_title: str
-    support_url: Optional[str] = field(default=None)
+    support_url: str | None = field(default=None)
     frame_ancestors: str = "'self'"
     #: Only honour ``X-Forwarded-For`` when the peer is one of these proxies.
     trust_proxy: bool = False
-    trusted_proxies: Tuple[str, ...] = ()
+    trusted_proxies: tuple[str, ...] = ()
 
     # -- derived helpers ---------------------------------------------------
     @property
@@ -327,29 +326,6 @@ def get_settings() -> Settings:
 def reset_settings() -> None:
     """Clear the settings cache (used by tests and after env changes)."""
     get_settings.cache_clear()
-
-
-# ---------------------------------------------------------------------------
-# Backwards compatible module level constants
-# ---------------------------------------------------------------------------
-
-def __getattr__(name: str):  # PEP 562
-    """Lazy aliases so ``from config import ADMIN_IDS`` keeps working."""
-    mapping = {
-        "BOT_TOKEN": "bot_token",
-        "ADMIN_IDS": "admin_ids",
-        "DATABASE_PATH": "database_path",
-        "REMINDER_HOURS_BEFORE": "reminder_hours_before",
-        "STARTING_POINTS": "starting_points",
-        "MIN_BET_POINTS": "min_bet_points",
-        "HOUSE_RAKE_BPS": "house_rake_bps",
-        "ESCROW_ADDRESS": "escrow_address",
-        "PUBLIC_BASE_URL": "public_base_url",
-    }
-    field_name = mapping.get(name)
-    if field_name:
-        return getattr(get_settings(), field_name)
-    raise AttributeError(name)
 
 
 def require_bot_token() -> str:
