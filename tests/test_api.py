@@ -4,10 +4,12 @@ from __future__ import annotations
 import time
 
 import pytest_asyncio
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from test_security import signed_init_data
 from test_ton_proof import make_proof, make_wallet
 
+import config
 from bot import api
 from bot.chain import bodies
 
@@ -102,7 +104,6 @@ class TestPublic:
             assert content_type in response.headers["Content-Type"], path
 
     async def test_manifest_icon_exists(self, client):
-        import config
 
         icon = api.WEB_DIR / "static" / "icon.png"
         assert icon.is_file(), "el manifiesto apunta a /static/icon.png"
@@ -137,7 +138,6 @@ class TestAuth:
         self, client, monkeypatch
     ):
         monkeypatch.setenv("ALLOW_DEV_SESSION", "0")
-        import config
 
         config.reset_settings()
         response = await client.post("/api/session", json={})
@@ -230,11 +230,18 @@ class TestWalletVerification:
         assert data["wallet"] is None
 
 
+async def ready_market(db, market_id=1, closes_in=3600):
+    """Market mirrored from the chain, ready to be listed (or resolved)."""
+    await db.enrich_market_from_event(
+        market_id, "0:" + "11" * 32, "¿Gana México?", 2,
+        int(time.time()) + closes_in, fee_bps=200,
+    )
+    await db.set_market_options(market_id, ["Sí", "No"])
+
+
 class TestMarketsApi:
     async def _ready_market(self, db, market_id=1, closes_in=3600):
-        await db.enrich_market_from_event(market_id, "0:" + "11" * 32, "¿Gana México?", 2,
-                               int(time.time()) + closes_in, fee_bps=200)
-        await db.set_market_options(market_id, ["Sí", "No"])
+        await ready_market(db, market_id, closes_in)
 
     async def test_list_and_detail(self, client, db):
         await self._ready_market(db)
@@ -561,12 +568,161 @@ async def _async(value):
     return value
 
 
+class TestClientIpAndBackstop:
+    """Fase 3.1 — S-04: la cabecera X-Forwarded-For no puede eludir los límites."""
+
+    @staticmethod
+    def _ip_app():
+        app = api.create_app()
+
+        async def current_ip(request):
+            return web.json_response({"ip": api._client_ip(request)})
+
+        app.router.add_get("/api/_ip", current_ip)
+        return app
+
+    async def test_rotating_xff_does_not_bypass_the_session_limiter(self, client):
+        """40 intentos con IP falsa rotada: la cubeta real es la del peer."""
+        assert config.get_settings().trust_proxy is False
+        api._session_limiter.reset()
+        statuses = []
+        for n in range(40):
+            response = await client.post(
+                "/api/session", json={}, headers={"X-Forwarded-For": f"10.0.0.{n}"}
+            )
+            statuses.append(response.status)
+        assert 429 in statuses, "rotar X-Forwarded-For no debe abrir sesiones infinitas"
+        assert statuses[0] != 429
+
+    async def test_429_carries_retry_after(self, client):
+        api._verify_limiter.reset()
+        payload, headers = await session_for(client, USER)
+        statuses = []
+        for _ in range(12):
+            response = await client.post("/api/wallet/verify", headers=headers, json={})
+            statuses.append(response.status)
+        limited = [s for s in statuses if s == 429]
+        assert limited, statuses
+        response = await client.post("/api/wallet/verify", headers=headers, json={})
+        if response.status == 429:
+            assert int(response.headers["Retry-After"]) >= 1
+
+    async def test_forwarded_header_is_ignored_when_the_peer_is_not_a_proxy(self, db, monkeypatch):
+        monkeypatch.setenv("TRUST_PROXY", "true")
+        monkeypatch.setenv("TRUSTED_PROXIES", "10.0.0.0/8")
+        config.reset_settings()
+        async with TestClient(TestServer(self._ip_app())) as local:
+            response = await local.get("/api/_ip", headers={"X-Forwarded-For": "203.0.113.9"})
+            assert (await response.json())["ip"] == "127.0.0.1"
+
+    async def test_trusted_proxy_resolves_the_original_client(self, db, monkeypatch):
+        monkeypatch.setenv("TRUST_PROXY", "true")
+        monkeypatch.setenv("TRUSTED_PROXIES", "127.0.0.1/32")
+        config.reset_settings()
+        async with TestClient(TestServer(self._ip_app())) as local:
+            response = await local.get(
+                "/api/_ip", headers={"X-Forwarded-For": "203.0.113.9, 127.0.0.1"}
+            )
+            assert (await response.json())["ip"] == "203.0.113.9"
+            # Cadena de proxies de confianza: el primer hop público manda.
+            response = await local.get(
+                "/api/_ip", headers={"X-Forwarded-For": "198.51.100.4, 127.0.0.1"}
+            )
+            assert (await response.json())["ip"] == "198.51.100.4"
+
+    async def test_backstop_is_per_endpoint_and_identity_independent(self, db):
+        """Aunque se roten IPs y sesiones, el endpoint tiene un techo global."""
+        app = api.create_app(backstop_limits={"/api/session": (3, 60)})
+        async with TestClient(TestServer(app)) as local:
+            statuses = [
+                (await local.post(
+                    "/api/session", json={}, headers={"X-Forwarded-For": f"10.1.0.{n}"}
+                )).status
+                for n in range(4)
+            ]
+            assert statuses[:3] != [429, 429, 429]
+            assert statuses[3] == 429
+
+    async def test_backstop_does_not_apply_to_other_endpoints(self, db):
+        app = api.create_app(backstop_limits={"/api/session": (1, 60)})
+        async with TestClient(TestServer(app)) as local:
+            for _ in range(3):
+                response = await local.get("/api/health")
+                assert response.status == 200
+
+
+class TestUnlinkAndCancelFromTheMiniApp:
+    """Fase 3.4 — D-02: lo que la Mini App promete, la Mini App lo usa."""
+
+    async def test_unlink_wallet_round_trip(self, client, db):
+        payload, headers = await session_for(client, USER, wallet=True)
+        assert payload["wallet"]["address"]
+
+        response = await client.delete("/api/wallet", headers=headers)
+        assert response.status == 200, await response.text()
+        assert (await response.json())["data"]["wallet"] is None
+
+        me = (await (await client.get("/api/me", headers=headers)).json())["data"]
+        assert me["wallet"] is None
+        assert me["user"]["is_admin"] is False
+
+    async def test_unlink_requires_a_session(self, client):
+        assert (await client.delete("/api/wallet")).status == 401
+
+    async def test_admin_cannot_unlink_someone_else(self, client, db):
+        _, user_headers = await session_for(client, USER, wallet=True)
+        _, admin_headers = await session_for(client, ADMIN)
+        await client.delete("/api/wallet", headers=admin_headers)
+        me = (await (await client.get("/api/me", headers=user_headers)).json())["data"]
+        assert me["wallet"] is not None
+
+    async def test_cancel_prepare_from_the_admin_panel(self, client, db):
+        await ready_market(db, closes_in=-60)
+        _, headers = await session_for(client, ADMIN, wallet=True)
+        response = await client.post(
+            "/api/admin/markets/1/cancel/prepare", headers=headers, json={}
+        )
+        assert response.status == 200, await response.text()
+        tx = (await response.json())["data"]
+        assert tx["kind"] == "cancel_market"
+        assert bodies.parse_message_body(tx["payload"]).market_id == 1
+
+    async def test_cancel_prepare_is_admin_only(self, client, db):
+        await ready_market(db, closes_in=-60)
+        _, headers = await session_for(client, USER, wallet=True)
+        response = await client.post(
+            "/api/admin/markets/1/cancel/prepare", headers=headers, json={}
+        )
+        assert response.status == 403
+
+
 class TestHardening:
     async def test_invalid_json(self, client):
         response = await client.post(
             "/api/session", data="not json", headers={"Content-Type": "application/json"}
         )
         assert response.status == 400
+
+    async def test_json_must_be_an_object(self, client):
+        response = await client.post("/api/session", json=[1, 2, 3])
+        assert response.status == 400
+
+    async def test_body_size_is_capped(self, client):
+        response = await client.post(
+            "/api/session", data="x" * (api.MAX_BODY + 1024),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status == 413
+
+    async def test_unknown_page_is_not_wrapped_as_json(self, client):
+        response = await client.get("/ruta-que-no-existe")
+        assert response.status == 404
+        assert "application/json" not in response.headers["Content-Type"]
+
+    async def test_trusted_proxy_rejects_a_malformed_ip(self):
+        assert api._is_trusted_proxy("no-es-una-ip", ("10.0.0.0/8",)) is False
+        assert api._is_trusted_proxy("10.1.2.3", ()) is False
+        assert api._is_trusted_proxy("10.1.2.3", ("10.0.0.0/8",)) is True
 
     async def test_rate_limited_sessions(self, client):
         api._session_limiter.reset()

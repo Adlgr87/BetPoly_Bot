@@ -158,3 +158,65 @@ arregló**, **qué se decidió** y **qué quedó pendiente**. El plan completo v
 - Fase 3 (seguridad y aislamiento de la API) antes de la Fase 4.
 - El panel del contrato no muestra aún el historial de transacciones de
   administración; hoy se consulta en el explorador con la dirección del escrow.
+
+---
+
+## Fase 3 — Endurecimiento de la API (S-04, S-05, D-01, D-02)
+
+**Fecha:** 2026-10-23
+
+### Arreglado
+- **S-04 · El limitador de tasa se eludía falsificando `X-Forwarded-For`.**
+  `bot/api.py:_client_ip` ya no confía en la cabecera: solo se honra con
+  `TRUST_PROXY=true` **y** si la conexión llega desde una red de
+  `TRUSTED_PROXIES`; entonces se recorre la lista de derecha a izquierda y se
+  devuelve el primer salto que no sea un proxy de confianza. La prueba de la
+  auditoría (40 `POST /api/session` rotando la cabecera) ahora termina en `429`.
+- **S-04 · El diccionario del limitador crecía sin control.** `RateLimiter` usa
+  ahora `OrderedDict` con **evicción LRU real** (`max_keys`, 10 000 por defecto)
+  en lugar de borrar solo las cubetas vacías. Las respuestas `429` incluyen
+  `Retry-After` en segundos.
+- **S-05 · El botón «Reintentar» no hacía nada.** Era un `onclick` inline que la
+  propia CSP del servidor bloquea. Pasa a `data-reload="1"` con delegación de
+  eventos (el patrón que ya usa el resto de la UI).
+- **D-02 · Dos endpoints sin consumidor.** La Mini App incorpora «Desvincular
+  wallet» (`DELETE /api/wallet`) y «Cancelar y reembolsar» por mercado
+  (`POST /api/admin/markets/{id}/cancel/prepare`), ambos con confirmación. El
+  baseline de `test_wiring` queda solo con `/api/health`, justificado.
+
+### Añadido
+- **Backstop global por endpoint** (300/min en `/api/session` y
+  `/api/wallet/nonce`, 120/min en `/api/wallet/verify`, `/api/markets/prepare` y
+  `/api/wallet`): la clave es la ruta, no el cliente, así que rotar IPs o
+  sesiones no lo esquiva. Los limitadores se crean por aplicación
+  (`create_app(backstop_limits=…)`) para que una app de prueba no herede
+  contadores ajenas.
+- **Configuración que no puede quedar muda:** `TRUST_PROXY` y `TRUSTED_PROXIES`
+  se validan al arrancar; confiar sin lista (o declarar lista sin confiar)
+  lanza `ConfigError` en vez de no hacer nada, que es la lección de D-03.
+- **D-01 · Menos duplicación en la API:** `_user_payload`, `_market_id` y
+  `_require_admin` sustituyen los clones de `/api/session` ↔ `/api/me` y de los
+  cuatro handlers con `market_id`/chequeo de admin; el mapeo de errores de
+  dominio (`forbidden`→403, `chain_unavailable`→503) vive en un único sitio
+  (`_MARKET_ERROR_STATUS`), lo que además elimina `_escrow_admin_error`. En los
+  handlers del bot, `_show_cancel_prepared` unifica las dos cancelaciones.
+- Pruebas nuevas: `tests/test_config.py` (proxies y validaciones de arranque) y
+  `tests/test_web_assets.py` (cero manejadores inline + la CSP que se publica de
+  verdad), más los casos de IP real, backstop, `Retry-After`, desvincular wallet
+  y cancelar desde la Mini App.
+
+### Decidido
+- **La cabecera no se honra por defecto.** Un despliegue directo a Internet no
+  necesita saber nada de proxies; detrás de uno, se declara explícitamente. El
+  valor por defecto seguro evita el fallo silencioso.
+- **No borrar endpoints, cablearlos.** `DELETE /api/wallet` y el `cancel/prepare`
+  de admin se exponen en la Mini App; `/api/health` se documenta como endpoint de
+  sondas y queda como único huérfano justificado.
+- **Un techo por endpoint, no por IP.** El backstop es una segunda barrera
+  independiente de la identidad; no sustituye al límite por usuario, que sigue
+  dando mensajes más precisos en el uso normal.
+
+### Pendiente
+- Fase 4: economía única y coherencia de lo mostrado (F-03, H-*, U-05).
+- El backstop es en memoria y por proceso: con varias réplicas cada una lleva su
+  propia cuenta (aceptable en el host único de 512 MB; ver ADR-05).

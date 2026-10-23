@@ -142,6 +142,9 @@ TON_PROOF_DOMAIN=tu-dominio
 SECRET_KEY=<32+ bytes aleatorios>
 TON_NETWORK=mainnet
 TON_API_KEY=…
+# Solo tras un proxy inverso: sin TRUST_PROXY la cabecera X-Forwarded-For se ignora
+TRUST_PROXY=false
+TRUSTED_PROXIES=127.0.0.1/32
 ```
 
 `PUBLIC_BASE_URL` debe servirse por HTTPS y alojar `/tonconnect-manifest.json` y `/static/icon.png`: TON Connect los descarga y verifica el origen.
@@ -187,7 +190,18 @@ Las sesiones viajan en la cabecera `X-Session`. El backend **nunca** devuelve un
 * **Autenticación**: `hash = HMAC_SHA256(bot_token, "WebAppData")` sobre el `init_data`; se valida `auth_date` y se exige `ALLOW_DEV_SESSION=false` en producción.
 * **Sesiones**: token `user_id.expira.hmac(secret_key)`; sin `secret_key` persistente las sesiones mueren al reiniciar (solo válido en desarrollo).
 * **ton_proof**: digest `sha256("ton-proof-item-v2/" ‖ wc ‖ address_hash ‖ domain_len ‖ domain ‖ timestamp ‖ payload)`, firmado en Ed25519 con la clave del `StateInit` (que debe hashear a la dirección declarada). Dominio exacto, ventana de 600 s, nonce de un solo uso por `(user_id, purpose)`.
-* **Rate limiting** por IP/usuario en sesión, preparación de transacciones y verificación de wallets.
+* **IP real**: `X-Forwarded-For` es una cabecera que el cliente controla, así que
+  se ignora salvo que `TRUST_PROXY=true` **y** la conexión llegue desde una red de
+  `TRUSTED_PROXIES`. En ese caso se recorre la lista de derecha a izquierda y se
+  toma el primer salto que no sea un proxy de confianza. Una configuración
+  incoherente (confiar sin lista, o lista sin confiar) **falla al arrancar**.
+* **Rate limiting** por IP/usuario en sesión, preparación de transacciones y
+  verificación de wallets, más un **backstop global por endpoint**
+  (`/api/session`, `/api/wallet/*`, `/api/markets/prepare`) que no depende de la
+  identidad: rotar IPs o sesiones no lo esquiva. Las respuestas `429` incluyen
+  `Retry-After`, y el limitador desaloja por LRU real (memoria acotada).
+* **CSP estricta** sin `'unsafe-inline'` para scripts: la Mini App no usa
+  manejadores inline y un test lo verifica.
 * **CSP** con `frame-ancestors` configurable (`FRAME_ANCESTORS`) para permitir Telegram y bloquear el resto.
 * **Índice idempotente**: cada transacción se procesa una vez (`chain_txs`), el cursor solo avanza tras confirmar, y un fallo de red nunca bloquea al bot.
 
@@ -258,12 +272,15 @@ La suite de Python no necesita red, Telegram ni TON API: usa SQLite en `tmp_path
 cobertura, compilación del contrato con verificación del hash reproducible,
 sandbox TVM, `npm audit` y `pip-audit`.
 
-Dos suites son *guardarraíles* y no pruebas funcionales:
+Tres suites son *guardarraíles* y no pruebas funcionales:
 
 - `tests/test_architecture.py` — dirección de las dependencias entre capas.
 - `tests/test_wiring.py` — conectividad: rutas sin consumidor, botones sin
   handler, builders on-chain inalcanzables y comandos prometidos en `/help`.
-  Los huérfanos conocidos viven en un baseline que solo puede encogerse.
+  Los huérfanos conocidos viven en un baseline que solo puede encogerse (hoy
+  solo queda `/api/health`, endpoint de sondas).
+- `tests/test_web_assets.py` — la Mini App no lleva manejadores inline y la CSP
+  que se publica de verdad los bloquearía.
 
 ### Administración del contrato (Fase 2)
 

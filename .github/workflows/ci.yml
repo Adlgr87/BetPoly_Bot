@@ -44,7 +44,7 @@ jobs:
           pytest \
             --cov=bot --cov=config --cov=main --cov=scripts \
             --cov-report=term-missing:skip-covered \
-            --cov-fail-under=59
+            --cov-fail-under=60
 
   contract:
     name: Contrato (build + sandbox + audit)

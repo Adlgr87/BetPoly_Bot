@@ -357,3 +357,6 @@ textarea { resize: vertical; min-height: 84px; }
 .contract-rows > div { display: flex; justify-content: space-between; gap: 10px; }
 .contract-rows dt { color: var(--muted); font-size: 12.5px; margin: 0; }
 .contract-rows dd { margin: 0; font-size: 12.5px; font-weight: 650; text-align: right; }
+
+/* Arranque fallido: el botón «Reintentar» se engancha por delegación (sin inline). */
+.boot-retry { max-width: 240px; margin: 0 auto; }

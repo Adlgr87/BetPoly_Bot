@@ -183,7 +183,7 @@
   function showFatal(message) {
     const boot = $('#boot');
     boot.innerHTML = `<div class="boot-logo">⚠️</div><p>${esc(message)}</p>
-      <button class="primary" style="max-width:240px;margin:0 auto" onclick="location.reload()">Reintentar</button>`;
+      <button class="primary boot-retry" type="button" data-reload="1">Reintentar</button>`;
   }
 
   function applyConfig() {
@@ -377,7 +377,10 @@
         <span class="pill open">${esc(points)} puntos</span>
         <span class="pill">${state.myBets.length} apuestas on-chain</span>
         <span class="pill">${wins} ganadas</span>
-      </div>`;
+      </div>
+      ${state.wallet
+        ? `<button class="ghost" type="button" data-unlink-wallet="1">Desvincular wallet</button>`
+        : ''}`;
   }
 
   function marketCard(market) {
@@ -483,7 +486,10 @@
           <span>🪙 ${fmtTon(market.pool_ton)} TON</span>
           <span>⏰ ${fmtDate(market.closes_at)}</span>
         </div>
-        <button class="primary" data-admin-resolve="${market.market_id}">Resolver on-chain</button>
+        <div class="option-row">
+          <button class="primary" data-admin-resolve="${market.market_id}">Resolver on-chain</button>
+          <button class="ghost" data-admin-cancel="${market.market_id}">Cancelar y reembolsar</button>
+        </div>
       </article>`).join('');
   }
 
@@ -968,6 +974,42 @@
       'Cambio de administrador enviado. Verifícalo on-chain antes de cerrar.');
   }
 
+  async function unlinkWallet() {
+    if (!state.wallet) return;
+    const sure = window.confirm(
+      '¿Desvincular esta wallet de tu cuenta?\n\nPodrás volver a conectarla cuando quieras.');
+    if (!sure) return;
+    busy(true);
+    try {
+      await api('/api/wallet', { method: 'DELETE' });
+      busy(false);
+      state.wallet = null;
+      renderWallet();
+      renderProfile();
+      toast('Wallet desvinculada.', 'ok');
+    } catch (error) {
+      busy(false);
+      toast(friendlyError(error), 'error');
+    }
+  }
+
+  async function adminCancelMarket(marketId) {
+    const sure = window.confirm(
+      `¿Cancelar el mercado #${marketId}?\n\nTodos podrán reclamar su reembolso completo.`);
+    if (!sure) return;
+    busy(true);
+    try {
+      const tx = await api(`/api/admin/markets/${marketId}/cancel/prepare`, { method: 'POST' });
+      busy(false);
+      await signTransaction(tx);
+      toast('Cancelación enviada. El indexador la confirmará.', 'ok');
+      switchView('admin');
+    } catch (error) {
+      busy(false);
+      toast(friendlyError(error), 'error');
+    }
+  }
+
   async function loadAdminStatus() {
     try {
       const status = await api('/api/indexer');
@@ -1027,6 +1069,23 @@
     });
 
     document.addEventListener('click', (event) => {
+      const reloadEl = event.target.closest('[data-reload]');
+      if (reloadEl) {
+        window.location.reload();
+        return;
+      }
+      const unlinkEl = event.target.closest('[data-unlink-wallet]');
+      if (unlinkEl) {
+        unlinkWallet();
+        return;
+      }
+      const cancelEl = event.target.closest('[data-admin-cancel]');
+      if (cancelEl) {
+        adminCancelMarket(Number(cancelEl.dataset.adminCancel)).catch((error) => {
+          toast(friendlyError(error), 'error');
+        });
+        return;
+      }
       const openEl = event.target.closest('[data-open-market]');
       if (openEl) {
         openMarket(Number(openEl.dataset.openMarket));

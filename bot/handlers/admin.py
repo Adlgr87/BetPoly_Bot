@@ -440,6 +440,30 @@ async def admin_chain_win_callback(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def _show_cancel_prepared(
+    update: Update, market_id: int, tx: markets.PreparedTx, *, emergency: bool = False
+) -> None:
+    """One renderer for both cancellation paths (normal and emergency)."""
+    title = "Cancelación de emergencia preparada" if emergency else "Cancelación preparada"
+    await edit_or_reply(
+        update,
+        f"🧾 <b>{title} (sin firmar)</b>\n\n"
+        f"Mercado: <b>#{market_id} {esc(tx.details.get('market_title', ''))}</b>\n\n"
+        "Al firmarla, todas las wallets podrán reclamar su reembolso completo.\n\n"
+        f"{code(tx.deeplink)}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔐 Firmar en la wallet", url=tx.deeplink)],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Volver", callback_data=f"admin_chain_market:{market_id}"
+                    )
+                ],
+            ]
+        ),
+    )
+
+
 async def admin_chain_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await safe_answer(query)
@@ -482,19 +506,7 @@ async def admin_chain_cancel_callback(update: Update, context: ContextTypes.DEFA
         await edit_or_reply(update, f"❌ {esc(exc)}")
         return
 
-    await edit_or_reply(
-        update,
-        "🧾 <b>Cancelación preparada (sin firmar)</b>\n\n"
-        f"Mercado: <b>#{market_id} {esc(tx.details.get('market_title', ''))}</b>\n\n"
-        "Al firmarla, todas las wallets podrán reclamar su reembolso completo.\n\n"
-        f"{code(tx.deeplink)}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🔐 Firmar en la wallet", url=tx.deeplink)],
-                [InlineKeyboardButton("🔙 Volver", callback_data=f"admin_chain_market:{market_id}")],
-            ]
-        ),
-    )
+    await _show_cancel_prepared(update, market_id, tx)
 
 
 async def admin_chain_cancel_force_callback(
@@ -515,23 +527,7 @@ async def admin_chain_cancel_force_callback(
         await edit_or_reply(update, f"❌ {esc(exc)}")
         return
 
-    await edit_or_reply(
-        update,
-        "🧾 <b>Cancelación de emergencia preparada (sin firmar)</b>\n\n"
-        f"Mercado: <b>#{market_id} {esc(tx.details.get('market_title', ''))}</b>\n\n"
-        "Al firmarla, todas las wallets podrán reclamar su reembolso completo.\n\n"
-        f"{code(tx.deeplink)}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🔐 Firmar en la wallet", url=tx.deeplink)],
-                [
-                    InlineKeyboardButton(
-                        "🔙 Volver", callback_data=f"admin_chain_market:{market_id}"
-                    )
-                ],
-            ]
-        ),
-    )
+    await _show_cancel_prepared(update, market_id, tx, emergency=True)
 
 
 # ===========================================================================

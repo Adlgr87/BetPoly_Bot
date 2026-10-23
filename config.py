@@ -15,6 +15,7 @@ Design notes
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import secrets as _secrets
 from dataclasses import dataclass, field
@@ -67,6 +68,23 @@ def _bool(key: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "y", "on", "si", "sí")
+
+
+def _cidrs(key: str) -> Tuple[str, ...]:
+    """Parse a comma separated list of CIDRs, rejecting anything malformed."""
+    raw = (os.getenv(key) or "").strip()
+    if not raw:
+        return ()
+    out = []
+    for chunk in raw.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            out.append(str(ipaddress.ip_network(chunk, strict=False)))
+        except ValueError as exc:
+            raise ConfigError(f"{key} contains an invalid CIDR: {chunk!r}") from exc
+    return tuple(out)
 
 
 def _ids(key: str) -> Tuple[int, ...]:
@@ -138,6 +156,9 @@ class Settings:
     app_title: str
     support_url: Optional[str] = field(default=None)
     frame_ancestors: str = "'self'"
+    #: Only honour ``X-Forwarded-For`` when the peer is one of these proxies.
+    trust_proxy: bool = False
+    trusted_proxies: Tuple[str, ...] = ()
 
     # -- derived helpers ---------------------------------------------------
     @property
@@ -198,6 +219,16 @@ class Settings:
             )
         if self.is_production and self.secret_key.startswith("dev-"):
             raise ConfigError("SECRET_KEY must be set to a strong random value in production.")
+        if self.trust_proxy and not self.trusted_proxies:
+            raise ConfigError(
+                "TRUST_PROXY=true requires TRUSTED_PROXIES (e.g. 127.0.0.1/32): "
+                "without a proxy list X-Forwarded-For would be trusted from anyone."
+            )
+        if self.trusted_proxies and not self.trust_proxy:
+            raise ConfigError(
+                "TRUSTED_PROXIES is set but TRUST_PROXY is false: the list would have "
+                "no effect. Set TRUST_PROXY=true or remove TRUSTED_PROXIES."
+            )
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -254,6 +285,8 @@ def _build_settings() -> Settings:
             "FRAME_ANCESTORS",
             "'self' https://*.telegram.org https://web.telegram.org https://*.e2b.app",
         ),
+        trust_proxy=_bool("TRUST_PROXY", False),
+        trusted_proxies=_cidrs("TRUSTED_PROXIES"),
     )
     return settings
 

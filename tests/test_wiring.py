@@ -23,11 +23,10 @@ KEYBOARDS_PY = ROOT / "bot" / "keyboards.py"
 MAIN_PY = ROOT / "main.py"
 BODIES_PY = ROOT / "bot" / "chain" / "bodies.py"
 
-# Ruta de API sin consumidor en el frontend -> motivo y fase que lo cablea.
+# Ruta de API sin consumidor en el frontend -> motivo. Desde la Fase 3 la lista
+# solo conserva el endpoint de sondas, que por diseño no consume la UI.
 KNOWN_API_ORPHANS: Dict[str, str] = {
     "/api/health": "Endpoint de orquestador / sondas; no lo consume la UI (correcto).",
-    "/api/wallet": "DELETE sin botón en la Mini App: se cablea en la Fase 3.",
-    "/api/admin/markets/{x}/cancel/prepare": "Solo alcanzable desde el bot; se cablea en la Fase 3.",
 }
 
 # Builders de cuerpo sin consumidor -> motivo y fase. Vacío desde la Fase 2:

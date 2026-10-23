@@ -19,9 +19,9 @@ import hashlib
 import hmac
 import json
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Optional, Tuple
 from urllib.parse import parse_qsl
 
 import config
@@ -171,26 +171,40 @@ def dev_session(init_data: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
-    """Sliding window limiter (per key) for API and chat actions."""
+    """Sliding window limiter (per key) for API and chat actions.
 
-    def __init__(self, limit: int, window_seconds: float) -> None:
+    Memory is bounded by real LRU eviction (``max_keys``): the least recently
+    used key is dropped, not just the buckets that happen to be empty. Without
+    that, a client rotating keys could grow the dict without limit while every
+    bucket stays "full" and therefore never empty — the old bug behind S-04.
+    """
+
+    def __init__(self, limit: int, window_seconds: float, *, max_keys: int = 10_000) -> None:
         self.limit = max(1, int(limit))
         self.window = float(window_seconds)
-        self._hits: Dict[str, Deque[float]] = {}
+        self.max_keys = max(1, int(max_keys))
+        self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
 
     def allow(self, key: str, *, now: Optional[float] = None) -> Tuple[bool, float]:
         current = float(now if now is not None else time.time())
-        bucket = self._hits.setdefault(key, deque())
+        bucket = self._hits.get(key)
+        if bucket is None:
+            bucket = deque()
+            self._hits[key] = bucket
+        else:
+            self._hits.move_to_end(key)
         while bucket and current - bucket[0] > self.window:
             bucket.popleft()
         if len(bucket) >= self.limit:
             retry_after = max(0.0, self.window - (current - bucket[0]))
             return False, retry_after
         bucket.append(current)
-        if len(self._hits) > 10_000:  # bound memory on long running bots
-            for stale in [k for k, v in self._hits.items() if not v]:
-                self._hits.pop(stale, None)
+        while len(self._hits) > self.max_keys:  # LRU real, no solo cubetas vacías
+            self._hits.popitem(last=False)
         return True, 0.0
+
+    def __len__(self) -> int:
+        return len(self._hits)
 
     def reset(self, key: Optional[str] = None) -> None:
         if key is None:

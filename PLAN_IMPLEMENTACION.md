@@ -124,7 +124,7 @@ Cada decisión incluye la alternativa descartada y **por qué es subóptima para
 | ✅ | **0** | Red de seguridad (CI, baseline) | F-10, F-11, T-01 (base), T-04, R-10 | 1 | — |
 | ✅ | **1** | Integridad del dinero on-chain | **S-01, S-02, S-07**, F-05, F-06 | 4 | 0 |
 | ✅ | **2** | Administración del contrato | **S-03**, D-03 | 3-4 | 0, 1 |
-| ⬜ | **3** | Endurecimiento de la API | **S-04, S-05**, D-01 (api), D-02 | 2 | 0 |
+| ✅ | **3** | Endurecimiento de la API | **S-04, S-05**, D-01 (api), D-02 | 2 | 0 |
 | ⬜ | **4** | Economía única y coherencia mostrada | F-03, H-*, U-05 | 2-3 | 1 |
 | ⬜ | **5** | Capa Telegram: navegación, entrada, notificaciones | F-01, F-14, F-02, F-04, **S-06**, U-01…U-04, U-06 | 4 | 1, 4 |
 | ⬜ | **6** | Rendimiento y activos | R-01…R-09 | 2-3 | 1, 5 |

@@ -12,10 +12,13 @@ The API never returns, stores or requests private keys or seed phrases.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
+import math
 import time
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from aiohttp import web
 
@@ -37,6 +40,33 @@ MAX_BODY = 64 * 1024
 _prepare_limiter = security.RateLimiter(limit=20, window_seconds=60)
 _session_limiter = security.RateLimiter(limit=30, window_seconds=60)
 _verify_limiter = security.RateLimiter(limit=10, window_seconds=300)
+
+#: Global backstop per endpoint (limit, window seconds). These are *not* keyed by
+#: client: even a client that rotates IPs or sessions hits this ceiling, which is
+#: what makes S-04 impossible to exploit by forging headers (see Fase 3).
+BACKSTOP_LIMITS: Dict[str, Tuple[int, float]] = {
+    "/api/session": (300, 60),
+    "/api/wallet/nonce": (300, 60),
+    "/api/wallet/verify": (120, 60),
+    "/api/markets/prepare": (120, 60),
+    "/api/wallet": (120, 60),
+}
+
+def _new_backstops(
+    limits: Optional[Dict[str, Tuple[int, float]]] = None,
+) -> Dict[str, security.RateLimiter]:
+    """Fresh limiters per app: a test app must not inherit another's counters."""
+    return {
+        path: security.RateLimiter(limit=limit, window_seconds=window)
+        for path, (limit, window) in (limits or BACKSTOP_LIMITS).items()
+    }
+
+#: Market error codes that are not a plain 400.
+_MARKET_ERROR_STATUS = {
+    "forbidden": 403,
+    "wallet_not_admin": 403,
+    "chain_unavailable": 503,
+}
 
 
 def _settings() -> config.Settings:
@@ -79,9 +109,47 @@ async def read_json(request: web.Request) -> Dict[str, Any]:
     return data
 
 
+@lru_cache(maxsize=32)
+def _networks(cidrs: Tuple[str, ...]) -> Tuple[Any, ...]:
+    """Parsed networks, cached: ``_client_ip`` runs on every request."""
+    return tuple(ipaddress.ip_network(cidr, strict=False) for cidr in cidrs)
+
+
+def _is_trusted_proxy(ip: str, cidrs: Tuple[str, ...]) -> bool:
+    if not cidrs:
+        return False
+    try:
+        address = ipaddress.ip_address(str(ip).strip().strip("[]"))
+    except ValueError:
+        return False
+    return any(address in network for network in _networks(cidrs))
+
+
 def _client_ip(request: web.Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    return (forwarded.split(",")[0].strip() if forwarded else request.remote) or "?"
+    """Peer address used for rate limiting, honouring proxies only when declared.
+
+    ``X-Forwarded-For`` is client controlled, so it is ignored unless
+    ``TRUST_PROXY`` is on *and* the direct peer is one of ``TRUSTED_PROXIES``.
+    The header list is then walked right to left, returning the first hop that
+    is not itself a trusted proxy (the real client as seen by our edge).
+    """
+    remote = request.remote or "?"
+    settings = _settings()
+    if not settings.trust_proxy or not _is_trusted_proxy(remote, settings.trusted_proxies):
+        return remote
+    raw = ",".join(request.headers.getall("X-Forwarded-For", []))
+    hops = [hop.strip() for hop in raw.split(",") if hop.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted_proxy(hop, settings.trusted_proxies):
+            return hop
+    return hops[0] if hops else remote
+
+
+def _rate_limited(message: str, retry_after: float = 0.0) -> web.Response:
+    """429 + ``Retry-After`` (seconds) so clients can back off correctly."""
+    response = json_error("rate_limited", message, 429)
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
+    return response
 
 
 def current_user(request: web.Request) -> int:
@@ -94,6 +162,33 @@ def current_user(request: web.Request) -> int:
 
 def _admin(user_id: int) -> bool:
     return user_id in _settings().admin_ids
+
+
+def _user_payload(user_id: int, user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Public shape of a user, shared by ``/api/session`` and ``/api/me``."""
+    return {
+        "user_id": user_id,
+        "username": (user or {}).get("username"),
+        "full_name": (user or {}).get("full_name"),
+        "points": (user or {}).get("points", 0),
+        "is_admin": _admin(user_id),
+    }
+
+
+def _market_id(request: web.Request) -> Optional[int]:
+    """``market_id`` from the URL, or ``None`` when it is not an integer."""
+    try:
+        return int(request.match_info["market_id"])
+    except (KeyError, ValueError):
+        return None
+
+
+def _require_admin(request: web.Request) -> int:
+    """Return the caller's id, raising a domain ``forbidden`` when not admin."""
+    user_id = current_user(request)
+    if not _admin(user_id):
+        raise markets.MarketError("forbidden", "Solo administradores.")
+    return user_id
 
 
 def _wallet_view(wallet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -226,7 +321,7 @@ async def index(request: web.Request) -> web.StreamResponse:
 async def create_session(request: web.Request) -> web.Response:
     allowed, retry = _session_limiter.allow(_client_ip(request))
     if not allowed:
-        return json_error("rate_limited", "Demasiados intentos. Espera un momento.", 429)
+        return _rate_limited("Demasiados intentos. Espera un momento.", retry)
 
     data = await read_json(request)
     init_data = data.get("init_data") or ""
@@ -263,13 +358,7 @@ async def create_session(request: web.Request) -> web.Response:
             "nonce": nonce,
             "dev_mode": dev,
             "user_id": user_id,
-            "user": {
-                "user_id": user_id,
-                "username": (user or {}).get("username"),
-                "full_name": (user or {}).get("full_name"),
-                "points": (user or {}).get("points", 0),
-                "is_admin": _admin(user_id),
-            },
+            "user": _user_payload(user_id, user),
             "wallet": _wallet_view(wallet),
             "config": public_config(),
         }
@@ -287,9 +376,9 @@ async def wallet_nonce(request: web.Request) -> web.Response:
 
 async def verify_wallet(request: web.Request) -> web.Response:
     user_id = current_user(request)
-    allowed, _ = _verify_limiter.allow(str(user_id))
+    allowed, retry = _verify_limiter.allow(str(user_id))
     if not allowed:
-        return json_error("rate_limited", "Demasiados intentos de verificación.", 429)
+        return _rate_limited("Demasiados intentos de verificación.", retry)
 
     data = await read_json(request)
     address = data.get("address") or ""
@@ -378,13 +467,7 @@ async def me(request: web.Request) -> web.Response:
         bets = await database.list_onchain_bets(wallet["address"], limit=25)
     return json_ok(
         {
-            "user": {
-                "user_id": user_id,
-                "username": (user or {}).get("username"),
-                "full_name": (user or {}).get("full_name"),
-                "points": (user or {}).get("points", 0),
-                "is_admin": _admin(user_id),
-            },
+            "user": _user_payload(user_id, user),
             "wallet": _wallet_view(wallet),
             "bets": [
                 {
@@ -428,9 +511,8 @@ async def list_markets(request: web.Request) -> web.Response:
 
 
 async def get_market(request: web.Request) -> web.Response:
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     user_id = None
     try:
@@ -448,7 +530,7 @@ async def prepare_market(request: web.Request) -> web.Response:
     user_id = current_user(request)
     allowed, retry = _prepare_limiter.allow(f"create:{user_id}")
     if not allowed:
-        return json_error("rate_limited", "Espera un momento antes de crear otro mercado.", 429)
+        return _rate_limited("Espera un momento antes de crear otro mercado.", retry)
 
     data = await read_json(request)
     options = data.get("options") or []
@@ -470,13 +552,12 @@ async def prepare_market(request: web.Request) -> web.Response:
 
 async def prepare_bet(request: web.Request) -> web.Response:
     user_id = current_user(request)
-    allowed, _ = _prepare_limiter.allow(f"bet:{user_id}")
+    allowed, retry = _prepare_limiter.allow(f"bet:{user_id}")
     if not allowed:
-        return json_error("rate_limited", "Espera un momento antes de apostar de nuevo.", 429)
+        return _rate_limited("Espera un momento antes de apostar de nuevo.", retry)
 
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     data = await read_json(request)
     try:
@@ -499,9 +580,8 @@ async def prepare_bet(request: web.Request) -> web.Response:
 
 async def prepare_claim(request: web.Request) -> web.Response:
     user_id = current_user(request)
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     try:
         tx = await markets.prepare_claim(user_id, market_id)
@@ -511,12 +591,9 @@ async def prepare_claim(request: web.Request) -> web.Response:
 
 
 async def prepare_resolve(request: web.Request) -> web.Response:
-    user_id = current_user(request)
-    if not _admin(user_id):
-        return json_error("forbidden", "Solo administradores.", 403)
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    user_id = _require_admin(request)
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     data = await read_json(request)
     try:
@@ -531,12 +608,9 @@ async def prepare_resolve(request: web.Request) -> web.Response:
 
 
 async def prepare_cancel(request: web.Request) -> web.Response:
-    user_id = current_user(request)
-    if not _admin(user_id):
-        return json_error("forbidden", "Solo administradores.", 403)
-    try:
-        market_id = int(request.match_info["market_id"])
-    except (KeyError, ValueError):
+    user_id = _require_admin(request)
+    market_id = _market_id(request)
+    if market_id is None:
         return json_error("bad_market", "market_id inválido.")
     try:
         tx = await markets.prepare_cancel(user_id, market_id)
@@ -549,39 +623,11 @@ async def prepare_cancel(request: web.Request) -> web.Response:
 # escrow administration (payload builders only: the wallet signs)
 # ---------------------------------------------------------------------------
 
-#: Errores del dominio que significan "no eres el administrador".
-_ADMIN_FORBIDDEN = ("forbidden", "wallet_not_admin")
-#: Errores de infraestructura (la cadena o el RPC no respondieron).
-_UNAVAILABLE = ("chain_unavailable",)
-
-
-def _escrow_admin_error(exc: Exception) -> web.Response:
-    """Map domain errors to HTTP without leaking chain details."""
-    if isinstance(exc, markets.MarketError):
-        if exc.code in _ADMIN_FORBIDDEN:
-            status = 403
-        elif exc.code in _UNAVAILABLE:
-            status = 503
-        else:
-            status = 400
-        return json_error(exc.code, str(exc), status)
-    raise exc
-
-
-def _require_web_admin(request: web.Request) -> int:
-    user_id = current_user(request)
-    if not _admin(user_id):
-        raise markets.MarketError("forbidden", "Solo un administrador puede operar el contrato.")
-    return user_id
-
-
 async def admin_contract_state(request: web.Request) -> web.Response:
-    try:
-        user_id = _require_web_admin(request)
-        force = request.query.get("refresh") in ("1", "true", "yes")
-        state = await markets.escrow_state(force=force)
-    except Exception as exc:  # noqa: BLE001 - mapped below
-        return _escrow_admin_error(exc)
+    user_id = _require_admin(request)
+    force = request.query.get("refresh") in ("1", "true", "yes")
+    # Los MarketError (chain_unavailable incluido) los traduce el middleware.
+    state = await markets.escrow_state(force=force)
     payload = state.as_dict()
     payload["admin_matches_wallet"] = await _admin_matches_wallet(user_id, state)
     return json_ok(payload)
@@ -601,51 +647,40 @@ async def _admin_matches_wallet(user_id: int, state: Any) -> Optional[bool]:
 
 
 async def admin_contract_withdraw(request: web.Request) -> web.Response:
-    try:
-        user_id = _require_web_admin(request)
-        data = await read_json(request)
-        amount = parse_nano(data.get("amount"), field="importe")
-        tx = await markets.prepare_withdraw_fees(user_id, amount)
-    except Exception as exc:  # noqa: BLE001 - mapped below
-        return _escrow_admin_error(exc)
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    amount = parse_nano(data.get("amount"), field="importe")
+    tx = await markets.prepare_withdraw_fees(user_id, amount)
     return json_ok(tx.as_dict())
 
 
 async def admin_contract_set_fee(request: web.Request) -> web.Response:
-    try:
-        user_id = _require_web_admin(request)
-        data = await read_json(request)
-        if data.get("fee_bps") is not None:
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    if data.get("fee_bps") is not None:
+        try:
             fee_bps = int(data["fee_bps"])
-        else:
-            fee_bps = parse_fee_bps(data.get("percent"))
-        tx = await markets.prepare_set_fee(user_id, fee_bps)
-    except (TypeError, ValueError):
-        return json_error("bad_fee", "fee_bps debe ser un entero.", 400)
-    except Exception as exc:  # noqa: BLE001 - mapped below
-        return _escrow_admin_error(exc)
+        except (TypeError, ValueError):
+            return json_error("bad_fee", "fee_bps debe ser un entero.")
+    else:
+        fee_bps = parse_fee_bps(data.get("percent"))
+    tx = await markets.prepare_set_fee(user_id, fee_bps)
     return json_ok(tx.as_dict())
 
 
 async def admin_contract_set_paused(request: web.Request) -> web.Response:
-    try:
-        user_id = _require_web_admin(request)
-        data = await read_json(request)
-        if not isinstance(data.get("paused"), bool):
-            return json_error("bad_flag", "paused debe ser true o false.", 400)
-        tx = await markets.prepare_set_paused(user_id, data["paused"])
-    except Exception as exc:  # noqa: BLE001 - mapped below
-        return _escrow_admin_error(exc)
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    if not isinstance(data.get("paused"), bool):
+        return json_error("bad_flag", "paused debe ser true o false.")
+    tx = await markets.prepare_set_paused(user_id, data["paused"])
     return json_ok(tx.as_dict())
 
 
 async def admin_contract_change_admin(request: web.Request) -> web.Response:
-    try:
-        user_id = _require_web_admin(request)
-        data = await read_json(request)
-        tx = await markets.prepare_change_admin(user_id, str(data.get("address") or ""))
-    except Exception as exc:  # noqa: BLE001 - mapped below
-        return _escrow_admin_error(exc)
+    user_id = _require_admin(request)
+    data = await read_json(request)
+    tx = await markets.prepare_change_admin(user_id, str(data.get("address") or ""))
     return json_ok(tx.as_dict())
 
 
@@ -690,12 +725,36 @@ def _error_middleware():
                 )
             raise
         except markets.MarketError as exc:
-            return json_error(exc.code, str(exc), 400)
+            return json_error(
+                exc.code, str(exc), _MARKET_ERROR_STATUS.get(exc.code, 400)
+            )
         except (BodyError, AddressError) as exc:
             return json_error("bad_request", str(exc), 400)
         except Exception:  # noqa: BLE001 - last resort, no stack traces leaked
             logger.exception("Unhandled API error on %s %s", request.method, request.path)
             return json_error("internal_error", "Error interno del servidor.", 500)
+
+    return middleware
+
+
+def _backstop_middleware(backstops: Dict[str, security.RateLimiter]):
+    """Ceiling per endpoint, independent of the caller's identity.
+
+    Forging ``X-Forwarded-For`` or minting sessions cannot bypass this: the key
+    is the endpoint itself, so the "rotate keys until it works" attack (S-04)
+    hits a wall even if no proxy is configured.
+    """
+    @web.middleware
+    async def middleware(request: web.Request, handler):
+        limiter = backstops.get(request.path)
+        if limiter is not None:
+            allowed, retry = limiter.allow(request.path)
+            if not allowed:
+                return _rate_limited(
+                    "El servicio recibe demasiadas peticiones. Inténtalo en unos segundos.",
+                    retry,
+                )
+        return await handler(request)
 
     return middleware
 
@@ -723,11 +782,19 @@ def _headers_middleware(allowed_ancestors: str):
     return middleware
 
 
-def create_app(ton_client: Any = None) -> web.Application:
+def create_app(
+    ton_client: Any = None,
+    *,
+    backstop_limits: Optional[Dict[str, Tuple[int, float]]] = None,
+) -> web.Application:
     settings = _settings()
     app = web.Application(
         client_max_size=MAX_BODY,
-        middlewares=[_error_middleware(), _headers_middleware(settings.frame_ancestors)],
+        middlewares=[
+            _error_middleware(),
+            _backstop_middleware(_new_backstops(backstop_limits)),
+            _headers_middleware(settings.frame_ancestors),
+        ],
     )
     app[TON_CLIENT_KEY] = ton_client
 
